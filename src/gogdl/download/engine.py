@@ -57,6 +57,14 @@ BACKOFF_CAP = 60.0
 RETRY_AFTER_CAP = 300.0
 """Obergrenze für ein von GOG genanntes ``Retry-After`` — schützt vor Hängern."""
 
+VERIFY_REPORT_STEP = 512 * 1024 * 1024
+"""Abstand zwischen zwei Fortschrittsmeldungen der MD5-Prüfung.
+
+Die Prüfung einer 4-GiB-Datei auf einem Netzlaufwerk dauert Minuten. Ohne
+Zwischenmeldung sieht ein laufender Download in dieser Zeit aus wie ein
+hängender.
+"""
+
 from gogdl.constants import OLD_SUFFIX  # noqa: E402  (Re-Export für Bestandscode)
 """Endung, unter der eine vorhandene Zieldatei beiseitegelegt wird.
 
@@ -98,6 +106,25 @@ def _parse_retry_after(value: str | None) -> float | None:
     if target.tzinfo is None:
         target = target.replace(tzinfo=_dt.timezone.utc)
     return max(0.0, (target - now).total_seconds())
+
+
+def _hash_block(handle: Any, hasher: Any, chunk_size: int) -> int:
+    """Liest einen Block und hasht ihn. Läuft im Worker-Thread.
+
+    Absichtlich beides in einem Aufruf: so wandert weder der Block noch die
+    CPU-Arbeit des Hashens zurück in den Loop-Thread.
+    """
+    block = handle.read(chunk_size)
+    if block:
+        hasher.update(block)
+    return len(block)
+
+
+def _share(done: int, total: int | None) -> str:
+    """Fortschritt als Prozentangabe, bei unbekannter Gesamtgröße in MiB."""
+    if total is None or total <= 0:
+        return f"{done // (1024 * 1024)} MiB"
+    return f"{min(100, done * 100 // total)}%"
 
 
 class HttpDownloader:
@@ -310,7 +337,7 @@ class HttpDownloader:
 
             break
 
-        return self._finish(item, written, restarted)
+        return await self._finish(item, written, restarted, reporter)
 
     # -------------------------------------------------------------- Details
 
@@ -362,13 +389,22 @@ class HttpDownloader:
         if due > elapsed:
             await self._nap(due - elapsed)
 
-    def _finish(self, item: DownloadItem, written: int, restarted: bool) -> DownloadResult:
+    async def _finish(
+        self,
+        item: DownloadItem,
+        written: int,
+        restarted: bool,
+        reporter: ProgressReporter | None = None,
+    ) -> DownloadResult:
         """Verifiziert die ``.part`` und benennt sie erst danach atomar um.
 
         Geprüft wird immer die Datei auf der Platte (:meth:`_digest_file`),
         nie ein während des Streams mitgerechneter Digest - ein fortgesetzter
         Download schließt den Altbestand der ``.part`` damit selbstverständlich
         ein, und ein von fremder Hand veränderter Rest fällt auf.
+
+        Asynchron, weil genau diese Prüfung die Event-Loop nicht blockieren
+        darf; ``reporter`` nimmt die Zwischenmeldungen der MD5-Prüfung auf.
         """
         entry = item.entry
         part = item.part_path
@@ -393,7 +429,7 @@ class HttpDownloader:
 
         if entry.md5:
             checked = True
-            digest = self._digest_file(part)
+            digest = await self._digest_file(part, reporter, total=actual)
             if digest.lower() != entry.md5.lower():
                 self._discard(part)
                 return DownloadResult(
@@ -464,14 +500,40 @@ class HttpDownloader:
         os.replace(target, candidate)
         return candidate
 
-    def _digest_file(self, path: Path) -> str:
+    async def _digest_file(
+        self,
+        path: Path,
+        reporter: ProgressReporter | None = None,
+        *,
+        total: int | None = None,
+    ) -> str:
+        """MD5 der Datei auf der Platte, ohne die Event-Loop zu blockieren.
+
+        Gelesen und gehasht wird blockweise in einem Worker-Thread. Lief das
+        synchron in der Loop, stand während der Prüfung einer 4-GiB-Datei auf
+        einem Netzlaufwerk minutenlang der gesamte Lauf still: der zweite
+        Auftrag (``--jobs 2``) schrieb kein Byte mehr, seine kurzlebige
+        CDN-URL lief derweil weiter ab, und die Fortschrittsanzeige rührte
+        sich nicht - von außen nicht von einem Absturz zu unterscheiden.
+
+        Gemeldet wird zwischen den Blöcken und damit im Loop-Thread:
+        ``ProgressReporter`` ist nicht threadsicher.
+        """
         hasher = hashlib.md5()
-        with open(path, "rb") as handle:
+        handle = await asyncio.to_thread(open, path, "rb")
+        try:
+            done = 0
+            next_report = VERIFY_REPORT_STEP
             while True:
-                block = handle.read(self._chunk_size)
-                if not block:
+                read = await asyncio.to_thread(_hash_block, handle, hasher, self._chunk_size)
+                if not read:
                     break
-                hasher.update(block)
+                done += read
+                if reporter is not None and done >= next_report:
+                    reporter.message(f"Verifying {path.name}: {_share(done, total)}")
+                    next_report = done + VERIFY_REPORT_STEP
+        finally:
+            await asyncio.to_thread(handle.close)
         return hasher.hexdigest()
 
     @staticmethod

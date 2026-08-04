@@ -8,12 +8,14 @@ den vollständigen Bytevergleich der Zieldatei.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 
 import httpx
 import pytest
 
 from gogdl.download import HttpDownloader
+from gogdl.download import engine as engine_mod
 from gogdl.errors import RangeNotHonoredError
 from gogdl.model.protocols import Downloader
 from gogdl.model.types import (
@@ -718,3 +720,72 @@ async def test_limit_rate_throttles(tmp_path):
 
     assert result.ok
     assert sleep.slept and sum(sleep.slept) > 0
+
+
+async def test_verification_gives_the_loop_back_between_blocks(tmp_path):
+    """Die MD5-Prüfung darf die Event-Loop nicht am Stück belegen.
+
+    Lief sie synchron, stand bei ``--jobs 2`` der zweite Auftrag still,
+    solange ein Teil geprüft wurde - auf einem Netzlaufwerk Minuten, in
+    denen auch dessen kurzlebige CDN-URL ablief.
+    """
+    api, sleep = FakeApi(), FakeSleep()
+    path = tmp_path / "gross.bin"
+    inhalt = b"x" * 4096
+    path.write_bytes(inhalt)
+
+    downloader = make_downloader(
+        lambda request: httpx.Response(200, content=BODY), api, sleep, chunk_size=1024
+    )
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0)
+            ticks += 1
+
+    task = asyncio.create_task(ticker())
+    try:
+        digest = await downloader._digest_file(path)
+    finally:
+        task.cancel()
+
+    assert digest == hashlib.md5(inhalt).hexdigest()
+    # Vier Blöcke plus Öffnen und Schließen: jeder dieser Schritte wartet auf
+    # einen Worker-Thread und lässt den Ticker dazwischen laufen.
+    assert ticks >= 4
+
+
+async def test_verification_reports_progress(tmp_path, monkeypatch):
+    """Eine lange Prüfung meldet Zwischenstände, sonst sieht sie aus wie ein Hänger."""
+    monkeypatch.setattr(engine_mod, "VERIFY_REPORT_STEP", 1024)
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    path = tmp_path / "gross.bin"
+    path.write_bytes(b"x" * 4096)
+
+    downloader = make_downloader(
+        lambda request: httpx.Response(200, content=BODY), api, sleep, chunk_size=1024
+    )
+    await downloader._digest_file(path, reporter, total=4096)
+
+    meldungen = [text for text in reporter.messages if "gross.bin" in text]
+    assert len(meldungen) >= 3
+    assert "25%" in meldungen[0]
+    assert "100%" in meldungen[-1]
+
+
+async def test_verification_progress_without_known_size(tmp_path, monkeypatch):
+    """Ohne Gesamtgröße meldet die Prüfung Megabyte statt Prozent."""
+    monkeypatch.setattr(engine_mod, "VERIFY_REPORT_STEP", 1024 * 1024)
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    path = tmp_path / "gross.bin"
+    path.write_bytes(b"x" * (3 * 1024 * 1024))
+
+    downloader = make_downloader(
+        lambda request: httpx.Response(200, content=BODY), api, sleep, chunk_size=1024 * 1024
+    )
+    await downloader._digest_file(path, reporter)
+
+    assert any("MiB" in text for text in reporter.messages)
