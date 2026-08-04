@@ -20,6 +20,7 @@ from gogdl.model.types import (
     ManifestEntry,
     ProductRef,
     RemoteFile,
+    Report,
     SyncPlan,
 )
 from gogdl.prune.executor import PruneExecutor, freed_bytes
@@ -534,18 +535,49 @@ def _print_plan(plan: SyncPlan, prune_plan: SyncPlan, ctx: AppContext) -> None:
             for item in prune_plan.prunes:
                 print(f"  [remove] {item.path.name} - {item.reason}")
 
-    for report in plan.reports:
-        if report.kind == "orphaned":
-            print(f"Note: {report.path.name} is no longer offered by GOG (left in place)")
-        elif report.kind == "collision":
-            # Zwei Auslieferungen desselben Spiels tragen denselben Dateinamen.
-            # Beide zu laden hiesse, sie in dieselbe Datei zu schreiben.
-            print(
-                f"Skipped: {report.path.name} - two releases claim the same "
-                f"filename. {report.detail}".rstrip()
-            )
-        elif ctx.verbose:
-            print(f"Note: {report.path.name} is not part of the manifest (left untouched)")
+    _print_reports(plan.reports, ctx)
+
+
+def _print_reports(reports: Sequence[Report], ctx: AppContext) -> None:
+    """Hinweise zusammenfassen statt sie einzeln aufzuzählen.
+
+    Bei einer gewachsenen Sammlung nimmt GOG laufend Fassungen aus dem
+    Angebot, vor allem Patches. Jede davon einzeln zu melden erzeugt
+    hunderte Zeilen und begräbt die wenigen Meldungen, die wirklich eine
+    Entscheidung verlangen - allen voran die Namenskollisionen.
+    """
+    kollisionen = [r for r in reports if r.kind == "collision"]
+    verwaist = [r for r in reports if r.kind == "orphaned"]
+    fremd = [r for r in reports if r.kind not in ("collision", "orphaned")]
+
+    # Kollisionen zuerst und immer vollständig: hier bleibt eine Datei
+    # ungeladen, das muss jemand sehen.
+    for report in kollisionen:
+        print(
+            f"Skipped: {report.path.name} - two releases claim the same "
+            f"filename. {report.detail}".rstrip()
+        )
+
+    if verwaist:
+        patches = sum(1 for r in verwaist if r.path.name.startswith("patch_"))
+        rest = len(verwaist) - patches
+        teile = []
+        if patches:
+            teile.append(f"{patches} patch files")
+        if rest:
+            teile.append(f"{rest} other files")
+        print(
+            f"No longer offered by GOG: {' and '.join(teile)} - left in place. "
+            "They stay on disk and are never deleted."
+        )
+        if ctx.verbose:
+            for report in verwaist[:20]:
+                print(f"  {report.path.name}")
+            if len(verwaist) > 20:
+                print(f"  ... and {len(verwaist) - 20} more")
+
+    if fremd and ctx.verbose:
+        print(f"Not part of the manifest: {len(fremd)} files - left untouched")
 
 
 # --------------------------------------------------------------------------- download

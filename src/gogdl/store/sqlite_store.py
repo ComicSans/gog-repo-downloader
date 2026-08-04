@@ -353,6 +353,10 @@ class SqliteStore:
     def __init__(self, path: str | Path = MEMORY_PATH) -> None:
         self._path = str(path)
         self._closed = False
+        # Vor allem anderen: ``_migrate`` öffnet weiter unten selbst eine
+        # Transaktion, und ``_tx`` fragt diesen Zähler ab.
+        self._tx_depth = 0
+        self._journal_mode = "unknown"
         try:
             if self._path != MEMORY_PATH:
                 parent = Path(self._path).expanduser().parent
@@ -365,13 +369,48 @@ class SqliteStore:
             self._conn.row_factory = sqlite3.Row
             # Vor jeder Transaktion setzen - innerhalb einer ist es wirkungslos.
             self._conn.execute("PRAGMA foreign_keys = ON")
-            self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute("PRAGMA synchronous = NORMAL")
+            self._apply_journal_mode()
             _migrate(self._conn)
         except (sqlite3.Error, OSError) as exc:
             raise StoreError(f"Manifest {path!s} is not usable: {exc}") from exc
 
     # -- interne Helfer ---------------------------------------------------
+
+    def _apply_journal_mode(self) -> None:
+        """Setzt WAL, liest den wirksamen Modus zurück, richtet ``synchronous`` aus.
+
+        ``PRAGMA journal_mode = WAL`` ist eine Bitte, keine Zusicherung.
+        SQLite braucht dafür gemeinsamen Speicher (mmap) über die
+        WAL-Indexdatei; auf exFAT, auf Netzlaufwerken und auf manchen
+        externen Platten gibt es den nicht, und SQLite bleibt still beim
+        alten Rollback-Journal. Der Rückgabewert des Pragmas nennt den
+        wirklich geltenden Modus - deshalb wird er hier ausgelesen und in
+        :attr:`journal_mode` festgehalten, statt WAL zu unterstellen.
+
+        Die Wahl von ``synchronous`` hängt daran, und zwar aus einem
+        Sicherheitsgrund, nicht aus Geschmack:
+
+        * **WAL + NORMAL**: kann die Datenbank nicht beschädigen. Die
+          WAL-Datei wird nur angehängt, und der Checkpoint synchronisiert
+          vollständig. Ein Stromausfall kostet höchstens die letzten
+          Transaktionen, nie die Datei.
+        * **Rollback-Journal + NORMAL**: kann die Datenbank sehr wohl
+          beschädigen. Hier wird die Hauptdatei überschrieben, und ohne
+          fsync ist nicht garantiert, dass das Journal vorher dauerhaft
+          auf der Platte liegt. Bricht der Lauf dazwischen ab, fehlt genau
+          das, was das Zurückrollen möglich machen würde.
+
+        Fällt WAL also weg, gilt ``synchronous = FULL``. Sicherheit geht
+        vor Geschwindigkeit, und der Preis ist tragbar geworden: seit
+        :meth:`transaction` viele Einträge zu einer Transaktion bündelt,
+        kostet das eine Synchronisierung pro Bündel statt eine pro Zeile.
+        Genau dafür gibt es die Bündelung.
+        """
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        row = self._conn.execute("PRAGMA journal_mode").fetchone()
+        self._journal_mode = str(row[0]).lower() if row is not None else "unknown"
+        synchronous = "NORMAL" if self._journal_mode == "wal" else "FULL"
+        self._conn.execute(f"PRAGMA synchronous = {synchronous}")
 
     def _check_open(self) -> None:
         if self._closed:
@@ -379,8 +418,22 @@ class SqliteStore:
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
-        """Eine Transaktion; bei Fehlern Rollback und ``StoreError``."""
+        """Eine Transaktion; bei Fehlern Rollback und ``StoreError``.
+
+        Läuft bereits eine Transaktion des Aufrufers (:meth:`transaction`),
+        wird weder ``BEGIN`` noch ``COMMIT`` abgesetzt: SQLite kennt keine
+        verschachtelten Transaktionen, und die äußere entscheidet ohnehin
+        über Commit und Rollback. Ein Fehler kommt auch dann als
+        ``StoreError`` heraus, damit die äußere Ebene ihn erkennt und
+        zurückrollt.
+        """
         self._check_open()
+        if self._tx_depth > 0:
+            try:
+                yield self._conn
+            except sqlite3.Error as exc:
+                raise StoreError(f"Writing to the manifest failed: {exc}") from exc
+            return
         try:
             self._conn.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
@@ -408,6 +461,82 @@ class SqliteStore:
             return list(self._conn.execute(sql, params))
         except sqlite3.Error as exc:
             raise StoreError(f"Reading from the manifest failed: {exc}") from exc
+
+    # -- über das Protocol hinaus -----------------------------------------
+    #
+    # Weder ``journal_mode`` noch ``transaction``/``update_entries`` stehen im
+    # Protocol ``Store``. Dorthin gehörten sie, aber ``model/protocols.py`` ist
+    # der Vertrag zwischen den Paketen und wird von einem Fachmodul nicht
+    # geändert. Ein Aufrufer, der auf das Protocol typisiert ist, fragt sie
+    # deshalb ab, statt sie vorauszusetzen.
+
+    @property
+    def journal_mode(self) -> str:
+        """Der tatsächlich geltende Journalmodus, kleingeschrieben.
+
+        ``"wal"`` im Normalfall, ``"delete"`` oder ``"truncate"``, wenn das
+        Dateisystem WAL abgelehnt hat, ``"memory"`` bei einer
+        Speicherdatenbank. Ein Aufrufer kann daran erkennen, dass er auf
+        einem Ablageort arbeitet, der teurer schreibt.
+        """
+        return self._journal_mode
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Fasst alle Schreibzugriffe im Block zu **einer** Transaktion zusammen.
+
+        Ohne diesen Block ist jeder einzelne Schreibaufruf eine eigene
+        Transaktion mit eigener Synchronisierung. Auf einer lokalen Platte
+        fällt das nicht auf, auf einem Ablageort ohne WAL sehr wohl: ein
+        Import von 2412 Einträgen lief so rund neun Minuten.
+
+        Ein Fehler im Block rollt alles zurück, was im Block geschrieben
+        wurde - ein halb übernommener Stand entsteht nicht. Fehler aus
+        SQLite kommen als ``StoreError`` heraus; eine Ausnahme des
+        Aufrufers selbst wird unverändert weitergereicht, nachdem
+        zurückgerollt wurde. Sie als ``StoreError`` auszugeben würde ihre
+        Herkunft verschleiern.
+
+        Die Zusicherung gilt für einen Fehler, der den Block **verlässt**.
+        Wer einen ``StoreError`` im Block abfängt und weitermacht,
+        committet am Ende, was bis zum Fehler geschrieben wurde. Für einen
+        späteren Aufrufer, der je Datei schreibt und Fehler einzeln melden
+        will (``cmd_download``), ist das die Falle: dann gehört jede Datei
+        in einen eigenen Block.
+
+        Verschachtelung ist erlaubt und zählt nur mit: erst der äußerste
+        Block committet. Der Zähler wird in ``finally`` zurückgesetzt, denn
+        ein hängengebliebener Zähler wäre der gefährlichste Fehler von
+        allen - jeder spätere Schreibzugriff würde still nie committen.
+        """
+        self._check_open()
+        if self._tx_depth > 0:
+            self._tx_depth += 1
+            try:
+                yield None
+            finally:
+                self._tx_depth -= 1
+            return
+
+        with self._tx():
+            self._tx_depth += 1
+            try:
+                yield None
+            finally:
+                self._tx_depth -= 1
+
+    def update_entries(self, entries: Sequence[ManifestEntry]) -> None:
+        """Schreibt viele Einträge in einer einzigen Transaktion.
+
+        Bequemlichkeit über :meth:`transaction`, sonst nichts: dieselbe
+        Wirkung wie :meth:`update_entry` je Eintrag, aber ein Commit statt
+        vieler. Eine leere Folge fasst die Datenbank überhaupt nicht an.
+        """
+        if not entries:
+            return
+        with self.transaction():
+            for entry in entries:
+                self.update_entry(entry)
 
     # -- Store ------------------------------------------------------------
 

@@ -766,3 +766,157 @@ def test_fremdes_produkt_in_replace_remote_wird_abgelehnt(store: SqliteStore) ->
     with pytest.raises(StoreError):
         store.replace_remote(PRODUCT_ID, [remote(), fremd], SEEN_1)
     assert store.entries() == [], "abgebrochene Transaktion darf nichts hinterlassen"
+
+
+# ---------------------------------------------------------------------------
+# Bündelung mehrerer Schreibzugriffe zu einer Transaktion
+# ---------------------------------------------------------------------------
+
+
+def eintrag(file_id: str) -> ManifestEntry:
+    """Ein vollständiger Eintrag, je ``file_id`` in einem eigenen Slot."""
+    return ManifestEntry(
+        slot=SlotKey(PRODUCT_ID, FileKind.EXTRA, variant=file_id),
+        file_id=file_id,
+        filename=f"{file_id}.bin",
+        version="1.0.0",
+        size=100,
+        md5="aaaa",
+        downlink=f"/downlink/{file_id}",
+        relative_path=f"Spiel/{file_id}.bin",
+        state=LocalState.COMPLETE,
+        bytes_done=100,
+        last_seen_utc=SEEN_1,
+        last_verified_utc=SEEN_1,
+    )
+
+
+def zaehle_transaktionen(store: SqliteStore) -> list[str]:
+    """Hängt einen Mitschnitt an die Verbindung und gibt die Liste zurück.
+
+    ``sqlite3.Connection`` bietet keinen Commit-Hook an; ``set_trace_callback``
+    sieht dafür jede abgesetzte Anweisung und damit ``BEGIN``/``COMMIT``
+    unmittelbar. Das zählt die Transaktionen, statt sie zu behaupten.
+    """
+    mitschnitt: list[str] = []
+
+    def aufzeichnen(anweisung: str) -> None:
+        text = anweisung.strip().upper()
+        if text.startswith(("BEGIN", "COMMIT", "ROLLBACK")):
+            mitschnitt.append(text.split()[0])
+
+    store._conn.set_trace_callback(aufzeichnen)
+    return mitschnitt
+
+
+def unschreibbar(file_id: str) -> ManifestEntry:
+    """Ein Eintrag, an dem SQLite scheitern muss: ``filename`` ist NOT NULL."""
+    kaputt = eintrag(file_id)
+    kaputt.filename = None  # type: ignore[assignment]
+    return kaputt
+
+
+def test_gebuendelt_geschrieben_ergibt_denselben_zustand(tmp_path) -> None:
+    """Einzeln und gebündelt müssen zum selben Manifest führen."""
+    eintraege = [eintrag(f"f{i}") for i in range(10)]
+
+    einzeln = SqliteStore(tmp_path / "einzeln.sqlite3")
+    gebuendelt = SqliteStore(tmp_path / "gebuendelt.sqlite3")
+    try:
+        for item in eintraege:
+            einzeln.update_entry(item)
+        gebuendelt.update_entries(eintraege)
+
+        assert gebuendelt.entries() == einzeln.entries()
+        assert len(gebuendelt.entries()) == 10
+    finally:
+        einzeln.close()
+        gebuendelt.close()
+
+
+def test_buendelung_setzt_genau_eine_transaktion_ab(store: SqliteStore) -> None:
+    """Der eigentliche Nachweis: zehn Einträge, ein BEGIN, ein COMMIT."""
+    eintraege = [eintrag(f"f{i}") for i in range(10)]
+
+    mitschnitt = zaehle_transaktionen(store)
+    store.update_entries(eintraege)
+    assert mitschnitt == ["BEGIN", "COMMIT"]
+
+    # Zum Vergleich derselbe Schreibvorgang ohne Bündelung.
+    mitschnitt.clear()
+    for item in eintraege:
+        store.update_entry(item)
+    assert mitschnitt.count("BEGIN") == 10
+    assert mitschnitt.count("COMMIT") == 10
+
+
+def test_leere_buendelung_faesst_die_datenbank_nicht_an(store: SqliteStore) -> None:
+    mitschnitt = zaehle_transaktionen(store)
+    store.update_entries([])
+    assert mitschnitt == []
+
+
+def test_verschachtelte_transaktion_committet_nur_aussen(store: SqliteStore) -> None:
+    mitschnitt = zaehle_transaktionen(store)
+    with store.transaction():
+        store.update_entry(eintrag("f1"))
+        with store.transaction():
+            store.update_entry(eintrag("f2"))
+        store.update_entry(eintrag("f3"))
+
+    assert mitschnitt == ["BEGIN", "COMMIT"]
+    assert {e.file_id for e in store.entries()} == {"f1", "f2", "f3"}
+
+
+def test_fehler_in_der_buendelung_laesst_keinen_teil_zurueck(store: SqliteStore) -> None:
+    """``filename`` ist NOT NULL - der dritte Eintrag scheitert in SQLite."""
+    eintraege = [eintrag("f1"), eintrag("f2"), unschreibbar("f3"), eintrag("f4")]
+
+    mitschnitt = zaehle_transaktionen(store)
+    with pytest.raises(StoreError):
+        store.update_entries(eintraege)
+
+    assert store.entries() == [], "auch der bereits geschriebene Teil muss weg sein"
+    assert mitschnitt == ["BEGIN", "ROLLBACK"]
+
+
+def test_ausnahme_des_aufrufers_rollt_zurueck_und_bleibt_sie_selbst(
+    store: SqliteStore,
+) -> None:
+    """Ein Fehler des Aufrufers wird nicht als ``StoreError`` verkleidet."""
+    with pytest.raises(ValueError):
+        with store.transaction():
+            store.update_entry(eintrag("f1"))
+            raise ValueError("Abbruch mitten drin")
+
+    assert store.entries() == []
+
+
+def test_transaktionszaehler_bleibt_nach_einem_fehler_nicht_haengen(
+    store: SqliteStore,
+) -> None:
+    """Ein hängender Zähler würde jeden späteren Commit still verschlucken."""
+    with pytest.raises(StoreError):
+        store.update_entries([unschreibbar("f1")])
+
+    store.update_entry(eintrag("f2"))
+    assert [e.file_id for e in store.entries()] == ["f2"]
+
+
+def test_wirksamer_journalmodus_ist_auslesbar(tmp_path) -> None:
+    """Auf einer lokalen Platte greift WAL; entscheidend ist der Rückgabewert."""
+    store = SqliteStore(tmp_path / "manifest.sqlite3")
+    try:
+        assert store.journal_mode == "wal"
+        # Der festgehaltene Wert ist der, den SQLite selbst meldet.
+        gemeldet = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
+        assert store.journal_mode == gemeldet.lower()
+        assert store._conn.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
+    finally:
+        store.close()
+
+
+def test_speicherdatenbank_meldet_ihren_eigenen_modus(store: SqliteStore) -> None:
+    """``:memory:`` kann kein WAL - der Store behauptet es deshalb auch nicht."""
+    assert store.journal_mode == "memory"
+    assert store._conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL

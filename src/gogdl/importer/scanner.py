@@ -16,7 +16,7 @@ zweiten Blick.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -479,6 +479,7 @@ def apply_import(
     now_utc: str,
     *,
     trust: Trust = Trust.NONE,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> ImportSummary:
     """Schreibt die sicheren Treffer des Plans ins Manifest.
 
@@ -495,10 +496,37 @@ def apply_import(
     besteht, wird übernommen.
 
     Die Eingabe-Einträge bleiben unverändert - geschrieben werden Kopien.
+
+    **Geschrieben wird erst am Ende, in einem Zug.** Die Schleife rechnet
+    und prüft nur; der Store bekommt die fertige Liste danach über
+    ``update_entries``. Zwei Gründe, beide wiegen schwerer als die
+    Reihenfolge:
+
+    * Ein Schreibaufruf je Eintrag ist eine Transaktion je Eintrag. Auf
+      einem Ablageort ohne WAL - exFAT, Netzlaufwerk - kostet das je eine
+      eigene Synchronisierung; ein Lauf über 2412 Einträge brauchte so rund
+      neun Minuten.
+    * Die Transaktion darf nicht offen stehen, während gerechnet wird. Mit
+      :attr:`Trust.MD5` liest die Schleife jede Datei vollständig; über
+      einer großen Sammlung sind das Stunden, und solange läge die
+      Datenbank für jeden anderen Zugriff gesperrt.
+
+    Der Preis, bewusst gezahlt: ein abgebrochener Lauf schreibt nun gar
+    nichts statt des bereits Geprüften. Der Import ist wiederholbar und
+    ändert nichts auf der Platte, ein zweiter Anlauf kostet also nur Zeit -
+    ein halb übernommener Stand wäre teurer.
+
+    ``on_progress`` wird, wenn gesetzt, nach jedem **bearbeiteten** Treffer
+    mit ``(bearbeitet, gesamt)`` gerufen - auch für die, die an der
+    MD5-Prüfung scheitern, denn die Arbeit ist getan. Diese Funktion gibt
+    selbst nichts aus; wie der Fortschritt aussieht, entscheidet allein der
+    Aufrufer.
     """
     imported: list[ManifestEntry] = []
     rejected: list[ImportRejection] = []
     unverifiable: list[Path] = []
+    total = len(plan.matches)
+    processed = 0
 
     for match in plan.matches:
         entry = match.entry
@@ -520,6 +548,9 @@ def apply_import(
                     rejected.append(
                         ImportRejection(entry=entry, path=match.path, reason=detail)
                     )
+                    processed += 1
+                    if on_progress is not None:
+                        on_progress(processed, total)
                     continue
                 verified_at = now_utc
         elif trust is Trust.SIZE:
@@ -548,11 +579,36 @@ def apply_import(
             bytes_done=match.size,
             last_verified_utc=verified_at,
         )
-        store.update_entry(updated)
         imported.append(updated)
+        processed += 1
+        if on_progress is not None:
+            on_progress(processed, total)
+
+    _write_entries(store, imported)
 
     return ImportSummary(
         imported=tuple(imported),
         rejected=tuple(rejected),
         unverifiable=tuple(unverifiable),
     )
+
+
+def _write_entries(store: Store, entries: Sequence[ManifestEntry]) -> None:
+    """Schreibt gebündelt, wo der Store es kann, sonst einzeln.
+
+    ``update_entries`` steht nicht im Protocol ``Store`` - dort gehörte es
+    hin, aber ``model/protocols.py`` ist der Vertrag zwischen den Paketen
+    und wird von einem Fachmodul nicht geändert. Deshalb wird die Bündelung
+    hier erfragt statt vorausgesetzt: ein Store, der sie anbietet,
+    bekommt einen Aufruf, jeder andere die bisherige Schleife. Das
+    Ergebnis ist in beiden Fällen dasselbe, nur die Anzahl der
+    Transaktionen unterscheidet sich.
+    """
+    if not entries:
+        return
+    bulk = getattr(store, "update_entries", None)
+    if callable(bulk):
+        bulk(entries)
+        return
+    for entry in entries:
+        store.update_entry(entry)

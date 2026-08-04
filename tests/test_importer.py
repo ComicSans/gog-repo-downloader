@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from gogdl.cli.context import scan_disk
+from gogdl.errors import StoreError
 from gogdl.importer import Trust, apply_import, match_existing
 from gogdl.model.types import (
     FileKind,
@@ -780,3 +781,167 @@ def test_import_veraendert_keine_datei_auf_der_platte(tmp_path: Path, trust: Tru
     store.close()
 
     assert snapshot(dest) == vorher
+
+
+# ---------------------------------------------------------------------------
+# Gebündeltes Schreiben und Fortschritt
+# ---------------------------------------------------------------------------
+
+
+def test_apply_import_schreibt_gebuendelt_in_einer_transaktion(tmp_path: Path) -> None:
+    """Der Nachweis: drei Einträge, ein BEGIN, ein COMMIT.
+
+    ``sqlite3.Connection`` bietet keinen Commit-Hook an; ``set_trace_callback``
+    sieht dafür jede abgesetzte Anweisung. Gezählt wird also wirklich, was
+    an SQLite geht, statt die Bündelung nur zu behaupten.
+    """
+    dest = tmp_path / "gog"
+    entries, on_disk = multipart_fixture(dest)
+    plan = match_existing(entries, on_disk, dest, SLUGS)
+    assert len(plan.matches) == 3
+
+    store = store_for(tmp_path)
+    mitschnitt: list[str] = []
+
+    def aufzeichnen(anweisung: str) -> None:
+        text = anweisung.strip().upper()
+        if text.startswith(("BEGIN", "COMMIT", "ROLLBACK")):
+            mitschnitt.append(text.split()[0])
+
+    store._conn.set_trace_callback(aufzeichnen)
+    try:
+        summary = apply_import(plan, store, NOW)
+        assert mitschnitt == ["BEGIN", "COMMIT"]
+        assert len(summary.imported) == 3
+        assert len(store.entries()) == 3
+    finally:
+        store._conn.set_trace_callback(None)
+        store.close()
+
+
+def test_fortschritt_wird_je_treffer_gemeldet(tmp_path: Path) -> None:
+    dest = tmp_path / "gog"
+    entries, on_disk = multipart_fixture(dest)
+    plan = match_existing(entries, on_disk, dest, SLUGS)
+
+    gemeldet: list[tuple[int, int]] = []
+    store = store_for(tmp_path)
+    summary = apply_import(
+        plan, store, NOW, on_progress=lambda d, t: gemeldet.append((d, t))
+    )
+    store.close()
+
+    assert gemeldet == [(1, 3), (2, 3), (3, 3)]
+    assert len(summary.imported) == 3
+
+
+def test_fortschritt_zaehlt_auch_abgelehnte_treffer(tmp_path: Path) -> None:
+    """Gemeldet wird bearbeitete Arbeit, nicht übernommene Einträge.
+
+    Eine an der MD5-Prüfung gescheiterte Datei wurde vollständig gelesen -
+    für den Fortschritt ist sie erledigt.
+    """
+    dest = tmp_path / "gog"
+    gut = b"E" * 1000
+    write(dest / SLUG / EXE, gut)
+    write(dest / SLUG / BIN1, b"B" * 2000)
+    entries = [
+        entry(file_id="f1", filename=EXE, size=1000, md5=hashlib.md5(gut).hexdigest()),
+        entry(file_id="f2", filename=BIN1, size=2000, md5="0" * 32, part_index=2),
+    ]
+    plan = match_existing(entries, scan_disk(dest), dest, SLUGS)
+    assert len(plan.matches) == 2
+
+    gemeldet: list[tuple[int, int]] = []
+    store = store_for(tmp_path)
+    summary = apply_import(
+        plan, store, NOW, trust=Trust.MD5, on_progress=lambda d, t: gemeldet.append((d, t))
+    )
+    store.close()
+
+    assert gemeldet == [(1, 2), (2, 2)]
+    assert len(summary.imported) == 1
+    assert len(summary.rejected) == 1
+
+
+def test_ohne_rueckruf_bleibt_das_ergebnis_dasselbe(tmp_path: Path) -> None:
+    """Der Rückruf ist reine Beobachtung und ändert am Manifest nichts."""
+    mit_dest = tmp_path / "mit" / "gog"
+    ohne_dest = tmp_path / "ohne" / "gog"
+
+    ergebnisse = []
+    for dest in (mit_dest, ohne_dest):
+        entries, on_disk = multipart_fixture(dest)
+        plan = match_existing(entries, on_disk, dest, SLUGS)
+        store = SqliteStore(dest.parent / "manifest.sqlite3")
+        rueckruf = (lambda done, total: None) if dest is mit_dest else None
+        summary = apply_import(plan, store, NOW, trust=Trust.SIZE, on_progress=rueckruf)
+        ergebnisse.append((summary, store.entries()))
+        store.close()
+
+    mit, ohne = ergebnisse
+    assert mit[0] == ohne[0]
+    assert mit[1] == ohne[1]
+
+
+def test_fortschritt_ohne_treffer_meldet_nichts(tmp_path: Path) -> None:
+    dest = tmp_path / "gog"
+    write(dest / "fremdes_spiel" / "setup.exe", b"F" * 100)
+    plan = match_existing([], scan_disk(dest), dest, SLUGS)
+    assert not plan.matches
+
+    gemeldet: list[tuple[int, int]] = []
+    store = store_for(tmp_path)
+    summary = apply_import(plan, store, NOW, on_progress=lambda d, t: gemeldet.append((d, t)))
+    store.close()
+
+    assert gemeldet == []
+    assert summary.imported == ()
+
+
+def test_apply_import_kommt_ohne_buendelung_aus(tmp_path: Path) -> None:
+    """Ein Store, der nur das Protocol erfüllt, bekommt weiter Einzelaufrufe.
+
+    ``update_entries`` steht nicht im gesperrten Protocol ``Store``, also
+    darf der Import es nicht voraussetzen.
+    """
+
+    class NurProtocolStore:
+        """Minimal, aber ohne ``update_entries``."""
+
+        def __init__(self) -> None:
+            self.geschrieben: list[ManifestEntry] = []
+
+        def update_entry(self, entry: ManifestEntry) -> None:
+            self.geschrieben.append(entry)
+
+    dest = tmp_path / "gog"
+    entries, on_disk = multipart_fixture(dest)
+    plan = match_existing(entries, on_disk, dest, SLUGS)
+
+    store = NurProtocolStore()
+    summary = apply_import(plan, store, NOW)  # type: ignore[arg-type]
+
+    assert len(store.geschrieben) == 3
+    assert list(summary.imported) == store.geschrieben
+
+
+def test_abgebrochener_import_hinterlaesst_keinen_halben_stand(tmp_path: Path) -> None:
+    """Scheitert das Schreiben, bleibt das Manifest leer statt halb gefüllt."""
+    dest = tmp_path / "gog"
+    entries, on_disk = multipart_fixture(dest)
+    plan = match_existing(entries, on_disk, dest, SLUGS)
+    assert len(plan.matches) == 3
+
+    # ``filename`` ist im Manifest NOT NULL. Erst nach der Zuordnung
+    # gesetzt, damit die Zuordnung selbst normal durchläuft und der Fehler
+    # wirklich mitten in der Bündelung auftritt.
+    plan.matches[1].entry.filename = None  # type: ignore[assignment]
+
+    store = store_for(tmp_path)
+    try:
+        with pytest.raises(StoreError):
+            apply_import(plan, store, NOW)
+        assert store.entries() == []
+    finally:
+        store.close()

@@ -6,6 +6,7 @@ jeweilige Protocol — es ändert es nicht.
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Protocol, Sequence, runtime_checkable
 
@@ -90,6 +91,25 @@ class Store(Protocol):
     def entries_for_slot(self, slot: SlotKey) -> list[ManifestEntry]: ...
 
     def update_entry(self, entry: ManifestEntry) -> None: ...
+
+    def update_entries(self, entries: Sequence[ManifestEntry]) -> None:
+        """Viele Einträge in EINER Transaktion schreiben.
+
+        Auf einem Dateisystem ohne WAL - externe Platten und Netzlaufwerke
+        fallen regelmäßig darauf zurück - kostet jede einzelne Transaktion
+        eine Synchronisierung. Der Import von 2412 Einträgen brauchte so
+        neun Minuten statt eines Augenblicks.
+        """
+        ...
+
+    def transaction(self) -> AbstractContextManager[None]:
+        """Mehrere Schreibvorgänge zu einer Transaktion zusammenfassen.
+
+        Ein Fehler, der den Block verlässt, rollt alles zurück. Wer einen
+        Fehler innerhalb des Blocks abfängt und weitermacht, schreibt das
+        bis dahin Geschriebene fest.
+        """
+        ...
 
     def remove_entry(self, slot: SlotKey, file_id: str) -> None: ...
 
