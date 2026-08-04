@@ -45,6 +45,9 @@ frei von I/O-Abhängigkeiten bleiben.
 STATE_DIRNAME = ".gogdl"
 DB_FILENAME = "manifest.sqlite3"
 
+LOCK_FILENAME = "lock"
+"""Sperrdatei im Zustandsordner, die schreibende Läufe gegeneinander abgrenzt."""
+
 
 def login_url() -> str:
     """Vollständige URL, die der Nutzer im Browser öffnet."""

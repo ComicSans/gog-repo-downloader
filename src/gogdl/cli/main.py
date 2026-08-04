@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import sys
 
@@ -11,7 +12,13 @@ from gogdl import __version__
 from gogdl.errors import GogdlError
 
 from . import commands
-from .context import _NOTATION_HINT, AppContext, build_sync_config, check_dest
+from .context import (
+    _NOTATION_HINT,
+    AppContext,
+    build_sync_config,
+    check_dest,
+    dest_lock,
+)
 
 _FILTER_HELP = "Comma-separated, e.g. --lang de,en"
 
@@ -274,6 +281,36 @@ def _parse_rate(value: str | None) -> int | None:
         raise ValueError(f"Invalid rate: {value!r}") from exc
 
 
+_SCHREIBENDE_KOMMANDOS = frozenset({"download", "sync", "update", "verify"})
+"""Kommandos, die immer schreiben und deshalb immer sperren.
+
+``download`` und ``sync`` stehen hier auch mit ``--dry-run`` drin. Die
+Aufgabenstellung nennt die Ausnahme ausdrücklich nur für ``clean`` und
+``import`` ohne ``--apply``; für die beiden anderen bleibt sie ungenannt,
+und ein Trockenlauf ist ohnehin in Sekunden vorbei.
+"""
+
+_SPERRT_NUR_MIT_APPLY = frozenset({"clean", "import"})
+"""Kommandos, die ohne ``--apply`` reine Lesevorgänge sind."""
+
+
+def _braucht_sperre(args) -> bool:
+    """Wer schreibt, sperrt.
+
+    ``status`` und ``login`` stehen bewusst nicht dabei: Wer einen
+    laufenden Download hat, soll jederzeit nachsehen dürfen, was gerade
+    passiert.
+
+    ``verify`` sieht wie ein Lesevorgang aus, setzt und entwertet aber
+    ``last_verified_utc``. Genau ein falscher Verifikationsstempel war der
+    Auslöser dieser Sperre, denn er autorisiert später eine Löschung. Neben
+    einem laufenden Download würde er auf einem Zwischenstand stempeln.
+    """
+    if args.command in _SCHREIBENDE_KOMMANDOS:
+        return True
+    return args.command in _SPERRT_NUR_MIT_APPLY and getattr(args, "apply", False)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -301,28 +338,41 @@ def main(argv: list[str] | None = None) -> int:
             limit_rate=_parse_rate(getattr(args, "limit_rate", None)),
         )
 
-        match args.command:
-            case "login":
-                return asyncio.run(commands.cmd_login(ctx, no_browser=args.no_browser))
-            case "update":
-                return asyncio.run(commands.cmd_update(ctx, only=args.only, skip=args.skip))
-            case "status":
-                return commands.cmd_status(ctx, only=args.only, skip=args.skip)
-            case "download":
-                return asyncio.run(
-                    commands.cmd_download(ctx, only=args.only, skip=args.skip)
-                )
-            case "verify":
-                return commands.cmd_verify(ctx, deep=args.deep)
-            case "import":
-                return commands.cmd_import(ctx, trust=args.trust, apply=args.apply)
-            case "clean":
-                return commands.cmd_clean(ctx, apply=args.apply)
-            case "sync":
-                return asyncio.run(commands.cmd_sync(ctx, only=args.only, skip=args.skip))
-            case _:  # pragma: no cover - argparse verhindert das
-                parser.error(f"Unknown command {args.command!r}")
-                return 1
+        # Die Sperre umschließt den gesamten Aufruf und liegt innerhalb des
+        # ``try``: Eine belegte Sperre ist ein ``GogdlError`` und soll als
+        # Meldung mit Rückgabewert herauskommen, nicht als Traceback. Das
+        # ``finally`` im Kontextmanager gibt sie auch bei Strg-C wieder frei.
+        # Hier und nicht in ``commands.py``, weil ``cmd_sync`` intern
+        # ``cmd_update`` und ``cmd_download`` aufruft und sich dort selbst
+        # aussperren würde.
+        sperre = dest_lock(config.dest) if _braucht_sperre(args) else contextlib.nullcontext()
+        with sperre:
+            match args.command:
+                case "login":
+                    return asyncio.run(commands.cmd_login(ctx, no_browser=args.no_browser))
+                case "update":
+                    return asyncio.run(
+                        commands.cmd_update(ctx, only=args.only, skip=args.skip)
+                    )
+                case "status":
+                    return commands.cmd_status(ctx, only=args.only, skip=args.skip)
+                case "download":
+                    return asyncio.run(
+                        commands.cmd_download(ctx, only=args.only, skip=args.skip)
+                    )
+                case "verify":
+                    return commands.cmd_verify(ctx, deep=args.deep)
+                case "import":
+                    return commands.cmd_import(ctx, trust=args.trust, apply=args.apply)
+                case "clean":
+                    return commands.cmd_clean(ctx, apply=args.apply)
+                case "sync":
+                    return asyncio.run(
+                        commands.cmd_sync(ctx, only=args.only, skip=args.skip)
+                    )
+                case _:  # pragma: no cover - argparse verhindert das
+                    parser.error(f"Unknown command {args.command!r}")
+                    return 1
     except GogdlError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return exc.exit_code

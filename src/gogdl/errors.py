@@ -66,3 +66,13 @@ class StoreError(GogdlError):
     """Manifest-Datenbank nicht les-/schreibbar."""
 
     exit_code = 6
+
+
+class LockBusy(GogdlError):
+    """Ein anderer schreibender Lauf arbeitet bereits auf diesem Ziel.
+
+    Eigener Code, damit ein Cron-Aufruf ihn von einem Bedienfehler
+    unterscheiden kann: Hier hilft ein späterer Versuch, dort nie.
+    """
+
+    exit_code = 8
