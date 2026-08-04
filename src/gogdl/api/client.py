@@ -7,12 +7,26 @@ Rohsignale aus §4.2 (``version``, ``size``, ``md5``) an die Planung.
 Authentifiziert wird ausschliesslich per ``Authorization: Bearer`` aus dem
 injizierten ``AuthProvider``; es gibt bewusst keinen Cookie-Jar.
 
-Gearbeitet wird auf dem Offline-Weg von ``embed.gog.com``:
+Es gibt zwei Wege zur Dateiliste, und dieses Modul kennt beide.
+
+Primaerweg ist ``api.gog.com/products/{id}?expand=downloads,expanded_dlcs``.
+Er ist der bessere, weil er drei Dinge liefert, die der andere nicht hat:
+``size`` als exakten Bytewert je Teildatei, die Adresse des Checksum-XML
+als eigenes Feld ``checksum`` der Downlink-Antwort, und vier statt zwei
+Kategorien (``installers``, ``patches``, ``language_packs``,
+``bonus_content``). Ausserdem fasst er die Aktualisierungsmarker im
+GOG-Konto nicht an.
+
+Rueckfallweg ist der Offline-Weg von ``embed.gog.com``:
 ``account/gameDetails/{id}.json`` liefert die Dateiliste, und die dort
 genannten ``manualUrl`` antworten mit einem 302 auf eine signierte
-CDN-URL. Der frueher genutzte Weg ueber ``api.gog.com/products/{id}
-?expand=downloads`` ist nicht mehr benutzbar: seine ``downlink``-URLs
-antworten mit HTTP 404 und einer HTML-Fehlerseite, mit und ohne Token.
+CDN-URL. Er greift, wenn der Produktabruf mit 404 antwortet oder keine
+Dateien liefert. Beides ist der Normalfall fuer ein Produkt, an dem
+dieses Konto keine Downloadrechte hat, und kein Fehler.
+
+Frueher stand hier, ``api.gog.com`` sei tot. Das war eine Fehldeutung:
+der beobachtete 404 kam von einem einzelnen Produkt ohne Downloadrechte,
+nicht vom Endpunkt.
 """
 
 from __future__ import annotations
@@ -35,6 +49,7 @@ from gogdl.constants import (
     EMBED_BASE,
     FILTERED_PRODUCTS_URL,
     MAX_RETRIES,
+    PRODUCT_URL,
     USER_AGENT,
     USER_DATA_URL,
 )
@@ -60,6 +75,17 @@ BACKOFF_MAX = 30.0
 
 GAME_DETAILS_URL = f"{EMBED_BASE}/account/gameDetails/{{product_id}}.json"
 """Offline-Dateiliste eines Produkts. Lokal definiert, nicht in constants.py."""
+
+PRODUCT_EXPAND = "downloads,expanded_dlcs"
+"""``expand``-Parameter des Produktabrufs: Dateiliste plus DLCs in einem Zug."""
+
+LANGUAGE_PACK_PREFIX = "langpack-"
+"""Variant-Praefix der ``language_packs``.
+
+Ohne dieses Praefix teilten sich ein Sprachpaket und ein echter Patch mit
+derselben Versionsangabe einen Slot; fuer das Aufraeumen waeren sie dann
+eine Auslieferung, und genau das verbietet KONZEPT.md §5.5.
+"""
 
 _REDIRECT_STATUS = frozenset({301, 302, 303, 307, 308})
 
@@ -183,6 +209,78 @@ def _file_id_from_manual(manual_url: Any) -> str:
     if not isinstance(manual_url, str) or not manual_url.strip():
         return ""
     return posixpath.basename(urlsplit(manual_url.strip()).path)
+
+
+def _api_file_id(part: Any) -> str:
+    """``file_id`` eines Teils aus ``downloads.*[].files[]``.
+
+    Bevorzugt wird das Feld ``id``; fehlt es, liefert der letzte Pfadteil
+    des ``downlink`` denselben Bezeichner. Beide Formen ergeben exakt den
+    Wert, den der Rueckfallweg aus der ``manualUrl`` zieht - das muss so
+    sein, sonst gaelte nach einem Wegwechsel jede Datei als neu.
+    """
+    if not isinstance(part, dict):
+        return ""
+    raw = part.get("id")
+    if raw is not None and not isinstance(raw, bool):
+        text = str(raw).strip()
+        if text:
+            return text
+    return _file_id_from_manual(part.get("downlink"))
+
+
+def _repair_serial(raw: Any) -> str:
+    """Seriennummer lesbar machen; leer oder unrettbar ergibt ``""``.
+
+    GOG liefert manche Schluessel UTF-16-kodiert aus, ohne das zu
+    kennzeichnen: der JSON-String traegt dann je Zeichen ein Byte, und
+    jedes zweite ist ein Nullbyte. ``str.isprintable`` erkennt das
+    zuverlaessig, weil ein Nullbyte nie druckbar ist. Bei ungerader Laenge
+    fehlt das letzte Fuellbyte und wird ergaenzt, sonst scheitert die
+    Dekodierung. gogrepoc behandelt denselben Fall.
+
+    Ein Schluessel, der auch nach der Reparatur nicht druckbar ist, ist
+    unbrauchbar und faellt weg - ihn roh weiterzureichen hiesse, Muell als
+    Seriennummer auszugeben.
+    """
+    if not isinstance(raw, str):
+        return ""
+    text = raw.strip()
+    if not text:
+        return ""
+    if text.isprintable():
+        return text
+    candidate = text if len(text) % 2 == 0 else text + "\x00"
+    try:
+        decoded = candidate.encode("latin-1").decode("utf-16").strip()
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        _LOG.debug("Serial key is not decodable as UTF-16 - dropped")
+        return ""
+    if not decoded or not decoded.isprintable():
+        _LOG.debug("Serial key stays unreadable after UTF-16 repair - dropped")
+        return ""
+    return decoded
+
+
+def _downlink_payload(response: httpx.Response) -> dict[str, Any] | None:
+    """JSON-Antwort eines ``api.gog.com``-Downlinks, sonst ``None``.
+
+    Streng an den Content-Type gebunden: eine 200-Antwort auf eine bereits
+    signierte CDN-URL ist die Datei selbst und darf nicht als JSON
+    fehlgedeutet werden.
+    """
+    if "json" not in response.headers.get("Content-Type", "").lower():
+        return None
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    signed = data.get("downlink")
+    if not isinstance(signed, str) or not signed.strip():
+        return None
+    return data
 
 
 def _text_or_none(value: Any) -> str | None:
@@ -334,36 +432,65 @@ class GogApiClient:
     async def product_files(self, product_id: int, *, include_dlc: bool = True) -> list[RemoteFile]:
         """Alle Dateien eines Produkts, DLCs rekursiv eingeschlossen.
 
-        Alle Eintraege derselben Sprache und Plattform sind die Teile
-        EINER Auslieferung und teilen sich einen Slot. Diese Buendelung ist
-        Vorbedingung der Prune-Sicherheit (KONZEPT.md §5.5) - mehrteilige
-        Installer duerfen nie in getrennte Slots zerfallen.
+        Primaerquelle ist ``api.gog.com/products/{id}?expand=downloads,
+        expanded_dlcs``. Antwortet der Abruf mit 404 oder liefert er
+        keinerlei Dateien, greift der Rueckfall auf gameDetails. Welcher
+        Weg gegriffen hat, steht im ``debug``-Protokoll.
+
+        Alle Teile derselben Auslieferung teilen sich einen Slot. Diese
+        Buendelung ist Vorbedingung der Prune-Sicherheit (KONZEPT.md §5.5)
+        - mehrteilige Installer duerfen nie in getrennte Slots zerfallen.
+        """
+        files = await self._files_from_product(product_id, include_dlc=include_dlc)
+        if files:
+            _LOG.debug(
+                "product_files(%s): served by api.gog.com/products (%d files)",
+                product_id,
+                len(files),
+            )
+            return files
+        _LOG.debug("product_files(%s): falling back to gameDetails", product_id)
+        return await self._files_from_details(product_id, include_dlc=include_dlc)
+
+    async def serials(self, product_id: int) -> dict[str, str]:
+        """Seriennummern eines Produkts und seiner DLCs: Titel -> Schluessel.
+
+        Eigener Abruf, bewusst nicht Teil von ``product_files``: die
+        Schluessel stehen nur in gameDetails, und wer sie nicht braucht,
+        soll den Request nicht bezahlen. Der Aufrufer entscheidet.
+
+        Nicht Teil des Protocols ``GogApi`` - wie ``content_length`` ist
+        das eine Zusatzleistung dieses Clients, kein Vertragsbestandteil.
+
+        Leere und unlesbare Schluessel fallen weg (siehe
+        ``_repair_serial``). Zwei DLCs mit identischem Titel fallen im
+        Ergebnis zusammen; die Abbildung ist auf den Titel geschluesselt.
         """
         payload = await self._get_json(GAME_DETAILS_URL.format(product_id=product_id))
-        out: list[RemoteFile] = []
-        self._collect_details(
-            payload,
-            product_id=product_id,
-            root_id=product_id,
-            is_dlc=False,
-            include_dlc=include_dlc,
-            out=out,
-            visited=set(),
-            seen_slots=set(),
-        )
+        out: dict[str, str] = {}
+        self._collect_serials(payload, str(product_id), out, set())
         return out
 
     async def resolve_downlink(self, downlink: str) -> ResolvedLink:
         """Signierte CDN-URL frisch aufloesen. Ergebnis ist kurzlebig (§5.1).
 
-        ``downlink`` ist die ``manualUrl`` aus gameDetails. GOG antwortet
-        darauf mit einem 302; die signierte URL steht im ``Location``.
+        Beide Wege enden hier, und sie antworten verschieden:
+
+        * Ein ``downlink`` aus dem Produktabruf beantwortet GOG mit 200 und
+          einem JSON-Objekt ``{"downlink": ..., "checksum": ...}``.
+        * Eine ``manualUrl`` aus gameDetails beantwortet GOG mit einem 302;
+          die signierte URL steht im ``Location``.
+
         Redirects duerfen deshalb nicht gefolgt werden - sonst laedt schon
         dieser Aufruf die ganze Datei herunter.
 
-        ``checksum_url`` ist die signierte URL ohne Query plus ``.xml`` -
-        dieser Pfad liefert gegen ein echtes Konto das Checksum-XML und
-        damit ``md5``, das dritte Aktualitaetssignal aus §4.2.
+        ``checksum_url`` kommt aus dem Feld ``checksum`` der JSON-Antwort.
+        Fehlt es, wird die Adresse wie bisher aus der signierten URL ohne
+        Query plus ``.xml`` gebaut. Diese Konstruktion ist der schwaechere
+        Weg - genau sie ist bei lgogdownloader gebrochen, als GOG das
+        Adressformat aenderte - und darum nur noch der Rueckfall. Beide
+        Formen liefern das Checksum-XML und damit ``md5``, das dritte
+        Aktualitaetssignal aus §4.2.
 
         Beide Werte sind nur so lange gueltig wie die Signatur. Sie
         gehoeren in denselben Arbeitsgang und duerfen niemals persistiert
@@ -376,6 +503,7 @@ class GogApiClient:
         """
         url = self._embed_absolute(downlink)
         response = await self._request("GET", url, follow_redirects=False)
+        checksum_url: str | None = None
         if response.status_code in _REDIRECT_STATUS:
             location = response.headers.get("Location")
             if not location:
@@ -384,8 +512,11 @@ class GogApiClient:
             # traegt ihr Token im Pfad, und jede Normalisierung koennte die
             # Signatur zerstoeren.
             signed = location if urlsplit(location).scheme else urljoin(url, location)
+        elif (payload := _downlink_payload(response)) is not None:
+            signed = str(payload["downlink"]).strip()
+            checksum_url = _text_or_none(payload.get("checksum"))
         else:
-            # 200 statt 302: die Antwort ist bereits die Datei selbst, die
+            # 200 ohne JSON: die Antwort ist bereits die Datei selbst, die
             # angefragte URL also die signierte. Kein Fehlerfall.
             signed = str(response.url)
         filename = _filename_from_url(signed)
@@ -394,7 +525,7 @@ class GogApiClient:
         return ResolvedLink(
             url=signed,
             filename=filename,
-            checksum_url=_checksum_url_from_signed(signed),
+            checksum_url=checksum_url or _checksum_url_from_signed(signed),
         )
 
     async def content_length(self, url: str) -> int | None:
@@ -465,7 +596,340 @@ class GogApiClient:
             return None
         return FileChecksum(filename=name, md5=md5, total_size=_as_int(node.get("total_size")))
 
-    # -- Payload-Auswertung ------------------------------------------
+    # -- Payload-Auswertung, Primaerweg api.gog.com ------------------
+
+    async def _files_from_product(
+        self, product_id: int, *, include_dlc: bool
+    ) -> list[RemoteFile]:
+        """Dateiliste aus dem Produktabruf; leere Liste heisst "nichts hier".
+
+        Ein 404 ist hier kein Fehler, sondern die uebliche Antwort fuer ein
+        Produkt ohne Downloadrechte, und wird zur leeren Liste. 401 und 429
+        sind etwas anderes und werden durchgereicht - ein abgelaufenes
+        Login darf nicht als "keine Dateien" durchrutschen und stillschweigend
+        in den Rueckfallweg fuehren.
+
+        Bewusst in Kauf genommen: ``ApiError`` trifft auch ein 5xx, das
+        ``_request`` nach allen Versuchen aufgibt. Eine Stoerung von
+        api.gog.com schaltet damit ebenfalls auf gameDetails um - mitsamt
+        dessen Nebenwirkung auf die Aktualisierungsmarker. Das ist die
+        gewollte Wahl: eine Dateiliste vom schlechteren Weg ist besser als
+        keine. Unterscheidbar waeren die beiden Faelle nur ueber den Text
+        der Ausnahme, denn ``ApiError`` traegt keinen Statuscode.
+        """
+        url = PRODUCT_URL.format(product_id=product_id)
+        try:
+            payload = await self._get_json(url, params={"expand": PRODUCT_EXPAND})
+        except RateLimitError:
+            raise
+        except ApiError as exc:
+            _LOG.debug("Product payload not retrievable (%s): %s", url, exc)
+            return []
+        out: list[RemoteFile] = []
+        self._collect_product(
+            payload,
+            product_id=product_id,
+            root_id=product_id,
+            is_dlc=False,
+            include_dlc=include_dlc,
+            out=out,
+            visited=set(),
+            seen_slots=set(),
+        )
+        return out
+
+    def _collect_product(
+        self,
+        payload: Any,
+        *,
+        product_id: int,
+        root_id: int,
+        is_dlc: bool,
+        include_dlc: bool,
+        out: list[RemoteFile],
+        visited: set[int],
+        seen_slots: set[SlotKey],
+    ) -> None:
+        """Ein Produktobjekt und - rekursiv - seine ``expanded_dlcs`` einsammeln.
+
+        ``root_id`` ist immer das urspruenglich angefragte Hauptprodukt und
+        wird in der Rekursion nie neu gesetzt; auch ein DLC im DLC zeigt per
+        ``dlc_of`` auf das Hauptspiel. Die Wiederholungssperre haengt wie im
+        Rueckfallweg an der Objektidentitaet, nicht an der Produkt-ID.
+
+        Ein DLC ohne eigenen ``downloads``-Block wird uebergangen und nicht
+        einzeln nachgeladen: ein Abruf je DLC waere genau die N+1-Last, die
+        dieser Weg beseitigen soll.
+        """
+        if not isinstance(payload, dict):
+            return
+        marker = id(payload)
+        if marker in visited:
+            return
+        visited.add(marker)
+
+        dlc_of = root_id if is_dlc else None
+        downloads = payload.get("downloads")
+        if isinstance(downloads, dict):
+            self._collect_api_group(
+                downloads.get("installers"),
+                product_id,
+                FileKind.INSTALLER,
+                out,
+                seen_slots,
+                dlc_of,
+                variant_prefix=None,
+            )
+            self._collect_api_group(
+                downloads.get("patches"),
+                product_id,
+                FileKind.PATCH,
+                out,
+                seen_slots,
+                dlc_of,
+                variant_prefix="",
+            )
+            # language_packs landen bei FileKind.PATCH, nicht bei EXTRA:
+            # sie tragen os und language, und nur ein Slot mit gesetzter
+            # Sprache laesst sich vom Sprachfilter der Planung ueberhaupt
+            # aussortieren (sync/planner.py prueft slot.language). Als EXTRA
+            # bekaeme der Nutzer die Pakete aller Sprachen.
+            self._collect_api_group(
+                downloads.get("language_packs"),
+                product_id,
+                FileKind.PATCH,
+                out,
+                seen_slots,
+                dlc_of,
+                variant_prefix=LANGUAGE_PACK_PREFIX,
+            )
+            self._collect_api_bonus(
+                downloads.get("bonus_content"), product_id, out, seen_slots, dlc_of
+            )
+        else:
+            _LOG.debug("Product %s has no downloads block in the product payload", product_id)
+
+        if not include_dlc:
+            return
+        for dlc in payload.get("expanded_dlcs") or []:
+            if not isinstance(dlc, dict):
+                continue
+            dlc_id = _as_int(dlc.get("id"))
+            if dlc_id is None:
+                dlc_id = root_id
+                _LOG.warning(
+                    "DLC without an id of its own in product %s - its files run under "
+                    "the product id of the base game",
+                    root_id,
+                )
+            self._collect_product(
+                dlc,
+                product_id=dlc_id,
+                root_id=root_id,
+                is_dlc=True,
+                include_dlc=include_dlc,
+                out=out,
+                visited=visited,
+                seen_slots=seen_slots,
+            )
+
+    def _collect_api_group(
+        self,
+        entries: Any,
+        product_id: int,
+        kind: FileKind,
+        out: list[RemoteFile],
+        seen_slots: set[SlotKey],
+        dlc_of: int | None,
+        *,
+        variant_prefix: str | None,
+    ) -> None:
+        """``installers``/``patches``/``language_packs`` uebersetzen.
+
+        Ein Eintrag der Liste ist genau EIN Slot; seine ``files`` sind die
+        Teile (§5.5). ``size`` steht dort als exakter Bytewert je Teil und
+        wird uebernommen - das ist der Gewinn gegenueber gameDetails, das
+        nur gerundeten Text ("1 MB") kennt. Bewusst nicht genommen wird das
+        ``total_size`` des Eintrags: bei einem mehrteiligen Installer waere
+        das fuer jeden einzelnen Teil die falsche Groesse.
+
+        ``variant_prefix`` steuert den Diskriminator: ``None`` heisst "kein
+        variant" (Installer sind durch os und Sprache eindeutig), ein
+        String heisst "aus der Versionsangabe, mit diesem Praefix". GOG
+        bietet pro os und Sprache mehrere Patches mit verschiedenen
+        Versionsspannen an; ohne diese Trennung fielen sie in einen Slot.
+        """
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            os_name = self._map_os(entry.get("os"))
+            if os_name is None:
+                continue
+            parts = [
+                part
+                for part in (entry.get("files") or [])
+                if isinstance(part, dict) and _api_file_id(part)
+            ]
+            if not parts:
+                continue
+            version = _text_or_none(entry.get("version"))
+            variant: str | None = None
+            if variant_prefix is not None:
+                base = _pick_variant((version,), entry.get("id"))
+                # Gibt weder Version noch id etwas her, bleibt das nackte
+                # Praefix - ohne den Trenner, der sonst ins Leere zeigte.
+                raw = f"{variant_prefix}{base}" if base else variant_prefix.rstrip("-")
+                variant = _normalize_variant(raw) or None
+            slot = SlotKey(
+                product_id=product_id,
+                kind=kind,
+                os=os_name,
+                language=self._api_language(entry),
+                variant=variant,
+            )
+            self._register_slot(slot, seen_slots)
+            total_parts = len(parts)
+            for index, part in enumerate(parts, start=1):
+                out.append(
+                    RemoteFile(
+                        slot=slot,
+                        file_id=_api_file_id(part),
+                        downlink=str(part.get("downlink") or "").strip(),
+                        size=_as_int(part.get("size")),
+                        version=version,
+                        part_index=index,
+                        total_parts=total_parts,
+                        dlc_of=dlc_of,
+                    )
+                )
+
+    def _collect_api_bonus(
+        self,
+        entries: Any,
+        product_id: int,
+        out: list[RemoteFile],
+        seen_slots: set[SlotKey],
+        dlc_of: int | None,
+    ) -> None:
+        """``bonus_content`` in Extras uebersetzen; je Eintrag ein Slot.
+
+        Wie im Rueckfallweg ohne Plattform und Sprache. Der Diskriminator
+        kommt zuerst aus ``name``, dann aus ``type``, zuletzt aus der
+        ``file_id`` des ersten Teils. Diese Reihenfolge ist keine
+        Geschmacksfrage: der Rueckfallweg leitet ``variant`` ebenfalls aus
+        ``name`` mit Rueckfall auf die ``file_id`` ab, und beide Wege
+        muessen denselben Slot ergeben. ``type`` zuerst faende fuer zwei
+        verschiedene Handbuecher denselben Wert ("manuals").
+
+        Eine Abweichung bleibt und ist nicht aufloesbar: api.gog.com fasst
+        einen mehrteiligen Bonus (ein Soundtrack, zwei Dateien) zu EINEM
+        Eintrag mit zwei ``files`` zusammen, gameDetails listet dieselben
+        Dateien als zwei ``extras``-Eintraege. Tragen die beiden dort
+        verschiedene Namen, ergibt der Rueckfallweg zwei Slots, wo dieser
+        Weg einen liefert. Der Wechsel des Wegs laesst den einen Slot dann
+        neu und die zwei alten verwaist aussehen. Die Buendelung hier ist
+        die richtigere - sie ist genau das, was §5.5 verlangt -, aber der
+        Unterschied ist real und trifft nur ``bonus_content``.
+        """
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            parts = [
+                part
+                for part in (entry.get("files") or [])
+                if isinstance(part, dict) and _api_file_id(part)
+            ]
+            if not parts:
+                _LOG.warning("Skipped a bonus entry without usable files in product %s", product_id)
+                continue
+            slot = SlotKey(
+                product_id=product_id,
+                kind=FileKind.EXTRA,
+                os=None,
+                language=None,
+                variant=_pick_variant(
+                    (entry.get("name"), entry.get("type")), _api_file_id(parts[0])
+                ),
+            )
+            self._register_slot(slot, seen_slots)
+            version = _text_or_none(entry.get("version"))
+            total_parts = len(parts)
+            for index, part in enumerate(parts, start=1):
+                out.append(
+                    RemoteFile(
+                        slot=slot,
+                        file_id=_api_file_id(part),
+                        downlink=str(part.get("downlink") or "").strip(),
+                        size=_as_int(part.get("size")),
+                        version=version,
+                        part_index=index,
+                        total_parts=total_parts,
+                        dlc_of=dlc_of,
+                    )
+                )
+
+    def _api_language(self, entry: dict[str, Any]) -> str | None:
+        """Sprachcode eines Produkt-Eintrags.
+
+        ``api.gog.com`` liefert in ``language`` bereits einen Code ("en",
+        "de"); der wird nur kleingeschrieben, damit er nicht neben dem
+        gleichlautenden Code des Rueckfallwegs einen zweiten Slot aufmacht.
+        Die Klartext-Abbildung greift nur, falls dort wider Erwarten ein
+        Klartext steht, und ``language_full`` ist der letzte Notnagel.
+        """
+        raw = entry.get("language")
+        text = raw.strip().lower() if isinstance(raw, str) else ""
+        if text:
+            return LANGUAGE_CODES.get(text, text)
+        return self._language_code(entry.get("language_full"))
+
+    def _collect_serials(
+        self, payload: Any, fallback_title: str, out: dict[str, str], visited: set[int]
+    ) -> None:
+        """``cdKey`` des Hauptspiels und seiner DLCs einsammeln."""
+        if not isinstance(payload, dict):
+            return
+        marker = id(payload)
+        if marker in visited:
+            return
+        visited.add(marker)
+
+        key = _repair_serial(payload.get("cdKey"))
+        if key:
+            title = str(payload.get("title") or "").strip() or fallback_title
+            if title in out and out[title] != key:
+                _LOG.warning("Two entries share the title %r - only one serial is kept", title)
+            out[title] = key
+        for dlc in payload.get("dlcs") or []:
+            self._collect_serials(dlc, fallback_title, out, visited)
+
+    # -- Payload-Auswertung, Rueckfallweg gameDetails -----------------
+
+    async def _files_from_details(
+        self, product_id: int, *, include_dlc: bool
+    ) -> list[RemoteFile]:
+        """Dateiliste aus gameDetails - der Rueckfallweg.
+
+        Nebenwirkung, die der Primaerweg nicht hat: dieser Abruf loescht
+        serverseitig die Aktualisierungsmarker im GOG-Konto des Nutzers.
+        """
+        payload = await self._get_json(GAME_DETAILS_URL.format(product_id=product_id))
+        out: list[RemoteFile] = []
+        self._collect_details(
+            payload,
+            product_id=product_id,
+            root_id=product_id,
+            is_dlc=False,
+            include_dlc=include_dlc,
+            out=out,
+            visited=set(),
+            seen_slots=set(),
+        )
+        return out
 
     def _collect_details(
         self,

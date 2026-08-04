@@ -207,11 +207,17 @@ async def _enrich(
     result: list[RemoteFile] = []
     for remote in files:
         previous = known.get((remote.slot, remote.file_id))
+        # Die Produkt-Payload nennt die exakte Bytegröße. Sie hier mit zu
+        # vergleichen ist der billigste Fund im ganzen Werkzeug: ein stiller
+        # Neu-Upload unter gleicher Version und gleichem Dateinamen wird
+        # dadurch im Normalbetrieb sichtbar, ohne eine einzige zusätzliche
+        # Anfrage. Bisher fand ihn nur --strict.
         unchanged = (
             previous is not None
             and previous.filename
             and previous.size is not None
             and previous.version == remote.version
+            and (remote.size is None or previous.size == remote.size)
             and not strict_md5
         )
         if unchanged:
@@ -228,7 +234,9 @@ async def _enrich(
         link = await api.resolve_downlink(remote.downlink)
         checksum = await api.checksum(link.checksum_url) if link.checksum_url else None
         size = remote.size or (checksum.total_size if checksum else None)
-        if size is None or strict_md5:
+        if size is None or (strict_md5 and remote.size is None):
+            # Die Kopfanfrage lohnt nur, wo die Payload selbst keine Größe
+            # nennt. Nennt sie eine, ist das bereits ein frischer Serverwert.
             size = await api.content_length(link.url) or size
         if size is None and previous is not None:
             # Nicht ermittelbar heißt „nichts Neues erfahren", nicht „hat
