@@ -1,0 +1,1 @@
+"""Gemeinsame Datentypen und Schnittstellen."""

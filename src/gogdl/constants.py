@@ -1,0 +1,48 @@
+"""Feste Endpunkte und Galaxy-Client-Credentials.
+
+Die Credentials sind die öffentlich dokumentierten Werte des GOG-Galaxy-
+Clients; dieselben verwendet auch lgogdownloader. Sie identifizieren den
+Client, nicht den Nutzer.
+"""
+
+from __future__ import annotations
+
+GALAXY_CLIENT_ID = "46899977096215655"
+GALAXY_CLIENT_SECRET = "9d85c43b1482497dbbce61f6e4aa173a433796eeae2ca8c5f6129f2dc4de46d9"
+REDIRECT_URI = "https://embed.gog.com/on_login_success?origin=client"
+
+AUTH_URL = "https://auth.gog.com/auth"
+TOKEN_URL = "https://auth.gog.com/token"
+
+EMBED_BASE = "https://embed.gog.com"
+API_BASE = "https://api.gog.com"
+
+USER_DATA_URL = f"{EMBED_BASE}/userData.json"
+FILTERED_PRODUCTS_URL = f"{EMBED_BASE}/account/getFilteredProducts"
+PRODUCT_URL = f"{API_BASE}/products/{{product_id}}"
+
+USER_AGENT = "gogdl/0.1 (+https://github.com/tobias/gog-repo-downloader)"
+
+DEFAULT_JOBS = 2
+DEFAULT_TIMEOUT = 30.0
+"""Verbindungs-/Lese-Timeout in Sekunden für Metadaten-Requests."""
+
+MAX_RETRIES = 5
+CHUNK_SIZE = 1024 * 1024
+
+TRASH_DIRNAME = ".trash"
+STATE_DIRNAME = ".gogdl"
+DB_FILENAME = "manifest.sqlite3"
+
+
+def login_url() -> str:
+    """Vollständige URL, die der Nutzer im Browser öffnet."""
+    from urllib.parse import urlencode
+
+    params = {
+        "client_id": GALAXY_CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "layout": "client2",
+    }
+    return f"{AUTH_URL}?{urlencode(params)}"
