@@ -630,6 +630,35 @@ async def cmd_download(
     return EXIT_NOTHING_TO_DO
 
 
+def _print_unmatched(paths: Sequence[Path], dest: Path, limit: int = 25) -> None:
+    """Nicht zuordenbare Dateien nach Verzeichnis zusammenfassen.
+
+    Eine gewachsene Sammlung enthält tausende Dateien, die dem Werkzeug
+    nichts sagen: Spielstände, Systemdateien, Beiwerk von Spielen. Sie
+    einzeln aufzuzählen macht die Ausgabe unlesbar und verdeckt genau die
+    Fälle, die jemand ansehen sollte. Gruppiert nach Verzeichnis wird aus
+    tausend Zeilen eine.
+    """
+    nach_ordner: dict[Path, list[Path]] = {}
+    for path in paths:
+        try:
+            ordner = path.relative_to(dest).parent
+        except ValueError:
+            ordner = path.parent
+        nach_ordner.setdefault(ordner, []).append(path)
+
+    sortiert = sorted(nach_ordner.items(), key=lambda kv: (-len(kv[1]), str(kv[0])))
+    for ordner, dateien in sortiert[:limit]:
+        ort = str(ordner) if str(ordner) != "." else "(top level)"
+        if len(dateien) == 1:
+            print(f"  {ort}/{dateien[0].name}")
+        else:
+            print(f"  {ort}/ - {len(dateien)} files")
+    if len(sortiert) > limit:
+        rest = sum(len(d) for _, d in sortiert[limit:])
+        print(f"  ... and {rest} files in {len(sortiert) - limit} more directories")
+
+
 def _prune_slot_if_complete(
     store: SqliteStore, ctx: AppContext, slot, reporter
 ) -> None:
@@ -805,8 +834,7 @@ def cmd_import(ctx: AppContext, *, trust: str, apply: bool) -> int:
         if plan.unmatched:
             print(f"Not matchable: {len(plan.unmatched)} files - left untouched")
             if ctx.verbose:
-                for path in plan.unmatched[:50]:
-                    print(f"  {path}")
+                _print_unmatched(plan.unmatched, ctx.dest)
 
         if not apply:
             print("\nNothing changed. Use --apply to adopt these files into the manifest.")
