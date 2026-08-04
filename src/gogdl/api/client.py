@@ -157,6 +157,23 @@ def _filename_from_url(url: str) -> str:
     return unquote(posixpath.basename(urlsplit(url).path))
 
 
+def _checksum_url_from_signed(signed: str) -> str:
+    """Checksum-XML zu einer signierten CDN-URL: Pfad ohne Query plus ``.xml``.
+
+    Abgeschnitten wird am ersten ``?``; nur der Pfad zaehlt, die
+    Query-Parameter tauchen in der Checksum-URL nicht auf. Bewusst ein
+    reiner String-Schnitt und kein Zerlegen und Wiederzusammensetzen: das
+    Token steckt im Pfad, und jede Normalisierung koennte die Signatur
+    zerstoeren.
+
+    Endet der Pfad bereits auf ``.xml``, wird nichts angehaengt.
+    """
+    base = signed.split("?", 1)[0]
+    if base.lower().endswith(".xml"):
+        return base
+    return base + ".xml"
+
+
 def _file_id_from_manual(manual_url: Any) -> str:
     """Letzter Pfadbestandteil einer ``manualUrl``, z. B. ``en1installer0``.
 
@@ -344,9 +361,18 @@ class GogApiClient:
         Redirects duerfen deshalb nicht gefolgt werden - sonst laedt schon
         dieser Aufruf die ganze Datei herunter.
 
-        ``checksum_url`` bleibt ``None``: ein funktionierender XML-Pfad ist
-        auf diesem Weg nicht bekannt, und ein geratener waere schlimmer als
-        keiner (``md5`` bleibt laut §4.2 zulaessigerweise leer).
+        ``checksum_url`` ist die signierte URL ohne Query plus ``.xml`` -
+        dieser Pfad liefert gegen ein echtes Konto das Checksum-XML und
+        damit ``md5``, das dritte Aktualitaetssignal aus §4.2.
+
+        Beide Werte sind nur so lange gueltig wie die Signatur. Sie
+        gehoeren in denselben Arbeitsgang und duerfen niemals persistiert
+        werden - ein gespeicherter ``checksum_url`` waere beim naechsten
+        Lauf abgelaufen.
+
+        Der Abruf des XML kostet einen eigenen Request pro Datei. Ob er
+        sich lohnt, entscheidet allein der Aufrufer (``cli/commands.py::
+        _enrich``); hier wird nur die URL geliefert, nichts geholt.
         """
         url = self._embed_absolute(downlink)
         response = await self._request("GET", url, follow_redirects=False)
@@ -365,7 +391,11 @@ class GogApiClient:
         filename = _filename_from_url(signed)
         if not filename:
             raise ApiError(f"Kein Dateiname in der signierten URL ableitbar: {url}")
-        return ResolvedLink(url=signed, filename=filename, checksum_url=None)
+        return ResolvedLink(
+            url=signed,
+            filename=filename,
+            checksum_url=_checksum_url_from_signed(signed),
+        )
 
     async def content_length(self, url: str) -> int | None:
         """Echte Bytegroesse einer signierten URL per HEAD.
@@ -392,7 +422,11 @@ class GogApiClient:
         return _as_int(response.headers.get("Content-Length"))
 
     async def checksum(self, checksum_url: str) -> FileChecksum | None:
-        """Checksum-XML einer Datei.
+        """Checksum-XML einer Datei. Kostet einen eigenen Request.
+
+        ``checksum_url`` kommt aus ``resolve_downlink`` und ist nur so
+        lange gueltig wie die Signatur - im selben Zug verwenden, nie
+        speichern.
 
         Ein fehlendes oder kaputtes XML ist laut KONZEPT.md §4.2 ein
         zulässiger Zustand (``md5`` bleibt dann ``None``) und darf den
@@ -648,7 +682,12 @@ class GogApiClient:
     # -- HTTP --------------------------------------------------------
 
     def _absolute(self, url: str) -> str:
-        """Relative Links auf ``API_BASE`` beziehen (Checksum-XML)."""
+        """Relative Links auf ``API_BASE`` beziehen.
+
+        Die Checksum-URLs aus ``resolve_downlink`` sind bereits absolut
+        und bleiben unveraendert; das hier ist nur der Notnagel fuer einen
+        relativ hereingereichten Wert.
+        """
         if urlsplit(url).scheme:
             return url
         return urljoin(API_BASE + "/", url.lstrip("/"))

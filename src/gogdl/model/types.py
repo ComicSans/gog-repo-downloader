@@ -327,6 +327,15 @@ class SyncConfig:
     include_patches: bool = False
     prune: bool = True
     keep_versions: int = 1
+    keep_old: bool = False
+    """Beiseitegelegte Vorgängerfassungen (``.old``) behalten.
+
+    Der Downloader legt eine Datei, die er sonst überschreiben müsste, als
+    ``.old`` beiseite; ohne das bliebe bei einem abgebrochenen mehrteiligen
+    Installer keine vollständige Fassung übrig. Standardmäßig verschwindet
+    sie wieder, sobald die neue Auslieferung geprüft vollständig vorliegt.
+    Wer eine Rückfallebene auf der Platte behalten will, setzt dies.
+    """
     prune_mode: PruneMode = PruneMode.DELETE
     strict_md5: bool = False
 

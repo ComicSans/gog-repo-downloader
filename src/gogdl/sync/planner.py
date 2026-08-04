@@ -1109,7 +1109,11 @@ def plan_prune(
                 )
             )
 
-        for basis, gruppe in sorted(old_leftovers.get(slot, {}).items()):
+        # Mit --keep-old bleiben beiseitegelegte Fassungen als
+        # Rueckfallebene liegen; die uebrigen Spuren sind davon unberuehrt.
+        for basis, gruppe in (
+            () if config.keep_old else sorted(old_leftovers.get(slot, {}).items())
+        ):
             parsed = _parse_version(basis)
             for path, size, generation in _keep_newest_old_generations(gruppe, keep_old):
                 plan.prunes.append(

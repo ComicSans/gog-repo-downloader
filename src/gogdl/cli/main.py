@@ -177,6 +177,16 @@ def _add_prune_flags(parser: argparse.ArgumentParser) -> None:
         default="delete",
         help="trash verschiebt nach <dest>/.trash statt zu löschen",
     )
+    parser.add_argument(
+        "--keep-old",
+        action="store_true",
+        default=False,
+        help=(
+            "Beiseitegelegte Vorgängerfassungen (.old) behalten. Ohne diesen "
+            "Schalter verschwinden sie, sobald die neue Fassung geprüft "
+            "vollständig vorliegt"
+        ),
+    )
 
 
 def _parse_rate(value: str | None) -> int | None:

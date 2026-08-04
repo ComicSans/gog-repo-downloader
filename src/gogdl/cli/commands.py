@@ -592,6 +592,8 @@ async def cmd_download(
                             # scheiterte identisch.
                             zugang_verloren = True
                     store.update_entry(entry)
+                    if result.ok:
+                        _prune_slot_if_complete(store, ctx, entry.slot, reporter)
 
                 await asyncio.gather(*(one(item) for item in plan.downloads))
 
@@ -620,6 +622,39 @@ async def cmd_download(
     if downloaded or removed_bytes:
         return EXIT_WORK_DONE
     return EXIT_NOTHING_TO_DO
+
+
+def _prune_slot_if_complete(
+    store: SqliteStore, ctx: AppContext, slot, reporter
+) -> None:
+    """Eine Auslieferung sofort aufräumen, sobald sie vollständig vorliegt.
+
+    Der Downloader legt eine überschriebene Vorgängerfassung als ``.old``
+    beiseite, statt sie zu ersetzen - sonst bliebe bei einem abgebrochenen
+    mehrteiligen Installer keine vollständige Fassung übrig. Ohne diesen
+    Aufruf lägen die Altdateien bis zum Ende des gesamten Laufs herum, was
+    bei einer grossen Sammlung viel Platz bindet.
+
+    Aufgeräumt wird erst, wenn ALLE Teile des Slots geprüft vollständig
+    sind. Die Sicherheitsprüfung ist dieselbe wie am Laufende, nur früher.
+    """
+    if not ctx.config.prune:
+        return
+    teile = store.entries_for_slot(slot)
+    if not teile or not all(teil.is_verified_complete for teil in teile):
+        return
+
+    plan = _plan_prune(store, ctx)
+    fuer_slot = [item for item in plan.prunes if item.slot == slot]
+    if not fuer_slot:
+        return
+
+    executor = PruneExecutor(ctx.dest, store, mode=ctx.config.prune_mode)
+    for result in executor.execute(fuer_slot, dry_run=ctx.dry_run):
+        if result.removed:
+            reporter.message(
+                f"entfernt: {result.item.path.name} ({human_bytes(result.item.size)})"
+            )
 
 
 def _reconcile_states(store: SqliteStore, ctx: AppContext) -> None:

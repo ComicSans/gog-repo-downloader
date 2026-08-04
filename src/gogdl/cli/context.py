@@ -102,6 +102,7 @@ def build_sync_config(args) -> SyncConfig:
         prune=getattr(args, "prune", True),
         keep_versions=getattr(args, "keep_versions", 1),
         prune_mode=PruneMode(getattr(args, "prune_mode", "delete")),
+        keep_old=getattr(args, "keep_old", False),
         strict_md5=getattr(args, "strict", False),
     )
 

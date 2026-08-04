@@ -583,8 +583,8 @@ async def test_resolve_downlink_liest_die_signierte_url_aus_dem_location_header(
     assert aufrufe[0].headers["Authorization"] == "Bearer token-123"
     assert link.url == SIGNIERT
     assert link.filename == "setup_15_days_1.0_(19285).exe"
-    # Solange kein funktionierender XML-Pfad bekannt ist, wird keiner geraten.
-    assert link.checksum_url is None
+    # Das Checksum-XML liegt unter der signierten URL plus ".xml".
+    assert link.checksum_url == SIGNIERT + ".xml"
 
 
 async def test_resolve_downlink_akzeptiert_absoluten_link():
@@ -626,13 +626,98 @@ async def test_resolve_downlink_akzeptiert_200_statt_302():
 
     assert link.url == signiert
     assert link.filename == "setup_spiel (2).bin"
-    assert link.checksum_url is None
+    assert link.checksum_url == signiert + ".xml"
 
 
 async def test_resolve_downlink_ohne_location_ist_api_error():
     client, _ = make_client(lambda request: httpx.Response(302))
     with pytest.raises(ApiError):
         await client.resolve_downlink("/downloads/x/en1installer0")
+
+
+async def test_resolve_downlink_haengt_xml_an_den_pfad_ohne_query():
+    """Die Query der signierten URL gehoert nicht in die Checksum-URL."""
+    mit_query = SIGNIERT + "?ttl=3600&sig=abc"
+
+    client, _ = make_client(lambda request: httpx.Response(302, headers={"Location": mit_query}))
+    link = await client.resolve_downlink("/downloads/15_days/en1installer0")
+
+    # Die signierte URL selbst bleibt unangetastet - sie braucht die Query.
+    assert link.url == mit_query
+    assert link.checksum_url == SIGNIERT + ".xml"
+    assert "?" not in link.checksum_url
+    assert "sig=abc" not in link.checksum_url
+
+
+async def test_resolve_downlink_haengt_kein_zweites_xml_an():
+    """Endet der Pfad schon auf .xml, wird nichts angehaengt."""
+    signiert = "https://gog-cdn-fastly.gog.com/token=x/secure/offline/liste.xml"
+
+    client, _ = make_client(lambda request: httpx.Response(302, headers={"Location": signiert}))
+    link = await client.resolve_downlink("/downloads/x/en1installer0")
+
+    assert link.checksum_url == signiert
+    assert not link.checksum_url.endswith(".xml.xml")
+
+
+async def test_resolve_downlink_und_checksum_liefern_md5():
+    """Zusammenspiel: aufloesen, dann das XML dahinter holen.
+
+    Zwei Requests - das ist der Preis der Pruefsumme, ein eigener Abruf
+    pro Datei zusaetzlich zur Aufloesung.
+    """
+    aufrufe: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        aufrufe.append(str(request.url))
+        if request.url.path.endswith(".xml"):
+            return httpx.Response(
+                200,
+                text=(
+                    '<file name="setup_15_days_1.0_(19285).exe" available="1" '
+                    'notavailablemsg="" md5="eed77e8beeb270924d0aabbccddeeff0" '
+                    'chunks="1" total_size="821824"/>'
+                ),
+            )
+        return httpx.Response(302, headers={"Location": SIGNIERT})
+
+    client, _ = make_client(handler)
+    link = await client.resolve_downlink("/downloads/15_days/en1installer0")
+    result = await client.checksum(link.checksum_url)
+
+    assert len(aufrufe) == 2
+    assert aufrufe[1] == SIGNIERT + ".xml"
+    assert result is not None
+    assert result.filename == "setup_15_days_1.0_(19285).exe"
+    assert result.md5 == "eed77e8beeb270924d0aabbccddeeff0"
+    assert result.total_size == 821824
+
+
+async def test_checksum_url_mit_404_ist_kein_fehler():
+    """GOG bietet nicht fuer jede Datei ein XML an - fehlt es, fehlt md5."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(".xml"):
+            return httpx.Response(404, text="<html>not found</html>")
+        return httpx.Response(302, headers={"Location": SIGNIERT})
+
+    client, _ = make_client(handler)
+    link = await client.resolve_downlink("/downloads/15_days/en1installer0")
+
+    assert link.checksum_url == SIGNIERT + ".xml"
+    assert await client.checksum(link.checksum_url) is None
+
+
+async def test_checksum_xml_ohne_total_size_ist_gueltig():
+    """Fehlt total_size, bleibt md5 trotzdem verwertbar."""
+    client, _ = make_client(
+        lambda request: httpx.Response(200, text='<file name="a.exe" md5="abc" available="1"/>')
+    )
+    result = await client.checksum(SIGNIERT + ".xml")
+
+    assert result is not None
+    assert result.md5 == "abc"
+    assert result.total_size is None
 
 
 # -- content_length ---------------------------------------------------
