@@ -12,6 +12,7 @@ von diesen Tests nicht angefasst - auch nicht lesend.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -285,6 +286,139 @@ def test_gleicher_name_zweimal_im_produkt_ist_nicht_eindeutig(tmp_path: Path) ->
 
     assert not plan.matches
     assert len(plan.unsure) == 2
+
+
+def _sprachfassungen(
+    filename: str, groessen: Sequence[int]
+) -> list[ManifestEntry]:
+    """Ein Installer, den GOG unter demselben Namen je Sprache ausliefert.
+
+    Jede Sprachfassung ist ein eigener Slot mit eigenem ``file_id``, aber
+    alle tragen denselben Dateinamen. Genau dieser Fall trat im echten Lauf
+    68-mal auf.
+    """
+    sprachen = ["de", "en", "fr", "es", "it", "pl", "ru", "pt", "cz", "jp"]
+    return [
+        entry(
+            slot=SlotKey(
+                product_id=PRODUCT_ID,
+                kind=FileKind.INSTALLER,
+                os=OsName.WINDOWS,
+                language=sprachen[index],
+            ),
+            file_id=f"f{index}",
+            filename=filename,
+            size=groesse,
+            total_parts=1,
+        )
+        for index, groesse in enumerate(groessen)
+    ]
+
+
+def test_zehn_sprachfassungen_die_groesse_entscheidet(tmp_path: Path) -> None:
+    """Der Kernfall: der Name passt zehnmal, die Größe genau einmal.
+
+    Vor der Zweistufigkeit lehnte der Import hier mit "name matches 10
+    entries" ab, obwohl er die Größen längst kannte.
+    """
+    dest = tmp_path / "gog"
+    name = "setup_metro_2033_redux_2.0.0.2.exe"
+    write(dest / SLUG / name, b"M" * 1050)
+    entries = _sprachfassungen(name, [1000 + 10 * index for index in range(10)])
+
+    plan = match_existing(entries, scan_disk(dest), dest, SLUGS)
+
+    assert len(plan.matches) == 1
+    assert not plan.unsure
+    treffer = plan.matches[0]
+    assert treffer.size == 1050
+    # Und zwar die Fassung mit passender Größe, nicht irgendeine.
+    assert treffer.entry.size == 1050
+    assert treffer.entry.file_id == "f5"
+    assert treffer.entry.slot.language == "pl"
+
+    store = store_for(tmp_path)
+    apply_import(plan, store, NOW)
+    geschrieben = store.entries(PRODUCT_ID)
+    store.close()
+
+    assert len(geschrieben) == 1
+    assert geschrieben[0].file_id == "f5"
+    assert geschrieben[0].relative_path == f"{SLUG}/{name}"
+
+
+def test_gleicher_name_und_gleiche_groesse_bleibt_abgelehnt(tmp_path: Path) -> None:
+    """Zwei Sprachfassungen identischer Größe - hier ist nichts zu entscheiden."""
+    dest = tmp_path / "gog"
+    name = "setup_gray_matter_2.2.0.8-1.bin"
+    write(dest / SLUG / name, b"G" * 2000)
+    entries = _sprachfassungen(name, [2000, 2000])
+
+    plan = match_existing(entries, scan_disk(dest), dest, SLUGS)
+
+    assert not plan.matches
+    assert len(plan.unsure) == 1
+    grund = plan.unsure[0].reason
+    # Die Begründung muss den echten Gleichstand vom bloßen Namensdoppel
+    # unterscheiden - ein Mensch soll sehen, dass die Größe nicht half.
+    assert "name and size match 2 entries" in grund
+    assert not plan.unsure[0].entry
+
+
+def test_gleicher_name_aber_keine_passende_groesse_bleibt_unsicher(
+    tmp_path: Path,
+) -> None:
+    """Veraltete Fassung: der Name passt mehrfach, die Größe zu keinem Eintrag."""
+    dest = tmp_path / "gog"
+    name = "setup_the_witcher_patch.exe"
+    write(dest / SLUG / name, b"W" * 3985000)
+    entries = _sprachfassungen(name, [3985008, 4000000])
+
+    plan = match_existing(entries, scan_disk(dest), dest, SLUGS)
+
+    assert not plan.matches
+    assert len(plan.unsure) == 1
+    grund = plan.unsure[0].reason
+    assert "3985000" in grund
+    assert "3985008" in grund and "4000000" in grund
+
+
+def test_zwei_dateien_auf_denselben_eintrag_bleiben_beide_liegen(
+    tmp_path: Path,
+) -> None:
+    """Die Eindeutigkeit gilt in beide Richtungen, auch nach Stufe 1."""
+    dest = tmp_path / "gog"
+    name = "handbuch.pdf"
+    write(dest / SLUG / name, b"P" * 500)
+    write(dest / SLUG / "extras" / name, b"Q" * 500)
+    entries = _sprachfassungen(name, [500, 750, 900])
+
+    plan = match_existing(entries, scan_disk(dest), dest, SLUGS)
+
+    assert not plan.matches
+    assert len(plan.unsure) == 2
+    for kandidat in plan.unsure:
+        assert "2 files match the same entry" in kandidat.reason
+
+
+def test_gleichnamiger_eintrag_ohne_sollgroesse_verhindert_die_zuordnung(
+    tmp_path: Path,
+) -> None:
+    """Ohne Sollgröße ist ein Eintrag nicht ausschließbar - also kein Treffer.
+
+    Sonst würde die Datei einer Fassung zugeschlagen, obwohl die andere
+    genauso gut passen könnte.
+    """
+    dest = tmp_path / "gog"
+    name = "setup_master_of_magic.sh"
+    write(dest / SLUG / name, b"S" * 1000)
+    entries = _sprachfassungen(name, [1000, None])
+
+    plan = match_existing(entries, scan_disk(dest), dest, SLUGS)
+
+    assert not plan.matches
+    assert len(plan.unsure) == 1
+    assert "expected size" in plan.unsure[0].reason
 
 
 def test_eintrag_ohne_sollgroesse_wird_nicht_zugeordnet(tmp_path: Path) -> None:

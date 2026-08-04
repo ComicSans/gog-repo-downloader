@@ -187,13 +187,18 @@ def match_existing(
        das Produktverzeichnis dagegen schon.
     2. Der Dateiname stimmt **exakt** mit ``entry.filename`` überein,
        Groß-/Kleinschreibung ausgenommen.
-    3. Die Größe stimmt mit ``entry.size`` überein -> sicherer Treffer.
-    4. Name passt, Größe weicht ab -> unsicherer Kandidat. Das ist meist
-       eine andere Version oder ein abgebrochener Download; beides darf
-       nicht als vollständig gelten.
-    5. Kein Namenstreffer -> nicht zuordenbar. Über Präfixe oder
+    3. Name und Größe zusammen treffen genau einen Eintrag -> sicherer
+       Treffer. Der Name allein darf dabei ruhig auf mehrere passen: GOG
+       liefert dieselbe Datei je Sprache unter demselben Namen aus, und
+       die Sprachfassungen unterscheiden sich fast immer in der Größe.
+    4. Name und Größe treffen mehrere Einträge -> unsicherer Kandidat.
+       Hier ist wirklich nichts zu entscheiden.
+    5. Name passt, Größe zu keinem der gleichnamigen Einträge -> unsicherer
+       Kandidat. Das ist meist eine andere Version oder ein abgebrochener
+       Download; beides darf nicht als vollständig gelten.
+    6. Kein Namenstreffer -> nicht zuordenbar. Über Präfixe oder
        Ähnlichkeit wird **nicht** geraten.
-    6. Verzeichnisse ohne bekannten Slug sind vollständig nicht zuordenbar.
+    7. Verzeichnisse ohne bekannten Slug sind vollständig nicht zuordenbar.
 
     Eindeutig heißt in beide Richtungen eindeutig: passt eine Datei auf
     zwei Einträge oder ein Eintrag auf zwei Dateien (derselbe Name in der
@@ -227,45 +232,22 @@ def match_existing(
         if path in occupied:
             continue  # Gehört bereits einem Eintrag mit lokaler Ablage.
         if len(parts) < 2 or parts[0] not in known_dirs:
-            # Regel 6: unbekanntes Verzeichnis - oder eine Datei direkt in
+            # Regel 7: unbekanntes Verzeichnis - oder eine Datei direkt in
             # der Wurzel, die zu keinem Produkt gehören kann.
             unmatched.append(path)
             continue
 
-        matches = by_key.get((parts[0], _fold(path.name)))
-        if not matches:
-            unmatched.append(path)  # Regel 5: kein Namenstreffer, kein Raten.
-            continue
-        if len(matches) > 1:
-            unsure.append(
-                ImportCandidate(
-                    path=path,
-                    reason=f"name matches {len(matches)} entries - not unique",
-                )
-            )
+        candidates = by_key.get((parts[0], _fold(path.name)))
+        if not candidates:
+            unmatched.append(path)  # Regel 6: kein Namenstreffer, kein Raten.
             continue
 
-        entry = matches[0]
-        if entry.size is None:
-            unsure.append(
-                ImportCandidate(
-                    path=path,
-                    reason="no expected size in the manifest - not checkable",
-                    entry=entry,
-                )
-            )
-            continue
-        if entry.size != size:
-            unsure.append(
-                ImportCandidate(
-                    path=path,
-                    reason=f"size {size} instead of {entry.size}",
-                    entry=entry,
-                )
-            )
+        chosen = _select_entry(candidates, path, size)
+        if isinstance(chosen, ImportCandidate):
+            unsure.append(chosen)
             continue
 
-        staged.append((entry, path, "/".join(parts), size))
+        staged.append((chosen, path, "/".join(parts), size))
 
     matches_out, ambiguous = _resolve_entry_conflicts(staged)
     unsure.extend(ambiguous)
@@ -298,6 +280,74 @@ def _partition_entries(
             continue
         importable.append(entry)
     return importable, occupied
+
+
+def _select_entry(
+    candidates: Sequence[ManifestEntry], path: Path, size: int
+) -> ManifestEntry | ImportCandidate:
+    """Wählt unter gleichnamigen Einträgen den einen, der zur Datei gehört.
+
+    Zweistufig: der Name grenzt ein, die Größe entscheidet. Der Grund ist
+    die Auslieferung von GOG selbst - ein Produkt mit zehn Sprachfassungen
+    hat zehn Manifest-Einträge desselben Dateinamens, je einen pro Slot.
+    Der Name allein taugt dort nicht als Schlüssel, die Bytegröße meistens
+    schon.
+
+    Zurück kommt entweder der eine passende Eintrag oder ein fertig
+    begründeter :class:`ImportCandidate`. Die Begründungen sind bewusst
+    unterscheidbar: "keine passende Größe" ist ein Fund (meist eine
+    veraltete Fassung), "gleicher Name **und** gleiche Größe" ist ein
+    echter Gleichstand, bei dem nichts zu entscheiden war.
+    """
+    if len(candidates) == 1:
+        # Der Normalfall. Bewusst getrennt gehalten: hier kann die
+        # Begründung den Eintrag benennen, unten kann sie das nicht.
+        entry = candidates[0]
+        if entry.size is None:
+            return ImportCandidate(
+                path=path,
+                reason="no expected size in the manifest - not checkable",
+                entry=entry,
+            )
+        if entry.size != size:
+            return ImportCandidate(
+                path=path,
+                reason=f"size {size} instead of {entry.size}",
+                entry=entry,
+            )
+        return entry
+
+    # Ein Eintrag ohne Sollgröße lässt sich nicht ausschließen. Er wäre
+    # damit immer ein zweiter möglicher Empfänger - also kein Treffer.
+    unsized = [item for item in candidates if item.size is None]
+    if unsized:
+        return ImportCandidate(
+            path=path,
+            reason=(
+                f"{len(candidates)} entries share this name, {len(unsized)} "
+                "of them without expected size - not checkable"
+            ),
+        )
+
+    by_size = [item for item in candidates if item.size == size]
+    if len(by_size) == 1:
+        return by_size[0]
+    if by_size:
+        # Zwei Sprachfassungen gleicher Größe. Weder Name noch Größe
+        # trennen sie, und geraten wird nicht.
+        return ImportCandidate(
+            path=path,
+            reason=(
+                f"name and size match {len(by_size)} entries "
+                "- cannot tell which language"
+            ),
+        )
+
+    expected = " or ".join(
+        str(item)
+        for item in sorted({item.size for item in candidates if item.size is not None})
+    )
+    return ImportCandidate(path=path, reason=f"size {size} instead of {expected}")
 
 
 def _resolve_entry_conflicts(

@@ -827,7 +827,7 @@ def cmd_import(ctx: AppContext, *, trust: str, apply: bool) -> int:
 
         print(f"Matched: {len(plan.matches)} files, {human_bytes(plan.match_bytes)}")
         if plan.unsure:
-            print(f"Unsure (name fits, size does not): {len(plan.unsure)} - skipped")
+            print(f"Unsure, not adopted: {len(plan.unsure)}")
             if ctx.verbose:
                 for candidate in plan.unsure:
                     print(f"  {candidate.path.name}: {candidate.reason}")
