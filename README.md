@@ -17,7 +17,7 @@ GOG games are DRM-free, which makes archiving them straightforward. They are not
 ## Install
 
 ```bash
-git clone https://github.com/tobias/gog-repo-downloader
+git clone https://github.com/ComicSans/gog-repo-downloader
 cd gog-repo-downloader
 ./gogdl.sh --help          # sets everything up on first run
 ```

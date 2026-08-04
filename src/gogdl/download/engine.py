@@ -523,6 +523,7 @@ class HttpDownloader:
         handle = await asyncio.to_thread(open, path, "rb")
         try:
             done = 0
+            reported = 0
             next_report = VERIFY_REPORT_STEP
             while True:
                 read = await asyncio.to_thread(_hash_block, handle, hasher, self._chunk_size)
@@ -531,7 +532,14 @@ class HttpDownloader:
                 done += read
                 if reporter is not None and done >= next_report:
                     reporter.message(f"Verifying {path.name}: {_share(done, total)}")
+                    reported = done
                     next_report = done + VERIFY_REPORT_STEP
+            # Die Dateigröße ist kein Vielfaches des Meldeabstands: der letzte
+            # Abschnitt bliebe sonst stumm und die Prüfung endete sichtbar bei
+            # 87 statt bei 100 Prozent. Nur melden, wenn überhaupt gemeldet
+            # wurde - eine kleine Datei ist ohne Zwischenstand schnell genug.
+            if reporter is not None and reported and reported < done:
+                reporter.message(f"Verifying {path.name}: {_share(done, total)}")
         finally:
             await asyncio.to_thread(handle.close)
         return hasher.hexdigest()

@@ -21,7 +21,7 @@ USER_DATA_URL = f"{EMBED_BASE}/userData.json"
 FILTERED_PRODUCTS_URL = f"{EMBED_BASE}/account/getFilteredProducts"
 PRODUCT_URL = f"{API_BASE}/products/{{product_id}}"
 
-USER_AGENT = "gogdl/0.1 (+https://github.com/tobias/gog-repo-downloader)"
+USER_AGENT = "gogdl/0.1 (+https://github.com/ComicSans/gog-repo-downloader)"
 
 DEFAULT_JOBS = 2
 DEFAULT_TIMEOUT = 30.0

@@ -776,6 +776,40 @@ async def test_verification_reports_progress(tmp_path, monkeypatch):
     assert "100%" in meldungen[-1]
 
 
+async def test_verification_reports_the_last_stretch(tmp_path, monkeypatch):
+    """Auch eine krumme Dateigröße endet sichtbar bei 100 Prozent.
+
+    Die echten GOG-Teile sind 4294967294 Bytes groß und damit kein Vielfaches
+    des Meldeabstands - ohne Abschlussmeldung bliebe der letzte Abschnitt
+    stumm und die Prüfung sähe aus, als bliebe sie bei 87 Prozent stehen.
+    """
+    monkeypatch.setattr(engine_mod, "VERIFY_REPORT_STEP", 1024)
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    path = tmp_path / "krumm.bin"
+    path.write_bytes(b"x" * 3500)
+
+    downloader = make_downloader(
+        lambda request: httpx.Response(200, content=BODY), api, sleep, chunk_size=512
+    )
+    await downloader._digest_file(path, reporter, total=3500)
+
+    assert "100%" in reporter.messages[-1]
+
+
+async def test_short_verification_stays_quiet(tmp_path):
+    """Eine kurze Prüfung meldet gar nichts - sie ist schnell genug."""
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    path = tmp_path / "klein.bin"
+    path.write_bytes(b"x" * 4096)
+
+    downloader = make_downloader(
+        lambda request: httpx.Response(200, content=BODY), api, sleep, chunk_size=1024
+    )
+    await downloader._digest_file(path, reporter, total=4096)
+
+    assert reporter.messages == []
+
+
 async def test_verification_progress_without_known_size(tmp_path, monkeypatch):
     """Ohne Gesamtgröße meldet die Prüfung Megabyte statt Prozent."""
     monkeypatch.setattr(engine_mod, "VERIFY_REPORT_STEP", 1024 * 1024)
