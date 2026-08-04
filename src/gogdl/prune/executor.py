@@ -21,12 +21,25 @@ from pathlib import Path
 
 from gogdl.constants import TRASH_DIRNAME
 from gogdl.model.protocols import Store
-from gogdl.model.types import ManifestEntry, PruneItem, PruneMode, PruneResult
+from gogdl.model.types import (
+    FileKind,
+    LocalState,
+    ManifestEntry,
+    PruneItem,
+    PruneMode,
+    PruneResult,
+    SlotKey,
+)
 
 __all__ = ["PruneExecutor", "freed_bytes"]
 
 PART_SUFFIX = ".part"
 """Endung unfertiger Downloads. ``.part``-Reste dürfen auch ohne Ersatz weg."""
+
+
+def _lang(slot: SlotKey) -> str | None:
+    """Sprache eines Slots für den Vergleich — casefold, ``None`` bleibt."""
+    return slot.language.casefold() if slot.language is not None else None
 
 
 def freed_bytes(results: Iterable[PruneResult]) -> int:
@@ -170,7 +183,9 @@ class PruneExecutor:
 
         Ohne benannten Ersatz wird nur ein ``.part``-Rest freigegeben —
         eine unfertige Datei ist per Definition kein Bestand, den es zu
-        schützen gäbe.
+        schützen gäbe. Die zweite Ausnahme ist die abgewählte Patch-Datei,
+        die GOG weiterhin anbietet (:meth:`_deselected_patch_refusal`):
+        sie ist jederzeit erneut ladbar und braucht deshalb keinen Ersatz.
 
         Die Reihenfolge der Ablehnungsgründe ist die vom Groben zum
         Feinen: erst was das Manifest gar nicht kennt, dann was es
@@ -181,9 +196,17 @@ class PruneExecutor:
         if not item.replaced_by:
             if path.name.endswith(PART_SUFFIX):
                 return None
+            if item.slot.kind is FileKind.PATCH:
+                return self._deselected_patch_refusal(item, path)
             return "no replacement named"
 
         entries = {entry.file_id: entry for entry in self._store.entries_for_slot(item.slot)}
+
+        fremd = tuple(file_id for file_id in item.replaced_by if file_id not in entries)
+        if fremd:
+            refusal = self._cross_slot_refusal(item, path, entries, fremd)
+            if refusal is not None:
+                return refusal
 
         replacements: list[ManifestEntry] = []
         for file_id in item.replaced_by:
@@ -205,6 +228,125 @@ class PruneExecutor:
             return refusal
 
         return self._offline_refusal(replacements)
+
+    # -- Sonderfall: abgewählte Patch-Dateien --------------------------
+
+    def _deselected_patch_refusal(self, item: PruneItem, path: Path) -> str | None:
+        """Patch ohne benannten Ersatz — nur, solange GOG ihn noch anbietet.
+
+        Der Plan setzt diesen Eintrag, wenn der Nutzer Patches abgewählt hat
+        (``include_patches=False``). Gerechtfertigt ist die Löschung allein
+        durch die **Wiederbeschaffbarkeit**: ein ``--include-patches`` holt
+        die Datei zurück. Genau das wird hier ein zweites Mal geprüft, denn
+        zwischen Planung und Ausführung kann das Manifest neu eingelesen
+        worden sein.
+
+        Führt das Manifest die Datei als ``ORPHANED``, ist sie **nicht**
+        wiederbeschaffbar; dann braucht es die Deckung durch einen
+        verifizierten Installer, und die hätte im Plan als ``replaced_by``
+        stehen müssen. Ohne sie bleibt die Datei liegen.
+        """
+        eigen = self._entry_for_path(self._store.entries_for_slot(item.slot), path)
+        if eigen is None:
+            return f"no manifest entry in slot {item.slot.as_str()} for this file"
+        if eigen.state is LocalState.ORPHANED:
+            return (
+                "patch is no longer offered by GOG - refusing without a verified "
+                "installer as replacement"
+            )
+        return None
+
+    def _cross_slot_refusal(
+        self,
+        item: PruneItem,
+        path: Path,
+        entries: dict[str, ManifestEntry],
+        fremd: Sequence[str],
+    ) -> str | None:
+        """Ersatz aus einem **anderen** Slot — nur für verwaiste Patches.
+
+        Der Regelfall ist der Ersatz aus demselben Slot: eine neue Version
+        löst die alte ab. Ein verwaister Patch dagegen wird durch den
+        vollständigen Installer gedeckt, und der liegt in einem anderen
+        Slot. Damit diese Erweiterung nicht zur Hintertür wird, unter der
+        beliebige Slots einander löschen dürfen, gelten fünf Bedingungen:
+
+        1. Das Löschziel gehört zu einem ``FileKind.PATCH``-Slot.
+        2. Jede benannte Datei ist im Produkt genau einmal auffindbar.
+        3. **Alle** benannten Ersatzdateien stammen aus genau einem Slot.
+        4. Dieser Slot ist ein ``FileKind.INSTALLER`` mit derselben
+           Plattform und Sprache wie der Patch-Slot.
+        5. Der Installer-Slot ist **vollständig** benannt: keine seiner
+           Manifest-Dateien fehlt in ``replaced_by``. Prune-Einheit ist der
+           Slot, nicht die Einzeldatei (KONZEPT.md §5.5).
+
+        Zusätzlich muss die zu löschende Datei im Manifest weiterhin als
+        ``ORPHANED`` geführt sein. Bietet GOG den Patch wieder an, ist die
+        endgültige Löschung nicht mehr gerechtfertigt - dann greift Stufe A
+        beim nächsten Lauf, und die ist umkehrbar.
+
+        Bei Erfolg werden die gefundenen Einträge in ``entries``
+        nachgetragen; die üblichen Prüfungen laufen anschließend
+        unverändert über sie.
+        """
+        if item.slot.kind is not FileKind.PATCH:
+            return f"replacement {fremd[0]} is not in the manifest"
+
+        im_produkt: dict[str, list[ManifestEntry]] = {}
+        pool = list(self._store.entries(item.slot.product_id))
+        for entry in pool:
+            im_produkt.setdefault(entry.file_id, []).append(entry)
+
+        gefunden: list[ManifestEntry] = []
+        for file_id in item.replaced_by:
+            treffer = im_produkt.get(file_id, [])
+            if not treffer:
+                return f"replacement {file_id} is not in the manifest"
+            if len(treffer) > 1:
+                return f"replacement {file_id} is ambiguous within the product"
+            gefunden.append(treffer[0])
+
+        slots = {entry.slot for entry in gefunden}
+        if len(slots) != 1:
+            return "named replacements span more than one slot"
+        deckung = next(iter(slots))
+
+        if deckung.kind is not FileKind.INSTALLER:
+            return f"replacement slot {deckung.as_str()} is not an installer"
+        if deckung.os != item.slot.os or _lang(deckung) != _lang(item.slot):
+            return (
+                f"replacement slot {deckung.as_str()} does not match platform or "
+                f"language of {item.slot.as_str()}"
+            )
+
+        fehlend = {
+            entry.file_id for entry in pool if entry.slot == deckung
+        } - set(item.replaced_by)
+        if fehlend:
+            return (
+                f"replacement slot {deckung.as_str()} is only partially named: "
+                f"{len(fehlend)} file(s) missing"
+            )
+
+        eigen = self._entry_for_path(self._store.entries_for_slot(item.slot), path)
+        if eigen is None:
+            return f"no manifest entry in slot {item.slot.as_str()} for this file"
+        if eigen.state is not LocalState.ORPHANED:
+            return "patch is offered by GOG again - not removing it as obsolete"
+
+        entries.update({entry.file_id: entry for entry in gefunden})
+        return None
+
+    def _entry_for_path(
+        self, entries: Iterable[ManifestEntry], path: Path
+    ) -> ManifestEntry | None:
+        """Manifest-Eintrag zu einem Pfad — casefold-sicher über
+        :meth:`_same_file`, damit eine abweichende Schreibweise auf der
+        Platte den Eintrag nicht verfehlt."""
+        for entry in entries:
+            if self._same_file(self._entry_path(entry), path):
+                return entry
+        return None
 
     def _same_file(self, links: Path, rechts: Path) -> bool:
         """Sind das dieselben zwei Pfade - oder dieselbe Datei?

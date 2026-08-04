@@ -26,6 +26,7 @@ from gogdl.model.types import (
     FileKind,
     LocalState,
     ManifestEntry,
+    OsName,
     PruneItem,
     RemoteFile,
     Report,
@@ -518,6 +519,100 @@ def _download_entry(
     )
 
 
+def _behaelt_den_namen(entry: ManifestEntry | None, dest: Path, wunsch: Path) -> int:
+    """Sortierrang: ``0`` für den Eintrag, der seinen Pfad behalten muss.
+
+    Ein Manifest-Eintrag, der bereits unter genau diesem Pfad liegt, wird
+    nicht umbenannt - sonst zöge ein importierter Bestand bei der ersten
+    Kollision um und würde erneut geladen. Alle übrigen sind gleichrangig
+    und werden über ``(slot, file_id)`` geordnet.
+    """
+    if entry is not None and entry.relative_path and dest / Path(entry.relative_path) == wunsch:
+        return 0
+    return 1
+
+
+def _freier_name(wunsch: Path, belegt: set[Path]) -> Path:
+    """``datei.zip`` → ``datei_2.zip``, ``datei_3.zip``, …
+
+    Der Index kommt **vor** die Endung: die Endung muss letzte bleiben,
+    sonst hält weder das Betriebssystem noch der Nutzer die Datei noch für
+    ein ZIP. Eine Teilnummer im Namen (``spiel_(1).bin``) bleibt damit im
+    Stamm erhalten, und alle Teile eines Slots behalten ihr gemeinsames
+    Namensschema - darauf beruht die Prune-Heuristik (:func:`_schema`).
+    """
+    index = 2
+    while True:
+        kandidat = wunsch.with_name(f"{wunsch.stem}_{index}{wunsch.suffix}")
+        if kandidat not in belegt:
+            return kandidat
+        index += 1
+
+
+def _eindeutige_ziele(
+    files: Sequence[RemoteFile],
+    by_key: Mapping[tuple[SlotKey, str], ManifestEntry],
+    dest: Path,
+    slugs: Mapping[int, str] | None,
+    reports: list[Report],
+) -> dict[tuple[SlotKey, str], Path]:
+    """Jedem Eintrag einen **eindeutigen** Zielpfad zuweisen.
+
+    Das Layout ist flach, und GOGs eigene Daten enthalten Fälle, in denen
+    zwei verschiedene Auslieferungen desselben Produkts denselben
+    Dateinamen tragen. Beide würden in dieselbe Datei und bei ``--jobs 2``
+    gleichzeitig in dieselbe ``.part`` schreiben - stille Korruption. Statt
+    den zweiten Eintrag zu überspringen (dann fehlte er dauerhaft), bekommt
+    er ``_2`` vor der Endung (:func:`_freier_name`).
+
+    **Deterministisch**, sonst lädt jeder Lauf alles neu: Innerhalb einer
+    Kollisionsgruppe entscheidet ``(behält-den-Pfad, slot, file_id)``, nicht
+    die Eingabereihenfolge. Weil ``slot`` vor ``file_id`` wiegt, bekommen
+    alle Teile eines mehrteiligen Slots denselben Rang und damit denselben
+    Zusatz - ihr gemeinsames Namensschema bleibt erhalten.
+
+    Jede Umbenennung wird als ``Report(kind="collision")`` gemeldet: der
+    Nutzer soll sehen, dass eine Datei nicht unter ihrem GOG-Namen liegt.
+    """
+    gruppen: dict[Path, list[RemoteFile]] = {}
+    for remote_file in files:
+        entry = by_key.get((remote_file.slot, remote_file.file_id))
+        gruppen.setdefault(
+            _remote_target(remote_file, entry, dest, slugs), []
+        ).append(remote_file)
+
+    belegt = set(gruppen)
+    ziele: dict[tuple[SlotKey, str], Path] = {}
+    for wunsch in sorted(gruppen, key=str):
+        geordnet = sorted(
+            gruppen[wunsch],
+            key=lambda f: (
+                _behaelt_den_namen(by_key.get((f.slot, f.file_id)), dest, wunsch),
+                f.slot.as_str(),
+                f.file_id,
+            ),
+        )
+        erster = geordnet[0]
+        ziele[(erster.slot, erster.file_id)] = wunsch
+        for remote_file in geordnet[1:]:
+            ziel = _freier_name(wunsch, belegt)
+            belegt.add(ziel)
+            ziele[(remote_file.slot, remote_file.file_id)] = ziel
+            reports.append(
+                Report(
+                    path=ziel,
+                    kind="collision",
+                    detail=(
+                        f"Target path {wunsch.name} already taken by slot "
+                        f"{erster.slot.as_str()} / {erster.file_id} - slot "
+                        f"{remote_file.slot.as_str()} / {remote_file.file_id} "
+                        f"will be saved as {ziel.name} instead"
+                    ),
+                )
+            )
+    return ziele
+
+
 def plan_downloads(
     remote: Sequence[RemoteFile],
     local: Sequence[ManifestEntry],
@@ -576,7 +671,9 @@ def plan_downloads(
     tragen (Installer und Extra heißen beide ``doku.pdf``). Beide würden
     in dieselbe Datei und bei ``--jobs 2`` gleichzeitig in dieselbe
     ``.part`` schreiben - stille Korruption. Der erste Eintrag behält den
-    Pfad, jeder weitere wird abgelehnt und gemeldet.
+    Pfad, jeder weitere bekommt ``_2``, ``_3``, … vor der Endung und wird
+    gemeldet (:func:`_eindeutige_ziele`). Übersprungen wird nichts: eine
+    der beiden Dateien fehlte sonst dauerhaft.
     """
     plan = SyncPlan()
     dest = config.dest
@@ -621,30 +718,21 @@ def plan_downloads(
     ]
     gewaehlt_os, gewaehlt_lang = _select_axes(planbar, config)
 
-    belegt: dict[Path, RemoteFile] = {}
-    for remote_file in planbar:
+    zulaessig = [
+        remote_file
+        for remote_file in planbar
+        if _passes_filters(remote_file, config, dlc_of, gewaehlt_os, gewaehlt_lang)
+    ]
+    ziele = _eindeutige_ziele(zulaessig, by_key, dest, slugs, plan.reports)
+    # Umbenannte Ziele sind bekannt: sonst meldet der Lauf, der sie anlegt,
+    # die eigene Datei als Fremdbestand.
+    for pfad in ziele.values():
+        known.add(pfad)
+        known.add(_part_of(pfad))
+
+    for remote_file in zulaessig:
         entry = by_key.get((remote_file.slot, remote_file.file_id))
-        if not _passes_filters(remote_file, config, dlc_of, gewaehlt_os, gewaehlt_lang):
-            continue
-
-        target = _remote_target(remote_file, entry, dest, slugs)
-
-        vorbesitzer = belegt.get(target)
-        if vorbesitzer is not None:
-            plan.reports.append(
-                Report(
-                    path=target,
-                    kind="collision",
-                    detail=(
-                        f"Target path already taken by slot "
-                        f"{vorbesitzer.slot.as_str()} / {vorbesitzer.file_id} - "
-                        f"slot {remote_file.slot.as_str()} / {remote_file.file_id} "
-                        f"will not be downloaded"
-                    ),
-                )
-            )
-            continue
-        belegt[target] = remote_file
+        target = ziele[(remote_file.slot, remote_file.file_id)]
 
         stale = entry is not None and is_stale(
             entry, remote_file, strict_md5=config.strict_md5
@@ -908,6 +996,167 @@ def _verwaltet_die_konfiguration(entries: Sequence[ManifestEntry], config: SyncC
     return True
 
 
+_DeckungsKey = tuple[int, OsName | None, str | None]
+"""Schlüssel, unter dem ein Installer-Slot einen Patch-Slot decken kann:
+Produkt, Plattform, Sprache. ``variant`` geht bewusst **nicht** ein - GOG
+bietet pro Plattform/Sprache mehrere Patches mit unterschiedlichen
+Versionsspannen an, und alle deckt derselbe Installer."""
+
+
+def _deckungs_key(slot: SlotKey) -> _DeckungsKey:
+    """Vergleichsschlüssel für Patch- und Installer-Slot.
+
+    Die Sprache wird casefold verglichen, alles andere strikt. Trägt der
+    Patch-Slot keine Sprache und der Installer eine (oder umgekehrt),
+    passen die Schlüssel nicht - dann bleibt der Patch liegen. Das ist
+    Absicht: geraten wird hier nichts.
+    """
+    return (
+        slot.product_id,
+        slot.os,
+        slot.language.casefold() if slot.language is not None else None,
+    )
+
+
+def _installer_deckung(
+    by_slot: Mapping[SlotKey, list[ManifestEntry]],
+    dest: Path,
+    slugs: Mapping[int, str] | None,
+    disk_norm: Mapping[str, int],
+) -> dict[_DeckungsKey, SlotKey]:
+    """Installer-Slots, die einen verwaisten Patch decken dürfen.
+
+    Bedingung ist :func:`_slot_is_replaceable` - dieselbe Prüfung, die auch
+    jede andere Löschung autorisiert: jede Teildatei ``is_verified_complete``
+    (also ``COMPLETE`` **und** verifiziert, womit ``STALE`` ausgeschlossen
+    ist), kein ``ORPHANED``, und alles liegt mit erwarteter Größe auf der
+    Platte.
+
+    Passen zwei Installer-Slots auf denselben Schlüssel, ist die Deckung
+    mehrdeutig und der Schlüssel fällt heraus - wie bei
+    :func:`_attribute_slot` gilt: im Zweifel nicht löschen.
+    """
+    treffer: dict[_DeckungsKey, list[SlotKey]] = {}
+    for slot, entries in by_slot.items():
+        if slot.kind is not FileKind.INSTALLER:
+            continue
+        if any(entry.state is LocalState.STALE for entry in entries):
+            # Redundant zu is_verified_complete, hier aber ausdrücklich
+            # benannt: ein veralteter Installer deckt keinen Patch-Stand.
+            continue
+        if not _slot_is_replaceable(entries, dest, slugs, disk_norm):
+            continue
+        treffer.setdefault(_deckungs_key(slot), []).append(slot)
+    return {key: slots[0] for key, slots in treffer.items() if len(slots) == 1}
+
+
+def _abgewaehlte_patches(
+    by_slot: Mapping[SlotKey, list[ManifestEntry]],
+    config: SyncConfig,
+    dest: Path,
+    slugs: Mapping[int, str] | None,
+    disk_norm: Mapping[str, int],
+) -> list[PruneItem]:
+    """Patch-Dateien, die der Nutzer abgewählt hat, zum Löschen vorschlagen.
+
+    Greift ausschließlich bei ``include_patches=False``: wer Patches
+    ausdrücklich nicht will, soll sie auch nicht auf der Platte behalten
+    müssen. Anders als die übrigen Spuren arbeitet diese hier auf den
+    **eigenen Manifest-Einträgen** des Patch-Slots, nicht auf unbekannten
+    Dateien - was gelöscht wird, ist also nachweislich vom Werkzeug
+    verwaltet und keine Namensheuristik.
+
+    Zwei Stufen, streng nach Wiederbeschaffbarkeit getrennt:
+
+    * **Stufe A - GOG bietet die Datei weiterhin an** (Zustand nicht
+      ``ORPHANED``). Löschen ist risikofrei: ein ``--include-patches`` holt
+      sie jederzeit zurück. Es genügt, dass der Nutzer Patches abgewählt
+      hat; ein Installer wird nicht verlangt.
+    * **Stufe B - die Datei ist ``ORPHANED``**, GOG bietet sie also nicht
+      mehr an. Diese Löschung ist **endgültig**, deshalb gilt sie nur, wenn
+      ein Installer-Slot desselben Produkts mit passender Plattform und
+      Sprache vollständig, verifiziert, nicht veraltet und nachweislich auf
+      der Platte liegt (:func:`_installer_deckung`). Der Installer deckt
+      dann den Stand ab, auf den der Patch gehoben hätte. Fehlt die
+      Deckung, bleibt die Datei liegen.
+
+    Die Stufe wird **je Eintrag** entschieden, nicht je Slot: ein
+    mehrteiliger Patch-Slot kann teils verwaist sein, und die
+    wiederbeschaffbare Hälfte darf nicht an der unwiederbringlichen hängen
+    bleiben.
+
+    ``keep_versions`` gilt hier nicht. Es staffelt Generationen **eines**
+    Slots; ein verwaister Patch ist keine ältere Generation des Installers,
+    und ein abgewählter Patch ist überhaupt keine Rückfallebene.
+
+    ``--no-dlc`` schützt nur **Stufe B**: eine endgültige Löschung fällt
+    nicht in einem Produktbereich, den der Nutzer von der Verwaltung
+    ausgenommen hat. Stufe A gilt dagegen auch dort - die Datei ist
+    wiederbeschaffbar, und „ich will diese Patches nicht" ist genau der
+    Grund, sie zu löschen, nicht sie zu behalten.
+    """
+    if config.include_patches:
+        return []
+
+    deckung = _installer_deckung(by_slot, dest, slugs, disk_norm)
+    items: list[PruneItem] = []
+
+    for slot, entries in by_slot.items():
+        if slot.kind is not FileKind.PATCH:
+            continue
+        parent = next((e.dlc_of for e in entries if e.dlc_of is not None), None)
+        fremdes_dlc = (
+            not config.include_dlc and parent is not None and parent != slot.product_id
+        )
+
+        installer_slot = deckung.get(_deckungs_key(slot))
+        installer = by_slot[installer_slot] if installer_slot is not None else None
+
+        for entry in entries:
+            target = _entry_target(entry, dest, slugs)
+            size = disk_norm.get(_casefold(target))
+            if size is None:
+                continue  # liegt gar nicht auf der Platte - nichts zu löschen
+
+            if entry.state is not LocalState.ORPHANED:
+                items.append(
+                    PruneItem(
+                        path=target,
+                        slot=slot,
+                        reason=(
+                            "patch file, patches are deselected - can be fetched "
+                            "again with --include-patches"
+                        ),
+                        size=size,
+                        old_version=entry.version,
+                        new_version=None,
+                        replaced_by=(),
+                    )
+                )
+                continue
+
+            if installer is None or fremdes_dlc:
+                continue
+            neu = next((e.version for e in installer if e.version is not None), None)
+            items.append(
+                PruneItem(
+                    path=target,
+                    slot=slot,
+                    reason=(
+                        f"obsolete patch, no longer offered by GOG, covered by "
+                        f"verified installer {neu or '(unknown version)'} - this "
+                        f"file cannot be downloaded again"
+                    ),
+                    size=size,
+                    old_version=entry.version,
+                    new_version=neu,
+                    replaced_by=tuple(sorted(e.file_id for e in installer)),
+                )
+            )
+
+    return items
+
+
 def plan_prune(
     local: Sequence[ManifestEntry],
     config: SyncConfig,
@@ -924,8 +1173,10 @@ def plan_prune(
     mehrteiligen Installers unvollständig oder unverifiziert, bleibt der
     ganze Slot unangetastet.
 
-    Nie im Plan: ``ORPHANED``-Einträge, Fremdbestand und alles außerhalb
-    von ``config.dest``. ``config.prune=False`` liefert einen leeren Plan.
+    Nie im Plan: Fremdbestand und alles außerhalb von ``config.dest``.
+    ``config.prune=False`` liefert einen leeren Plan. ``ORPHANED``-Einträge
+    sind ebenfalls tabu - mit **einer** ausdrücklichen Ausnahme, dem
+    abgewählten Patch (:func:`_abgewaehlte_patches`).
 
     **Heuristik „alte Version"** — ``ManifestEntry`` beschreibt nur den
     *aktuellen* Remote-Stand; die Vorgängerversion steht in keiner
@@ -980,6 +1231,12 @@ def plan_prune(
     zwei Dateien liegen statt einer. Im Zweifel bleibt mehr liegen, nie
     weniger - die beiden Spuren sind nicht vergleichbar, und ein
     gemeinsamer Rang wäre geraten.
+
+    **Abgewählte Patches** laufen auf einer dritten, eigenen Spur
+    (:func:`_abgewaehlte_patches`). Sie ist die einzige, die
+    Manifest-Einträge selbst löscht statt erschlossener Altdateien, und die
+    einzige, die ``ORPHANED`` anfasst - dann allerdings nur mit
+    verifiziertem Installer als Deckung.
     """
     plan = SyncPlan()
     if not config.prune:
@@ -1131,6 +1388,12 @@ def plan_prune(
                         replaced_by=replaced_by,
                     )
                 )
+
+    # Eigene Spur: abgewählte Patch-Dateien (§ Nutzerentscheidung, siehe
+    # ``_abgewaehlte_patches``). Sie arbeitet auf den Manifest-Einträgen
+    # selbst; deren Zielpfade stehen in ``known`` und können deshalb von den
+    # Spuren oben gar nicht erfasst werden - Dubletten sind ausgeschlossen.
+    plan.prunes.extend(_abgewaehlte_patches(by_slot, config, dest, slugs, disk_norm))
 
     plan.prunes.sort(key=lambda item: (item.slot.as_str(), str(item.path)))
     return plan

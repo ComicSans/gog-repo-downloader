@@ -30,13 +30,25 @@ FIXED_DAY = date(2026, 8, 4)
 
 
 class FakeStore:
-    """Nur ``entries_for_slot`` wird von prune/ benötigt."""
+    """``entries_for_slot`` und - nur für die Patch-Regel - ``entries``.
+
+    ``entries`` wird ausschließlich gebraucht, wenn eine benannte
+    Ersatzdatei nicht im Slot des Löschziels liegt (verwaister Patch,
+    gedeckt vom Installer-Slot). Jeder andere Aufruf bleibt ein Fehler.
+    """
 
     def __init__(self, *entries: ManifestEntry) -> None:
         self._entries = list(entries)
 
     def entries_for_slot(self, slot: SlotKey) -> list[ManifestEntry]:
         return [entry for entry in self._entries if entry.slot == slot]
+
+    def entries(self, product_id: int | None = None) -> list[ManifestEntry]:
+        return [
+            entry
+            for entry in self._entries
+            if product_id is None or entry.product_id == product_id
+        ]
 
     # Restliche Store-Methoden sind hier nicht im Spiel.
     def __getattr__(self, name: str):  # pragma: no cover - Schutz vor Tippfehlern
@@ -47,6 +59,7 @@ def make_entry(
     file_id: str,
     filename: str,
     *,
+    slot: SlotKey = SLOT,
     relative_path: str | None = None,
     state: LocalState = LocalState.COMPLETE,
     verified: bool = True,
@@ -55,7 +68,7 @@ def make_entry(
     total_parts: int = 1,
 ) -> ManifestEntry:
     return ManifestEntry(
-        slot=SLOT,
+        slot=slot,
         file_id=file_id,
         filename=filename,
         version=version,
@@ -70,10 +83,16 @@ def make_entry(
     )
 
 
-def make_item(path: Path, *, replaced_by: tuple[str, ...] = (), size: int = 100) -> PruneItem:
+def make_item(
+    path: Path,
+    *,
+    slot: SlotKey = SLOT,
+    replaced_by: tuple[str, ...] = (),
+    size: int = 100,
+) -> PruneItem:
     return PruneItem(
         path=path,
-        slot=SLOT,
+        slot=slot,
         reason="ersetzt durch 2.1.1",
         size=size,
         old_version="2.1.0",
@@ -271,6 +290,199 @@ def test_abweichende_schreibweise_schuetzt_den_ersatz(tmp_path: Path) -> None:
 
     assert results[0].removed is False
     assert auf_platte.exists()
+
+
+# -- Abgewaehlte Patches: Ersatz aus einem anderen Slot --------------------
+
+PATCH_SLOT = SlotKey(product_id=42, kind=FileKind.PATCH, os=OsName.WINDOWS, language="en")
+PATCH_DE_SLOT = SlotKey(product_id=42, kind=FileKind.PATCH, os=OsName.WINDOWS, language="de")
+EXTRA_SLOT = SlotKey(product_id=42, kind=FileKind.EXTRA)
+
+PATCH_NAME = "patch_2.1.0_to_2.1.1.exe"
+
+
+def make_patch(
+    *,
+    slot: SlotKey = PATCH_SLOT,
+    file_id: str = "patch",
+    state: LocalState = LocalState.ORPHANED,
+    filename: str = PATCH_NAME,
+) -> ManifestEntry:
+    return make_entry(file_id, filename, slot=slot, state=state, verified=False)
+
+
+def patch_umfeld(tmp_path: Path) -> tuple[Path, Path]:
+    """Patch **und** Installer auf der Platte anlegen."""
+    patch = write(tmp_path / "spielname" / PATCH_NAME)
+    installer = write(tmp_path / "spielname" / "setup_2.1.1.exe")
+    return patch, installer
+
+
+def test_verwaister_patch_wird_vom_installer_slot_gedeckt(tmp_path: Path) -> None:
+    """Der Ersatz liegt in einem **anderen** Slot - das muss durchgehen."""
+    patch, installer = patch_umfeld(tmp_path)
+    store = FakeStore(make_patch(), make_entry("inst", "setup_2.1.1.exe"))
+
+    results = make_executor(tmp_path, store).execute(
+        [make_item(patch, slot=PATCH_SLOT, replaced_by=("inst",))]
+    )
+
+    assert [r.removed for r in results] == [True]
+    assert not patch.exists()
+    assert installer.exists()
+
+
+def test_verwaister_patch_bleibt_wenn_der_installer_unverifiziert_wird(
+    tmp_path: Path,
+) -> None:
+    """Zwischen Plan und Ausfuehrung kann das Manifest neu gelesen worden sein."""
+    patch, _ = patch_umfeld(tmp_path)
+    store = FakeStore(make_patch(), make_entry("inst", "setup_2.1.1.exe", verified=False))
+
+    results = make_executor(tmp_path, store).execute(
+        [make_item(patch, slot=PATCH_SLOT, replaced_by=("inst",))]
+    )
+
+    assert results[0].removed is False
+    assert "not verified" in results[0].reason
+    assert patch.exists()
+
+
+def test_verwaister_patch_bleibt_wenn_der_installer_von_der_platte_verschwindet(
+    tmp_path: Path,
+) -> None:
+    patch = write(tmp_path / "spielname" / PATCH_NAME)
+    store = FakeStore(make_patch(), make_entry("inst", "setup_2.1.1.exe"))
+
+    results = make_executor(tmp_path, store).execute(
+        [make_item(patch, slot=PATCH_SLOT, replaced_by=("inst",))]
+    )
+
+    assert results[0].removed is False
+    assert "not on disk" in results[0].reason
+    assert patch.exists()
+
+
+def test_ersatz_aus_fremdem_slot_muss_ein_installer_sein(tmp_path: Path) -> None:
+    patch, _ = patch_umfeld(tmp_path)
+    store = FakeStore(
+        make_patch(),
+        make_entry("extra", "setup_2.1.1.exe", slot=EXTRA_SLOT),
+    )
+
+    results = make_executor(tmp_path, store).execute(
+        [make_item(patch, slot=PATCH_SLOT, replaced_by=("extra",))]
+    )
+
+    assert results[0].removed is False
+    assert "not an installer" in results[0].reason
+    assert patch.exists()
+
+
+def test_ersatz_aus_fremdem_slot_muss_sprache_und_plattform_treffen(
+    tmp_path: Path,
+) -> None:
+    patch, _ = patch_umfeld(tmp_path)
+    store = FakeStore(
+        make_patch(slot=PATCH_DE_SLOT),
+        make_entry("inst", "setup_2.1.1.exe"),
+    )
+
+    results = make_executor(tmp_path, store).execute(
+        [make_item(patch, slot=PATCH_DE_SLOT, replaced_by=("inst",))]
+    )
+
+    assert results[0].removed is False
+    assert "does not match platform or language" in results[0].reason
+    assert patch.exists()
+
+
+def test_teilweise_benannter_installer_slot_wird_abgelehnt(tmp_path: Path) -> None:
+    """Prune-Einheit ist der Slot: fehlt ein Teil im Plan, bleibt der Patch."""
+    patch, _ = patch_umfeld(tmp_path)
+    write(tmp_path / "spielname" / "setup_2.1.1_(2).bin")
+    store = FakeStore(
+        make_patch(),
+        make_entry("inst", "setup_2.1.1.exe"),
+        make_entry("inst2", "setup_2.1.1_(2).bin"),
+    )
+
+    results = make_executor(tmp_path, store).execute(
+        [make_item(patch, slot=PATCH_SLOT, replaced_by=("inst",))]
+    )
+
+    assert results[0].removed is False
+    assert "partially named" in results[0].reason
+    assert patch.exists()
+
+
+def test_wieder_angebotener_patch_wird_nicht_endgueltig_geloescht(tmp_path: Path) -> None:
+    """Der Plan hielt ihn fuer verwaist, das Manifest sagt inzwischen etwas anderes."""
+    patch, _ = patch_umfeld(tmp_path)
+    store = FakeStore(
+        make_patch(state=LocalState.COMPLETE),
+        make_entry("inst", "setup_2.1.1.exe"),
+    )
+
+    results = make_executor(tmp_path, store).execute(
+        [make_item(patch, slot=PATCH_SLOT, replaced_by=("inst",))]
+    )
+
+    assert results[0].removed is False
+    assert "offered by GOG again" in results[0].reason
+    assert patch.exists()
+
+
+def test_installer_darf_keinen_fremden_slot_als_ersatz_haben(tmp_path: Path) -> None:
+    """Die Erweiterung gilt nur fuer Patches, nicht in die andere Richtung."""
+    alt = write(tmp_path / "spielname" / "setup_2.1.0.exe")
+    write(tmp_path / "spielname" / PATCH_NAME)
+    store = FakeStore(make_patch(state=LocalState.COMPLETE))
+
+    results = make_executor(tmp_path, store).execute([make_item(alt, replaced_by=("patch",))])
+
+    assert results[0].removed is False
+    assert "not in the manifest" in results[0].reason
+    assert alt.exists()
+
+
+# -- Abgewaehlte Patches: Stufe A, ohne benannten Ersatz -------------------
+
+
+def test_abgewaehlter_patch_darf_ohne_ersatz_weg(tmp_path: Path) -> None:
+    """Solange GOG ihn anbietet, ist die Loeschung umkehrbar."""
+    patch = write(tmp_path / "spielname" / PATCH_NAME)
+    store = FakeStore(make_patch(state=LocalState.COMPLETE))
+
+    results = make_executor(tmp_path, store).execute([make_item(patch, slot=PATCH_SLOT)])
+
+    assert results[0].removed is True
+    assert not patch.exists()
+
+
+def test_verwaister_patch_ohne_ersatz_bleibt_liegen(tmp_path: Path) -> None:
+    """Ohne Angebot und ohne Installer waere die Loeschung endgueltig."""
+    patch = write(tmp_path / "spielname" / PATCH_NAME)
+    store = FakeStore(make_patch())
+
+    results = make_executor(tmp_path, store).execute([make_item(patch, slot=PATCH_SLOT)])
+
+    assert results[0].removed is False
+    assert "no longer offered by GOG" in results[0].reason
+    assert patch.exists()
+
+
+def test_patch_ohne_manifest_eintrag_bleibt_liegen(tmp_path: Path) -> None:
+    """Was das Manifest gar nicht kennt, faellt nicht unter diese Regel."""
+    patch = write(tmp_path / "spielname" / PATCH_NAME)
+
+    results = make_executor(tmp_path, FakeStore()).execute(
+        [make_item(patch, slot=PATCH_SLOT)]
+    )
+
+    assert results[0].removed is False
+    assert "no manifest entry" in results[0].reason
+    assert patch.exists()
 
 
 # -- Prüfung 1 und 2: Pfad -------------------------------------------------

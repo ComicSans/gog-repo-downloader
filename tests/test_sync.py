@@ -650,13 +650,17 @@ def test_dlc_mapping_uebersteuert_die_angabe_an_der_datei():
     assert sorted(i.entry.file_id for i in plan.downloads) == ["d"]
 
 
-def test_zwei_eintraege_mit_gleichem_zielpfad_kollidieren():
+def _zuordnung(plan) -> dict[str, Path]:
+    """file_id -> Zielpfad, zum Vergleich zwischen zwei Laeufen."""
+    return {item.entry.file_id: item.target for item in plan.downloads}
+
+
+def test_zwei_eintraege_mit_gleichem_zielpfad_werden_umbenannt():
     """Das Layout ist flach - zwei Slots koennen denselben Namen tragen.
 
     Installer und Extra heissen beide ``doku.pdf`` und landen im selben
-    Verzeichnis. Ohne Erkennung schreiben bei ``--jobs 2`` zwei Downloads
-    gleichzeitig in dieselbe ``.part``. Der erste Eintrag behaelt den
-    Pfad, der zweite wird abgelehnt und gemeldet.
+    Verzeichnis. Ueberspringen hiesse, dass eine der beiden Dateien
+    dauerhaft fehlt; deshalb bekommt die zweite ``_2`` vor der Endung.
     """
     files = [
         remote(slot=WIN_SLOT, file_id="w", filename="doku.pdf", version=None),
@@ -664,11 +668,155 @@ def test_zwei_eintraege_mit_gleichem_zielpfad_kollidieren():
     ]
     plan = plan_downloads(files, [], config(include_extras=True), {}, slugs=SLUGS)
 
-    assert [item.entry.file_id for item in plan.downloads] == ["w"]
+    # EXTRA_SLOT sortiert vor INSTALLER und behaelt deshalb den Namen.
+    assert _zuordnung(plan) == {
+        "x": GAME_DIR / "doku.pdf",
+        "w": GAME_DIR / "doku_2.pdf",
+    }
+    assert plan.downloads[0].entry.relative_path in (
+        "the_game/doku.pdf",
+        "the_game/doku_2.pdf",
+    )
     kollisionen = [r for r in plan.reports if r.kind == "collision"]
     assert len(kollisionen) == 1
-    assert kollisionen[0].path == GAME_DIR / "doku.pdf"
-    assert "x" in kollisionen[0].detail
+    assert kollisionen[0].path == GAME_DIR / "doku_2.pdf"
+    assert "doku_2.pdf" in kollisionen[0].detail
+    assert "will not be downloaded" not in kollisionen[0].detail
+
+
+def test_drei_eintraege_bekommen_zwei_und_drei():
+    files = [
+        remote(slot=WIN_SLOT, file_id="w", filename="doku.pdf", version=None),
+        remote(slot=MAC_SLOT, file_id="m", filename="doku.pdf", version=None),
+        remote(slot=EXTRA_SLOT, file_id="x", filename="doku.pdf", version=None),
+    ]
+    plan = plan_downloads(
+        files,
+        [],
+        config(include_extras=True, os_filter=frozenset({OsName.WINDOWS, OsName.MAC})),
+        {},
+        slugs=SLUGS,
+    )
+
+    # Rangfolge ist (slot, file_id): extra < installer/mac < installer/windows.
+    assert _zuordnung(plan) == {
+        "x": GAME_DIR / "doku.pdf",
+        "m": GAME_DIR / "doku_2.pdf",
+        "w": GAME_DIR / "doku_3.pdf",
+    }
+    assert len([r for r in plan.reports if r.kind == "collision"]) == 2
+
+
+def test_umbenennung_ist_unabhaengig_von_der_eingabereihenfolge():
+    """Sonst laedt jeder Lauf alles erneut unter einem neuen Namen."""
+    files = [
+        remote(slot=WIN_SLOT, file_id="w", filename="doku.pdf", version=None),
+        remote(slot=MAC_SLOT, file_id="m", filename="doku.pdf", version=None),
+        remote(slot=EXTRA_SLOT, file_id="x", filename="doku.pdf", version=None),
+    ]
+    cfg = config(include_extras=True, os_filter=frozenset({OsName.WINDOWS, OsName.MAC}))
+
+    erwartet = _zuordnung(plan_downloads(files, [], cfg, {}, slugs=SLUGS))
+    for reihenfolge in (list(reversed(files)), [files[1], files[2], files[0]]):
+        assert _zuordnung(plan_downloads(reihenfolge, [], cfg, {}, slugs=SLUGS)) == erwartet
+
+
+def test_vorhandener_relative_path_behaelt_seinen_pfad():
+    """Ein importierter Bestand zieht nicht wegen einer Kollision um."""
+    files = [
+        remote(slot=WIN_SLOT, file_id="w", filename="doku.pdf", version=None),
+        remote(slot=EXTRA_SLOT, file_id="x", filename="doku.pdf", version=None),
+    ]
+    # EXTRA_SLOT wuerde sonst den Namen behalten - der Installer liegt aber
+    # bereits unter diesem Pfad auf der Platte.
+    lokal = [
+        entry(
+            slot=WIN_SLOT,
+            file_id="w",
+            filename="doku.pdf",
+            version=None,
+            relative_path="the_game/doku.pdf",
+        )
+    ]
+    plan = plan_downloads(files, lokal, config(include_extras=True), {}, slugs=SLUGS)
+
+    assert _zuordnung(plan) == {
+        "w": GAME_DIR / "doku.pdf",
+        "x": GAME_DIR / "doku_2.pdf",
+    }
+
+
+def test_echter_kollisionsname_gilt_nicht_als_altversion():
+    """Der Fall aus dem Betrieb, isoliert auf die Namensheuristik.
+
+    ``..._(28044)_2.exe`` liegt neben ``..._(28044).exe``; der Slot des
+    Originals ist vollstaendig, verifiziert und auf der Platte, die
+    Ersatzbedingung waere also erfuellt. Trotzdem darf die umbenannte
+    Datei nicht als Vorgaengerversion eingesammelt werden: das Schema
+    unterscheidet sich (``_#.exe`` gegen ``.exe``), und ihre Ziffernfolge
+    ist nicht kleiner.
+    """
+    original = "setup_master_of_magic_1.3.1_(german)_(28044).exe"
+    umbenannt = "setup_master_of_magic_1.3.1_(german)_(28044)_2.exe"
+    on_disk = {GAME_DIR / original: 1000, GAME_DIR / umbenannt: 900}
+    local = [entry(filename=original, version="1.3.1")]
+
+    plan = plan_prune(local, config(), on_disk, slugs=SLUGS)
+    assert plan.prunes == []
+
+    # Gegenprobe: eine echte Altversion desselben Slots wird sehr wohl geplant.
+    on_disk[GAME_DIR / "setup_master_of_magic_1.3.1_(german)_(27000).exe"] = 800
+    geplant = plan_prune(local, config(), on_disk, slugs=SLUGS).prunes
+    assert [item.path.name for item in geplant] == [
+        "setup_master_of_magic_1.3.1_(german)_(27000).exe"
+    ]
+
+
+def test_umbenannte_datei_ist_keine_altversion_des_gegenstuecks():
+    """``_2`` neben dem Original darf nie als Vorgaengerversion gelten."""
+    on_disk = {
+        GAME_DIR / "setup_game_2.0.exe": 1000,
+        GAME_DIR / "setup_game_2.0_2.exe": 900,
+        GAME_DIR / "artworks.zip": 50,
+        GAME_DIR / "artworks_2.zip": 60,
+    }
+    local = [
+        entry(),
+        entry(slot=EXTRA_SLOT, file_id="x1", filename="artworks.zip", version=None, size=50),
+    ]
+    # Die umbenannte Datei gehoert zu einem eigenen Slot; selbst wenn sie
+    # dem Manifest voraus ist, darf die Namensheuristik sie nicht als
+    # Altversion einsammeln.
+    plan = plan_prune(local, config(include_extras=True), on_disk, slugs=SLUGS)
+    assert plan.prunes == []
+
+
+def test_mehrteiliger_slot_behaelt_sein_namensschema():
+    """Alle Teile eines Slots bekommen denselben Zusatz."""
+    files = [
+        remote(slot=WIN_SLOT, file_id="w1", filename="spiel_1.0_(1).bin", part_index=1,
+               total_parts=2),
+        remote(slot=WIN_SLOT, file_id="w2", filename="spiel_1.0_(2).bin", part_index=2,
+               total_parts=2),
+        remote(slot=MAC_SLOT, file_id="m1", filename="spiel_1.0_(1).bin", part_index=1,
+               total_parts=2),
+        remote(slot=MAC_SLOT, file_id="m2", filename="spiel_1.0_(2).bin", part_index=2,
+               total_parts=2),
+    ]
+    plan = plan_downloads(
+        files,
+        [],
+        config(os_filter=frozenset({OsName.WINDOWS, OsName.MAC})),
+        {},
+        slugs=SLUGS,
+    )
+
+    # Mac sortiert vor Windows und behaelt beide Teilnamen unveraendert.
+    zuordnung = _zuordnung(plan)
+    assert zuordnung["m1"] == GAME_DIR / "spiel_1.0_(1).bin"
+    assert zuordnung["m2"] == GAME_DIR / "spiel_1.0_(2).bin"
+    assert zuordnung["w1"] == GAME_DIR / "spiel_1.0_(1)_2.bin"
+    assert zuordnung["w2"] == GAME_DIR / "spiel_1.0_(2)_2.bin"
 
 
 def test_gleicher_name_in_verschiedenen_produkten_kollidiert_nicht():
@@ -1283,6 +1431,258 @@ def test_unversionierter_slot_hat_keine_altversion():
     ]
 
     assert plan_prune(local, config(include_extras=True), on_disk, slugs=SLUGS).prunes == []
+
+
+# ---------------------------------------------------------------------------
+# Abgewaehlte Patches - zwei Stufen nach Wiederbeschaffbarkeit
+# ---------------------------------------------------------------------------
+
+PATCH_DE_SLOT = SlotKey(
+    product_id=1207658924, kind=FileKind.PATCH, os=OsName.WINDOWS, language="de"
+)
+PATCH_MAC_SLOT = SlotKey(
+    product_id=1207658924, kind=FileKind.PATCH, os=OsName.MAC, language="en"
+)
+
+PATCH_NAME = "patch_game_1.0_to_2.0.exe"
+INSTALLER_NAME = "setup_game_2.0.exe"
+
+
+def patch_entry(
+    *,
+    slot: SlotKey = PATCH_SLOT,
+    file_id: str = "pt",
+    filename: str = PATCH_NAME,
+    state: LocalState = LocalState.ORPHANED,
+    size: int = 500,
+    version: str | None = "2.0",
+) -> ManifestEntry:
+    return entry(
+        slot=slot,
+        file_id=file_id,
+        filename=filename,
+        version=version,
+        size=size,
+        state=state,
+    )
+
+
+def installer_bestand(**mehr: int) -> dict[Path, int]:
+    """Installer und Patch auf der Platte; ``mehr`` sind Name-zu-Groesse."""
+    bestand = {GAME_DIR / INSTALLER_NAME: 1000, GAME_DIR / PATCH_NAME: 500}
+    bestand.update({GAME_DIR / name: groesse for name, groesse in mehr.items()})
+    return bestand
+
+
+def test_verwaister_patch_mit_verifiziertem_installer_wird_geplant():
+    """Stufe B: GOG bietet den Patch nicht mehr an, der Installer deckt ihn.
+
+    Diese Loeschung ist endgueltig - die Begruendung muss das sagen.
+    """
+    local = [entry(), patch_entry()]
+    plan = plan_prune(local, config(), installer_bestand(), slugs=SLUGS)
+
+    assert len(plan.prunes) == 1
+    item = plan.prunes[0]
+    assert item.path == GAME_DIR / PATCH_NAME
+    assert item.slot == PATCH_SLOT
+    assert item.size == 500
+    assert item.new_version == "2.0"
+    assert item.replaced_by == ("f1",)
+    assert "obsolete patch" in item.reason
+    assert "no longer offered by GOG" in item.reason
+    assert "cannot be downloaded again" in item.reason
+
+
+def test_verwaister_patch_bleibt_bei_include_patches():
+    """Wer Patches will, behaelt sie - in beiden Stufen."""
+    local = [entry(), patch_entry()]
+    plan = plan_prune(local, config(include_patches=True), installer_bestand(), slugs=SLUGS)
+    assert plan.prunes == []
+
+
+def test_verwaister_patch_bei_unvollstaendigem_installer_bleibt_liegen():
+    """Ein halber Installer deckt keinen Stand ab."""
+    local = [
+        entry(file_id="p1", filename="setup_game_2.0_(1).bin", part_index=1, total_parts=2),
+        entry(
+            file_id="p2",
+            filename="setup_game_2.0_(2).bin",
+            part_index=2,
+            total_parts=2,
+            state=LocalState.PARTIAL,
+            last_verified_utc=None,
+        ),
+        patch_entry(),
+    ]
+    on_disk = {
+        GAME_DIR / "setup_game_2.0_(1).bin": 1000,
+        GAME_DIR / "setup_game_2.0_(2).bin": 1000,
+        GAME_DIR / PATCH_NAME: 500,
+    }
+    assert plan_prune(local, config(), on_disk, slugs=SLUGS).prunes == []
+
+
+def test_verwaister_patch_bei_veraltetem_installer_bleibt_liegen():
+    """STALE heisst: der Installer ist selbst nicht auf dem Stand."""
+    local = [entry(state=LocalState.STALE), patch_entry()]
+    assert plan_prune(local, config(), installer_bestand(), slugs=SLUGS).prunes == []
+
+
+def test_verwaister_patch_ohne_installer_derselben_sprache_bleibt_liegen():
+    """Der deutsche Patch wird von der englischen Fassung nicht gedeckt."""
+    local = [entry(), patch_entry(slot=PATCH_DE_SLOT, file_id="pt_de")]
+    assert plan_prune(local, config(), installer_bestand(), slugs=SLUGS).prunes == []
+
+
+def test_verwaister_patch_ohne_installer_derselben_plattform_bleibt_liegen():
+    local = [entry(), patch_entry(slot=PATCH_MAC_SLOT, file_id="pt_mac")]
+    assert plan_prune(local, config(), installer_bestand(), slugs=SLUGS).prunes == []
+
+
+def test_verwaister_patch_ohne_installer_auf_der_platte_bleibt_liegen():
+    """Das Manifest sagt verifiziert, die Datei ist trotzdem nicht da."""
+    local = [entry(), patch_entry()]
+    on_disk = {GAME_DIR / PATCH_NAME: 500}
+    assert plan_prune(local, config(), on_disk, slugs=SLUGS).prunes == []
+
+
+def test_verwaister_patch_ohne_datei_auf_der_platte_erzeugt_nichts():
+    local = [entry(), patch_entry()]
+    on_disk = {GAME_DIR / INSTALLER_NAME: 1000}
+    assert plan_prune(local, config(), on_disk, slugs=SLUGS).prunes == []
+
+
+def test_mehrdeutige_deckung_bleibt_liegen():
+    """Zwei verifizierte Installer-Slots auf demselben Schluessel: nichts tun.
+
+    Ueber ``variant`` unterscheidbar, ueber Produkt/Plattform/Sprache
+    nicht - dann ist die Deckung geraten und der Patch bleibt liegen.
+    """
+    zwilling = SlotKey(
+        product_id=1207658924,
+        kind=FileKind.INSTALLER,
+        os=OsName.WINDOWS,
+        language="en",
+        variant="gog_galaxy",
+    )
+    local = [
+        entry(),
+        entry(slot=zwilling, file_id="f2", filename="setup_game_alt_2.0.exe"),
+        patch_entry(),
+    ]
+    on_disk = installer_bestand()
+    on_disk[GAME_DIR / "setup_game_alt_2.0.exe"] = 1000
+    assert plan_prune(local, config(), on_disk, slugs=SLUGS).prunes == []
+
+
+def test_noch_angebotener_patch_wird_ohne_installer_geplant():
+    """Stufe A: abgewaehlt und jederzeit wieder ladbar - Loeschen ist frei.
+
+    Kein Installer im Manifest, trotzdem ein Eintrag: das Risiko ist ein
+    erneuter Download, kein Datenverlust.
+    """
+    local = [patch_entry(state=LocalState.COMPLETE)]
+    plan = plan_prune(local, config(), {GAME_DIR / PATCH_NAME: 500}, slugs=SLUGS)
+
+    assert len(plan.prunes) == 1
+    item = plan.prunes[0]
+    assert item.path == GAME_DIR / PATCH_NAME
+    assert item.slot == PATCH_SLOT
+    assert item.replaced_by == ()
+    assert "patches are deselected" in item.reason
+    assert "--include-patches" in item.reason
+    assert "cannot be downloaded again" not in item.reason
+
+
+def test_noch_angebotener_patch_bleibt_bei_include_patches():
+    local = [patch_entry(state=LocalState.COMPLETE)]
+    plan = plan_prune(
+        local, config(include_patches=True), {GAME_DIR / PATCH_NAME: 500}, slugs=SLUGS
+    )
+    assert plan.prunes == []
+
+
+def test_installer_slot_wird_von_der_patch_regel_nie_erfasst():
+    """Weder Stufe A noch Stufe B fassen einen Installer an."""
+    local = [entry(), entry(slot=MAC_SLOT, file_id="m1", state=LocalState.ORPHANED)]
+    on_disk = {GAME_DIR / INSTALLER_NAME: 1000}
+    assert plan_prune(local, config(), on_disk, slugs=SLUGS).prunes == []
+
+
+def test_beide_stufen_sind_an_der_begruendung_unterscheidbar():
+    """Ein Mensch muss in der Ausgabe sehen, welche Loeschung endgueltig ist."""
+    local = [
+        entry(),
+        patch_entry(),
+        patch_entry(
+            slot=PATCH_SLOT,
+            file_id="pt2",
+            filename="patch_game_2.0_to_2.1.exe",
+            state=LocalState.COMPLETE,
+            version="2.1",
+        ),
+    ]
+    on_disk = installer_bestand()
+    on_disk[GAME_DIR / "patch_game_2.0_to_2.1.exe"] = 400
+
+    gruende = {
+        item.path.name: item.reason
+        for item in plan_prune(local, config(), on_disk, slugs=SLUGS).prunes
+    }
+    assert set(gruende) == {PATCH_NAME, "patch_game_2.0_to_2.1.exe"}
+    assert "cannot be downloaded again" in gruende[PATCH_NAME]
+    assert "cannot be downloaded again" not in gruende["patch_game_2.0_to_2.1.exe"]
+    assert "--include-patches" in gruende["patch_game_2.0_to_2.1.exe"]
+
+
+def _dlc_patch_eintrag(state: LocalState) -> ManifestEntry:
+    return ManifestEntry(
+        slot=SlotKey(product_id=999111, kind=FileKind.PATCH, os=OsName.WINDOWS, language="en"),
+        file_id="dp",
+        filename="patch_dlc_1.0_to_2.0.exe",
+        version="2.0",
+        size=100,
+        md5=None,
+        downlink="/downlink/dp",
+        relative_path="the_game_dlc/patch_dlc_1.0_to_2.0.exe",
+        state=state,
+        dlc_of=1207658924,
+    )
+
+
+def test_no_dlc_schuetzt_nur_die_endgueltige_loeschung():
+    """Stufe A gilt auch im abgewaehlten DLC, Stufe B nicht.
+
+    Wiederbeschaffbar heisst risikofrei - „ich will diese Patches nicht"
+    ist dann der Grund zu loeschen. Eine **endgueltige** Loeschung faellt
+    dagegen nicht in einem Produktbereich, den der Nutzer von der
+    Verwaltung ausgenommen hat.
+    """
+    on_disk = {DEST / "the_game_dlc" / "patch_dlc_1.0_to_2.0.exe": 100}
+
+    angeboten = [_dlc_patch_eintrag(LocalState.COMPLETE)]
+    assert len(plan_prune(angeboten, config(include_dlc=False), on_disk, slugs=SLUGS).prunes) == 1
+
+    verwaist = [_dlc_patch_eintrag(LocalState.ORPHANED)]
+    dlc_installer = entry(
+        slot=SlotKey(
+            product_id=999111, kind=FileKind.INSTALLER, os=OsName.WINDOWS, language="en"
+        ),
+        file_id="di",
+        filename="setup_dlc_2.0.exe",
+    )
+    verwaist.append(dlc_installer)
+    on_disk[DEST / "the_game_dlc" / "setup_dlc_2.0.exe"] = 1000
+
+    assert plan_prune(verwaist, config(include_dlc=False), on_disk, slugs=SLUGS).prunes == []
+    assert len(plan_prune(verwaist, config(), on_disk, slugs=SLUGS).prunes) == 1
+
+
+def test_prune_false_gilt_auch_fuer_patches():
+    local = [entry(), patch_entry()]
+    plan = plan_prune(local, config(prune=False), installer_bestand(), slugs=SLUGS)
+    assert plan.prunes == []
 
 
 # ---------------------------------------------------------------------------

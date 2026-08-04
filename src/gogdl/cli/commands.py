@@ -553,10 +553,7 @@ def _print_reports(reports: Sequence[Report], ctx: AppContext) -> None:
     # Kollisionen zuerst und immer vollständig: hier bleibt eine Datei
     # ungeladen, das muss jemand sehen.
     for report in kollisionen:
-        print(
-            f"Skipped: {report.path.name} - two releases claim the same "
-            f"filename. {report.detail}".rstrip()
-        )
+        print(f"Renamed: {report.path.name} - {report.detail}".rstrip())
 
     if verwaist:
         patches = sum(1 for r in verwaist if r.path.name.startswith("patch_"))
@@ -567,8 +564,9 @@ def _print_reports(reports: Sequence[Report], ctx: AppContext) -> None:
         if rest:
             teile.append(f"{rest} other files")
         print(
-            f"No longer offered by GOG: {' and '.join(teile)} - left in place. "
-            "They stay on disk and are never deleted."
+            f"No longer offered by GOG: {' and '.join(teile)}. These cannot be "
+            "downloaded again; only obsolete patches covered by a verified "
+            "installer are cleaned up, everything else stays on disk."
         )
         if ctx.verbose:
             for report in verwaist[:20]:
