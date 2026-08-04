@@ -58,13 +58,13 @@ The manifest lives inside the collection, at `<dest>/.gogdl/`, not in your home 
 
 `--dest` defaults to `~/GOG` and deliberately not to the current directory: the tool writes a database there, downloads gigabytes into it, and deletes superseded files inside it. Pointing it at a git working tree prints a warning. `--dest` works before and after the subcommand: `gogdl --dest ~/GOG status` and `gogdl status --dest ~/GOG` are equivalent.
 
-By default this fetches installers for **your current platform** in **English**, including DLC. Everything else is opt-in:
+By default this fetches installers for **your current platform** in **English**, including DLC and goodies such as manuals and artwork. Individual patch files are not fetched, since the installer of the current version already contains them.
 
 ```bash
-gogdl --dest ~/GOG download --os windows+linux --lang de,en --extras
+gogdl --dest ~/GOG download --os windows+linux --lang de,en
 ```
 
-That reads as: Windows *and* Linux builds, German *or else* English, bonus content included. The notation is explained below.
+That reads as: Windows *and* Linux builds, German *or else* English. The notation is explained below.
 
 If you already have a collection downloaded with `gogrepo` or another tool, run `gogdl import` before the first `download` - otherwise everything gets downloaded again. See [Importing an existing collection](#importing-an-existing-collection).
 
@@ -107,8 +107,12 @@ Filters, available on `update`, `status`, `download`, `verify`, `clean`, and `sy
 ```
 --os / --lang                  see above; defaults: current platform, en
 --dlc / --no-dlc               default: on
---extras / --no-extras         default: off (bonus content is large and rarely needed)
---strict                       compare MD5 for installers too, not only for extras
+--skip-goodies                 leave out manuals, maps, artwork and soundtracks
+                               (goodies are included by default)
+--include-patches              also fetch individual patch files (default: off,
+                               the full installer of the current version is preferred)
+--include-saves                read save game directories when scanning (default: off)
+--strict                       compare MD5 for installers too, not only for goodies
 ```
 
 Game selection, available on `update` and `sync` (they decide what enters the manifest):

@@ -182,13 +182,20 @@ async def _enrich(
 ) -> list[RemoteFile]:
     """Dateiname und echte Größe ergänzen - nur wo nötig.
 
-    Die Produkt-Payload nennt weder den Dateinamen noch eine brauchbare
-    Größe: sie trägt gerundeten Text ("1 MB"), den die api-Schicht
-    zulässigerweise nicht als Bytewert ausgibt. ``size`` kommt deshalb aus
-    einer Kopfanfrage auf die signierte URL, ``md5`` gibt es auf diesem Weg
-    gar nicht. Ohne diese Größe bliebe ``version`` das einzige Signal, das
-    den Store erreicht - und ein stiller Neu-Upload unter gleicher Version
-    wäre unsichtbar. Genau dafür ist dieses Werkzeug da.
+    Keine der beiden Dateilisten nennt den Dateinamen, und keine nennt eine
+    brauchbare Größe: gameDetails trägt gerundeten Text ("1 MB"),
+    api.gog.com eine auf volle MiB gerundete Zahl. Die api-Schicht gibt
+    deshalb in beiden Fällen ``size=None`` aus (siehe die Messung in
+    ``api/client.py::_collect_api_group``). Die echte Größe kommt hier aus
+    zwei Quellen, in dieser Reihenfolge:
+
+    * ``checksum.total_size`` aus dem Checksum-XML - kostenlos, denn das XML
+      wird für ``md5`` ohnehin geholt,
+    * sonst ``api.content_length`` per Kopfanfrage auf die signierte URL.
+
+    Ohne diese Größe bliebe ``version`` das einzige Signal, das den Store
+    erreicht - und ein stiller Neu-Upload unter gleicher Version wäre
+    unsichtbar. Genau dafür ist dieses Werkzeug da.
 
     Jede Auflösung kostet zwei Requests pro Datei. Bei einer Bibliothek mit
     hunderten Titeln ist das der Kostenfaktor des Laufs, und GOG drosselt.
@@ -197,27 +204,25 @@ async def _enrich(
     * die ``version`` ist eine andere,
     * es gibt noch gar keine Größe (oder keinen Dateinamen),
     * ``--strict``: dann soll ein Re-Upload **ohne** Versionssprung
-      auffallen, und den findet nur eine frische Kopfanfrage. ``--strict``
-      ist damit teuer - eine Kopfanfrage pro Datei und Lauf.
+      auffallen, und den findet nur ein frisch geholter Wert. ``--strict``
+      ist damit teuer - jede Datei wird in jedem Lauf aufgelöst.
 
     Der Kurzschluss übernimmt ``size`` und ``md5`` ausdrücklich aus dem
     Manifest. Ohne das schriebe der nächste ``replace_remote`` eine leere
     Größe über eine bekannte, und der Store hielte jede Datei für veraltet.
+    Er vergleicht bewusst keine Größe: ``remote.size`` ist immer ``None``,
+    und ``previous.size`` mit sich selbst zu vergleichen fände nie etwas.
     """
     result: list[RemoteFile] = []
     for remote in files:
         previous = known.get((remote.slot, remote.file_id))
-        # Die Produkt-Payload nennt die exakte Bytegröße. Sie hier mit zu
-        # vergleichen ist der billigste Fund im ganzen Werkzeug: ein stiller
-        # Neu-Upload unter gleicher Version und gleichem Dateinamen wird
-        # dadurch im Normalbetrieb sichtbar, ohne eine einzige zusätzliche
-        # Anfrage. Bisher fand ihn nur --strict.
+        # ``remote.size`` ist hier immer None und taugt deshalb nicht als
+        # Vergleichswert - die Dateilisten von GOG kennen keine exakte Größe.
         unchanged = (
             previous is not None
             and previous.filename
             and previous.size is not None
             and previous.version == remote.version
-            and (remote.size is None or previous.size == remote.size)
             and not strict_md5
         )
         if unchanged:
@@ -233,11 +238,11 @@ async def _enrich(
 
         link = await api.resolve_downlink(remote.downlink)
         checksum = await api.checksum(link.checksum_url) if link.checksum_url else None
-        size = remote.size or (checksum.total_size if checksum else None)
-        if size is None or (strict_md5 and remote.size is None):
-            # Die Kopfanfrage lohnt nur, wo die Payload selbst keine Größe
-            # nennt. Nennt sie eine, ist das bereits ein frischer Serverwert.
-            size = await api.content_length(link.url) or size
+        size = checksum.total_size if checksum else None
+        if size is None:
+            # Erst wenn das XML nichts hergibt: eine eigene Kopfanfrage. Das
+            # XML wird ohnehin geholt, die Kopfanfrage ist der Zusatzrequest.
+            size = await api.content_length(link.url)
         if size is None and previous is not None:
             # Nicht ermittelbar heißt „nichts Neues erfahren", nicht „hat
             # keine Größe": den bekannten Wert stehen zu lassen ist besser,
@@ -310,6 +315,16 @@ def _slugs(store: SqliteStore) -> dict[int, str]:
     return {p.product_id: p.slug for p in store.products()}
 
 
+def _scan(ctx: AppContext) -> dict[Path, int]:
+    """Plattenzustand so, wie der Nutzer ihn bestellt hat.
+
+    Nur an einer Stelle, damit alle Kommandos dieselbe Sicht haben: sähe
+    das Aufräumen mehr als die Planung, würde eine Datei geplant und
+    gleich wieder gelöscht.
+    """
+    return scan_disk(ctx.dest, include_saves=ctx.config.include_saves)
+
+
 def _plan_prune(
     store: SqliteStore,
     ctx: AppContext,
@@ -327,7 +342,7 @@ def _plan_prune(
     return plan_prune(
         _select_entries(store.entries(), slugs, only, skip),
         ctx.config,
-        on_disk=scan_disk(ctx.dest),
+        on_disk=_scan(ctx),
         slugs=slugs,
     )
 
@@ -388,7 +403,7 @@ def _build_download_plan(
         if e.state is not LocalState.ORPHANED
     ]
     plan = plan_downloads(
-        remote, entries, ctx.config, on_disk=scan_disk(ctx.dest), slugs=slugs
+        remote, entries, ctx.config, on_disk=_scan(ctx), slugs=slugs
     )
     _erzwinge_stale(plan, entries, ctx.dest, slugs)
     return plan
@@ -706,7 +721,7 @@ def _reconcile_states(store: SqliteStore, ctx: AppContext) -> None:
     (KONZEPT.md §5.5). ``STALE`` wird nicht angefasst: eine veraltete Datei
     hat oft genau die erwartete Größe und ist trotzdem die falsche.
     """
-    disk = scan_disk(ctx.dest)
+    disk = _scan(ctx)
     slugs = _slugs(store)
     for entry in store.entries():
         if entry.state not in (LocalState.MISSING, LocalState.PARTIAL):
@@ -823,7 +838,7 @@ def cmd_import(ctx: AppContext, *, trust: str, apply: bool) -> int:
             )
             return 1
 
-        plan = match_existing(entries, scan_disk(ctx.dest), ctx.dest, _slugs(store))
+        plan = match_existing(entries, _scan(ctx), ctx.dest, _slugs(store))
 
         print(f"Matched: {len(plan.matches)} files, {human_bytes(plan.match_bytes)}")
         if plan.unsure:

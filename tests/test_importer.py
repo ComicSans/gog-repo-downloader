@@ -289,7 +289,9 @@ def test_gleicher_name_zweimal_im_produkt_ist_nicht_eindeutig(tmp_path: Path) ->
 
 
 def _sprachfassungen(
-    filename: str, groessen: Sequence[int]
+    filename: str,
+    groessen: Sequence[int | None],
+    md5s: Sequence[str | None] | None = None,
 ) -> list[ManifestEntry]:
     """Ein Installer, den GOG unter demselben Namen je Sprache ausliefert.
 
@@ -298,6 +300,7 @@ def _sprachfassungen(
     68-mal auf.
     """
     sprachen = ["de", "en", "fr", "es", "it", "pl", "ru", "pt", "cz", "jp"]
+    pruefsummen = list(md5s) if md5s is not None else [None] * len(groessen)
     return [
         entry(
             slot=SlotKey(
@@ -309,6 +312,7 @@ def _sprachfassungen(
             file_id=f"f{index}",
             filename=filename,
             size=groesse,
+            md5=pruefsummen[index],
             total_parts=1,
         )
         for index, groesse in enumerate(groessen)
@@ -347,8 +351,10 @@ def test_zehn_sprachfassungen_die_groesse_entscheidet(tmp_path: Path) -> None:
     assert geschrieben[0].relative_path == f"{SLUG}/{name}"
 
 
-def test_gleicher_name_und_gleiche_groesse_bleibt_abgelehnt(tmp_path: Path) -> None:
-    """Zwei Sprachfassungen identischer Größe - hier ist nichts zu entscheiden."""
+def test_gleicher_name_und_gleiche_groesse_ohne_pruefsumme_bleibt_abgelehnt(
+    tmp_path: Path,
+) -> None:
+    """Zwei Sprachfassungen identischer Größe, keine Prüfsumme - kein Beweis."""
     dest = tmp_path / "gog"
     name = "setup_gray_matter_2.2.0.8-1.bin"
     write(dest / SLUG / name, b"G" * 2000)
@@ -363,6 +369,100 @@ def test_gleicher_name_und_gleiche_groesse_bleibt_abgelehnt(tmp_path: Path) -> N
     # unterscheiden - ein Mensch soll sehen, dass die Größe nicht half.
     assert "name and size match 2 entries" in grund
     assert not plan.unsure[0].entry
+
+
+PRUEFSUMME = "d41d8cd98f00b204e9800998ecf8427e"
+ANDERE_PRUEFSUMME = "0123456789abcdef0123456789abcdef"
+
+
+def test_identische_pruefsummen_erlauben_die_zuordnung(tmp_path: Path) -> None:
+    """Der Normalfall aus der Messung: derselbe Installer in fünf Sprach-Slots.
+
+    93 von 99 gemessenen Gruppen sind nachweislich byteidentisch. Die
+    Sprache des Slots sagt dann nichts über die Datei aus, und ein
+    Neu-Download wäre reine Verschwendung.
+    """
+    dest = tmp_path / "gog"
+    name = "setup_surgeon_simulator2013_anniversary_edition_2.0.0.5.exe"
+    write(dest / SLUG / name, b"S" * 2000)
+    entries = _sprachfassungen(name, [2000] * 5, [PRUEFSUMME.upper()] * 5)
+
+    plan = match_existing(entries, scan_disk(dest), dest, SLUGS)
+
+    assert len(plan.matches) == 1
+    assert not plan.unsure
+    assert plan.matches[0].relative_path == f"{SLUG}/{name}"
+
+    # Deterministisch: derselbe Lauf, dasselbe Ergebnis. Sonst wanderte der
+    # Eintrag zwischen zwei Importen von Slot zu Slot.
+    gewaehlt = plan.matches[0].entry.file_id
+    assert gewaehlt == "f0"
+    for _ in range(3):
+        erneut = match_existing(
+            list(reversed(entries)), scan_disk(dest), dest, SLUGS
+        )
+        assert erneut.matches[0].entry.file_id == gewaehlt
+
+
+def test_verschiedene_pruefsummen_bleiben_abgelehnt(tmp_path: Path) -> None:
+    """Der Theme-Hospital-Fall: gleicher Name, gleiche Größe, anderer Inhalt."""
+    dest = tmp_path / "gog"
+    name = "setup_theme_hospital_v3_(28027).exe"
+    write(dest / SLUG / name, b"T" * 2000)
+    entries = _sprachfassungen(
+        name, [2000, 2000], [PRUEFSUMME, ANDERE_PRUEFSUMME]
+    )
+
+    plan = match_existing(entries, scan_disk(dest), dest, SLUGS)
+
+    assert not plan.matches
+    assert len(plan.unsure) == 1
+    assert "different checksums" in plan.unsure[0].reason
+
+
+def test_fehlende_pruefsumme_beweist_nichts(tmp_path: Path) -> None:
+    """Ohne Prüfsumme bei einem Kandidaten ist die Gleichheit nicht belegt."""
+    dest = tmp_path / "gog"
+    name = "gog_master_of_magic_2.0.0.3.sh"
+    write(dest / SLUG / name, b"M" * 2000)
+    entries = _sprachfassungen(
+        name, [2000, 2000, 2000], [PRUEFSUMME, None, PRUEFSUMME]
+    )
+
+    plan = match_existing(entries, scan_disk(dest), dest, SLUGS)
+
+    assert not plan.matches
+    assert len(plan.unsure) == 1
+    grund = plan.unsure[0].reason
+    assert "checksum missing for 1" in grund
+    assert "name and size match 3 entries" in grund
+
+
+def test_ein_eintrag_faellt_auch_bei_gleicher_pruefsumme_nur_einer_datei_zu(
+    tmp_path: Path,
+) -> None:
+    """Zwei Dateien wählen denselben Eintrag - dann bekommt ihn keine.
+
+    Die Prüfsumme belegt nur, dass die Slots austauschbar sind. Sie sagt
+    nicht, welche der beiden Dateien auf der Platte gemeint ist.
+    """
+    dest = tmp_path / "gog"
+    name = "handbuch.pdf"
+    write(dest / SLUG / name, b"P" * 500)
+    write(dest / SLUG / "extras" / name, b"Q" * 500)
+    entries = _sprachfassungen(name, [500, 500], [PRUEFSUMME, PRUEFSUMME])
+
+    plan = match_existing(entries, scan_disk(dest), dest, SLUGS)
+
+    assert not plan.matches
+    assert len(plan.unsure) == 2
+    for kandidat in plan.unsure:
+        assert "2 files match the same entry" in kandidat.reason
+
+    store = store_for(tmp_path)
+    apply_import(plan, store, NOW)
+    assert not store.entries()
+    store.close()
 
 
 def test_gleicher_name_aber_keine_passende_groesse_bleibt_unsicher(
@@ -419,6 +519,30 @@ def test_gleichnamiger_eintrag_ohne_sollgroesse_verhindert_die_zuordnung(
     assert not plan.matches
     assert len(plan.unsure) == 1
     assert "expected size" in plan.unsure[0].reason
+
+
+def test_fehlende_sollgroesse_haelt_die_pruefsumme_nicht_auf(tmp_path: Path) -> None:
+    """Auch mit einem Kandidaten ohne Sollgröße entscheidet die Prüfsumme.
+
+    Der Eintrag ohne Sollgröße bleibt ein möglicher Empfänger - aber wenn
+    alle Kandidaten dieselbe Prüfsumme tragen, ist auch er nachweislich
+    dieselbe Datei, und die Wahl ist wieder gegenstandslos.
+    """
+    dest = tmp_path / "gog"
+    name = "setup_beneath_a_steel_sky.exe"
+    write(dest / SLUG / name, b"B" * 2000)
+    entries = _sprachfassungen(
+        name, [2000, 2000, 2000, 2000, None], [PRUEFSUMME] * 5
+    )
+
+    plan = match_existing(entries, scan_disk(dest), dest, SLUGS)
+
+    assert len(plan.matches) == 1
+    assert not plan.unsure
+    # Gewählt wird nur unter denen mit passender Sollgröße - der Eintrag im
+    # Manifest soll zur Datei passen, nicht bloß zu ihrem Inhalt.
+    assert plan.matches[0].entry.file_id == "f0"
+    assert plan.matches[0].entry.size == 2000
 
 
 def test_eintrag_ohne_sollgroesse_wird_nicht_zugeordnet(tmp_path: Path) -> None:

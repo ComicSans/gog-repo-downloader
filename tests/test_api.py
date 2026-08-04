@@ -6,8 +6,9 @@ Test beschreibt genau ein Verhalten aus KONZEPT.md §3/§4.
 Es gibt zwei Wege, und beide werden geprüft:
 
 * Primaerweg ``api.gog.com/products/{id}?expand=downloads,expanded_dlcs``
-  mit exakten Byte-Größen und einem ``checksum``-Feld in der
-  Downlink-Antwort. Handler dafür: ``api_handler``.
+  mit vier Kategorien und einem ``checksum``-Feld in der Downlink-Antwort.
+  Handler dafür: ``api_handler``. Seine ``size`` ist auf volle MiB
+  gerundet und darf nie als Bytewert durchgereicht werden.
 * Rueckfallweg ``embed.gog.com/account/gameDetails/{id}.json`` plus ein
   302 auf jede ``manualUrl``. Handler dafür: ``details_handler``, der den
   Produktabruf mit 404 beantwortet und damit den Rückfall erzwingt.
@@ -654,10 +655,17 @@ def api_installer(file_id: str, size: int, *, os_name="windows", lang="en", vers
     }
 
 
-async def test_produktabruf_liefert_exakte_groesse_ohne_kopfanfrage():
-    """Der ganze Gewinn des Primaerwegs: ``size`` steht als Bytewert drin.
+async def test_produktabruf_gibt_die_gerundete_groesse_nicht_als_bytewert_aus():
+    """Die ``size`` der Produkt-Payload ist auf volle MiB gerundet.
 
-    Genau ein Request - keine Auflösung, keine Kopfanfrage.
+    Live gemessen an einer Datei: die Payload nennt 1048576, Content-Length
+    und ``total_size`` des Checksum-XML nennen beide 821824. Wer den
+    gerundeten Wert als ``RemoteFile.size`` durchreicht, füllt das Manifest
+    mit Werten, an denen jede spätere Größenprüfung scheitert - der Import
+    verwirft dann jede Datei mit "size 821824 instead of 1048576".
+
+    Ein Request, keine Auflösung, keine Kopfanfrage - und trotzdem keine
+    erfundene Größe.
     """
     gesehen: list[str] = []
 
@@ -670,7 +678,7 @@ async def test_produktabruf_liefert_exakte_groesse_ohne_kopfanfrage():
     (file,) = await client.product_files(1104118179)
 
     assert gesehen == ["GET"]
-    assert file.size == 1048576
+    assert file.size is None, "1048576 ist gerundet und darf nie im Manifest landen"
     assert file.version == "1.0"
     assert file.slot == SlotKey(1104118179, FileKind.INSTALLER, OsName.WINDOWS, "en")
     assert file.slot.variant is None
@@ -701,8 +709,9 @@ async def test_produktabruf_mehrteiliger_installer_teilt_einen_slot():
     assert len({f.slot for f in files}) == 1
     assert [f.part_index for f in files] == [1, 2, 3]
     assert [f.total_parts for f in files] == [3, 3, 3]
-    # Je Teil die eigene Größe, nicht das total_size des Eintrags.
-    assert [f.size for f in files] == [4_000_000, 4_000_000, 1_000_000]
+    # Keine Größe aus der Payload - weder je Teil noch das total_size des
+    # Eintrags, das für jeden einzelnen Teil ohnehin falsch wäre.
+    assert [f.size for f in files] == [None, None, None]
     assert [f.file_id for f in files] == ["en1installer0", "en1installer1", "en1installer2"]
 
 
@@ -737,7 +746,7 @@ async def test_patches_gleicher_sprache_trennen_sich_ueber_die_version():
     assert [f.slot.variant for f in files] == ["2.0-to-2.1", "2.1-to-2.2"]
     assert len({f.slot for f in files}) == 2
     assert all(f.slot.os is OsName.WINDOWS and f.slot.language == "en" for f in files)
-    assert [f.size for f in files] == [111, 222]
+    assert [f.size for f in files] == [None, None]
 
 
 async def test_patch_ohne_version_faellt_auf_die_id_zurueck():
@@ -837,7 +846,9 @@ async def test_bonus_content_wird_zu_extras_mit_stabilem_variant():
     # Der Soundtrack hat zwei Teile und bleibt trotzdem ein Slot.
     soundtrack = [f for f in files if f.slot.variant == "game-soundtrack"]
     assert [f.part_index for f in soundtrack] == [1, 2]
-    assert [f.size for f in soundtrack] == [20, 10]
+    # Auch bei bonus_content ist die Größe der Payload gerundet und bleibt
+    # liegen; sie kommt später aus dem Checksum-XML.
+    assert [f.size for f in soundtrack] == [None, None]
 
 
 async def test_bonus_content_ohne_namen_faellt_auf_den_typ_zurueck():
@@ -953,8 +964,8 @@ async def test_beide_wege_ergeben_denselben_slot_und_dieselbe_file_id():
     assert {(f.slot.as_str(), f.file_id) for f in von_api} == {
         (f.slot.as_str(), f.file_id) for f in von_details
     }
-    # Nur die Größe unterscheidet sich - genau das ist der Gewinn.
-    assert sorted(f.size or 0 for f in von_api) == [12, 821824]
+    # Beide Wege lassen die Größe offen: keiner nennt eine exakte.
+    assert all(f.size is None for f in von_api)
     assert all(f.size is None for f in von_details)
 
 
@@ -1197,6 +1208,43 @@ async def test_resolve_downlink_und_checksum_liefern_md5():
     assert result.filename == "setup_15_days_1.0_(19285).exe"
     assert result.md5 == "eed77e8beeb270924d0aabbccddeeff0"
     assert result.total_size == 821824
+
+
+async def test_gerundete_payload_groesse_verliert_gegen_das_checksum_xml():
+    """Der Fall, der einmal 7010 Manifest-Einträge verdorben hat.
+
+    Dieselbe Datei, drei Zahlen: die Produkt-Payload nennt 1048576 (auf
+    volle MiB gerundet), Content-Length und ``total_size`` des Checksum-XML
+    nennen beide 821824. Die api-Schicht darf die gerundete Zahl nirgends
+    als Bytegröße ausgeben - sonst scheitert jede spätere Größenprüfung
+    ("size 821824 instead of 1048576") und der Import verwirft die Datei.
+    """
+    payload = api_payload(installers=[api_installer("en1installer0", 1048576)])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(".xml"):
+            return httpx.Response(
+                200,
+                text=(
+                    '<file name="setup_15_days_1.0_(19285).exe" available="1" '
+                    'md5="eed77e8beeb270924d0aabbccddeeff0" chunks="1" '
+                    'total_size="821824"/>'
+                ),
+            )
+        if "/downlink/" in request.url.path:
+            return json_response({"downlink": SIGNIERT, "checksum": SIGNIERT + ".xml"})
+        assert ist_produktabruf(request)
+        return json_response(payload)
+
+    client, _ = make_client(handler)
+    (file,) = await client.product_files(1104118179)
+    link = await client.resolve_downlink(file.downlink)
+    pruefsumme = await client.checksum(link.checksum_url)
+
+    assert file.size is None, "die gerundete Payload-Größe darf nicht durchkommen"
+    assert pruefsumme is not None
+    # Die einzige Bytegröße, die diese Schicht hergibt, ist die echte.
+    assert pruefsumme.total_size == 821824
 
 
 async def test_checksum_url_mit_404_ist_kein_fehler():

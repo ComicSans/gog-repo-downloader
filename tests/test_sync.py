@@ -317,27 +317,29 @@ def test_extras_patches_und_dlc_filter():
     ]
     dlc_of = {999111: 1207658924, 1207658924: 1207658924}
 
+    # Voreinstellung: Goodies sind dabei, einzelne Patches nicht.
     default = plan_downloads(files, [], config(), {}, slugs=SLUGS, dlc_of=dlc_of)
-    assert sorted(i.entry.file_id for i in default.downloads) == ["d", "w"]
+    assert sorted(i.entry.file_id for i in default.downloads) == ["d", "w", "x"]
 
-    alles = plan_downloads(
-        files,
-        [],
-        config(include_extras=True, include_patches=True),
-        {},
-        slugs=SLUGS,
-        dlc_of=dlc_of,
+    ohne_goodies = plan_downloads(
+        files, [], config(include_extras=False), {}, slugs=SLUGS, dlc_of=dlc_of
     )
-    assert sorted(i.entry.file_id for i in alles.downloads) == ["d", "p", "w", "x"]
+    assert sorted(i.entry.file_id for i in ohne_goodies.downloads) == ["d", "w"]
 
+    mit_patches = plan_downloads(
+        files, [], config(include_patches=True), {}, slugs=SLUGS, dlc_of=dlc_of
+    )
+    assert sorted(i.entry.file_id for i in mit_patches.downloads) == ["d", "p", "w", "x"]
+
+    # Der DLC-Filter greift nur bei DLC; das Extra bleibt davon unberührt.
     ohne_dlc = plan_downloads(
         files, [], config(include_dlc=False), {}, slugs=SLUGS, dlc_of=dlc_of
     )
-    assert sorted(i.entry.file_id for i in ohne_dlc.downloads) == ["w"]
+    assert sorted(i.entry.file_id for i in ohne_dlc.downloads) == ["w", "x"]
 
     # Ohne dlc_of-Abbildung wird nicht geraten: nichts wird als DLC gefiltert.
     ohne_wissen = plan_downloads(files, [], config(include_dlc=False), {}, slugs=SLUGS)
-    assert sorted(i.entry.file_id for i in ohne_wissen.downloads) == ["d", "w"]
+    assert sorted(i.entry.file_id for i in ohne_wissen.downloads) == ["d", "w", "x"]
 
 
 def test_filter_erzeugen_keine_fremdmeldung():
@@ -1122,8 +1124,8 @@ def test_ersatz_mit_falscher_groesse_verhindert_jede_loeschung():
     assert plan_prune([entry()], config(), on_disk, slugs=SLUGS).prunes == []
 
 
-def test_no_extras_raeumt_das_extras_umfeld_nicht_auf():
-    """Wer ``--no-extras`` setzt, will dort auch keine Loeschungen."""
+def test_skip_goodies_raeumt_das_extras_umfeld_nicht_auf():
+    """Wer ``--skip-goodies`` setzt, will dort auch keine Loeschungen."""
     on_disk = {
         GAME_DIR / "handbuch_2.0.pdf": 500,
         GAME_DIR / "handbuch_1.0.pdf": 400,
@@ -1134,10 +1136,12 @@ def test_no_extras_raeumt_das_extras_umfeld_nicht_auf():
         )
     ]
 
-    assert plan_prune(local, config(), on_disk, slugs=SLUGS).prunes == []
+    ohne_goodies = plan_prune(local, config(include_extras=False), on_disk, slugs=SLUGS)
+    assert ohne_goodies.prunes == []
 
-    mit_extras = plan_prune(local, config(include_extras=True), on_disk, slugs=SLUGS)
-    assert [item.path.name for item in mit_extras.prunes] == ["handbuch_1.0.pdf"]
+    # Voreinstellung: Goodies werden verwaltet, also auch aufgeraeumt.
+    mit_goodies = plan_prune(local, config(), on_disk, slugs=SLUGS)
+    assert [item.path.name for item in mit_goodies.prunes] == ["handbuch_1.0.pdf"]
 
 
 def test_zwei_slots_mit_demselben_namensschema_bleiben_liegen():

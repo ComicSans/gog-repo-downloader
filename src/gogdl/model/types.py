@@ -323,8 +323,28 @@ class SyncConfig:
     language_preference: Preference = field(default_factory=Preference)
     """Sprachwahl mit Rückfallebenen. Leer heißt: ``languages`` gilt."""
     include_dlc: bool = True
-    include_extras: bool = False
+    include_extras: bool = True
+    """Goodies (Handbücher, Karten, Bilder, Soundtracks) mitnehmen.
+
+    Standardmäßig an: sie gehören für den Nutzer zum Spiel und sind
+    gegenüber den Installern klein. Abgewählt wird über ``--skip-goodies``.
+    """
     include_patches: bool = False
+    """Einzelne Patch-Dateien und Sprachpakete mitnehmen.
+
+    Standardmäßig aus: ein Patch hebt nur von einer Version auf die
+    nächste, gewollt ist der vollständige Installer der aktuellen Version.
+    Sprachpakete hängen mit daran, weil sie im Modell ebenfalls
+    ``FileKind.PATCH`` sind (siehe ``api/client.py``).
+    """
+    include_saves: bool = False
+    """Lokale Spielstandsordner beim Einlesen der Platte miterfassen.
+
+    Betrifft nicht GOG, sondern den vorhandenen Bestand: Ordner wie
+    ``SaveFiles/`` gehören keinem Manifest-Eintrag und erzeugen sonst
+    seitenweise "not matchable"-Meldungen. Standardmäßig aus, damit der
+    Plattenzustand nur das zeigt, worum sich das Werkzeug kümmert.
+    """
     prune: bool = True
     keep_versions: int = 1
     keep_old: bool = False

@@ -29,18 +29,39 @@ def db_path(dest: Path) -> Path:
     return state_dir(dest) / DB_FILENAME
 
 
-def scan_disk(root: Path) -> dict[Path, int]:
+SAVE_DIRNAMES = frozenset({"savefiles"})
+"""Verzeichnisse, die Spielstände statt Auslieferungen enthalten (casefold).
+
+Bewusst kurz gehalten: Was hier steht, sieht das Werkzeug nicht mehr - ein
+zu breiter Filter versteckt echten Bestand. Belegt ist ``SaveFiles/``; in
+einer gewachsenen Sammlung liegen darunter die eigentlichen ``saves/``, die
+deshalb keinen eigenen Eintrag brauchen. ``extras/`` gehört ausdrücklich
+nicht dazu, dort liegen Goodies.
+"""
+
+
+def scan_disk(root: Path, *, include_saves: bool = True) -> dict[Path, int]:
     """Tatsächlicher Plattenzustand: Pfad -> Größe.
 
     Die Datei ist die Wahrheit, die Datenbank nur der Cache (KONZEPT.md §5.2).
     Der Zustandsordner und der Papierkorb bleiben außen vor.
+
+    ``include_saves=False`` blendet zusätzlich die Spielstandsordner aus
+    (:data:`SAVE_DIRNAMES`). Der Vorgabewert ist hier bewusst *nicht* die
+    Voreinstellung der Befehlszeile: Wer den Parameter vergisst, bekommt zu
+    viele Dateien zu sehen, nie zu wenige. Die Kommandos reichen die
+    Entscheidung des Nutzers (``--include-saves``) ausdrücklich durch.
     """
     result: dict[Path, int] = {}
     if not root.exists():
         return result
     skip = {STATE_DIRNAME, TRASH_DIRNAME}
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in skip]
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in skip and (include_saves or d.casefold() not in SAVE_DIRNAMES)
+        ]
         base = Path(dirpath)
         for name in filenames:
             path = base / name
@@ -103,8 +124,9 @@ def build_sync_config(args) -> SyncConfig:
         os_preference=os_pref,
         language_preference=lang_pref,
         include_dlc=getattr(args, "dlc", True),
-        include_extras=getattr(args, "extras", False),
+        include_extras=getattr(args, "extras", True),
         include_patches=getattr(args, "patches", False),
+        include_saves=getattr(args, "include_saves", False),
         prune=getattr(args, "prune", True),
         keep_versions=getattr(args, "keep_versions", 1),
         prune_mode=PruneMode(getattr(args, "prune_mode", "delete")),

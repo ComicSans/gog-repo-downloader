@@ -18,10 +18,12 @@ from pathlib import Path
 import pytest
 
 from gogdl.cli import commands
-from gogdl.cli.context import AppContext, db_path
+from gogdl.cli.context import AppContext, build_sync_config, db_path, scan_disk
+from gogdl.cli.main import build_parser
 from gogdl.errors import ApiError, AuthError
 from gogdl.model.types import (
     DownloadResult,
+    FileChecksum,
     FileKind,
     LocalState,
     ManifestEntry,
@@ -159,14 +161,19 @@ class _FakeApi:
         *,
         fail: set[int] | None = None,
         size: int | None = None,
+        xml_size: int | None = None,
     ) -> None:
         self._products = products or []
         self._files = files or {}
         self._fail = fail or set()
         self._size = size
+        # Ohne ``xml_size`` gibt es kein Checksum-XML: ``resolve_downlink``
+        # liefert dann wie bisher gar keine ``checksum_url``.
+        self._xml_size = xml_size
         self.gefragt: list[int] = []
         self.aufgeloest: list[str] = []
         self.kopfanfragen: list[str] = []
+        self.xml_abrufe: list[str] = []
 
     async def library(self) -> list[ProductRef]:
         return list(self._products)
@@ -181,14 +188,21 @@ class _FakeApi:
 
     async def resolve_downlink(self, downlink: str) -> ResolvedLink:
         self.aufgeloest.append(downlink)
-        return ResolvedLink(url="https://cdn.example/x", filename=FILENAME, checksum_url=None)
+        return ResolvedLink(
+            url="https://cdn.example/x",
+            filename=FILENAME,
+            checksum_url="https://cdn.example/x.xml" if self._xml_size is not None else None,
+        )
 
     async def content_length(self, url: str) -> int | None:
         self.kopfanfragen.append(url)
         return self._size
 
-    async def checksum(self, checksum_url: str):  # pragma: no cover - hier nie gerufen
-        return None
+    async def checksum(self, checksum_url: str) -> FileChecksum | None:
+        self.xml_abrufe.append(checksum_url)
+        if self._xml_size is None:  # pragma: no cover - dann fragt niemand
+            return None
+        return FileChecksum(filename=FILENAME, md5="bbbb", total_size=self._xml_size)
 
 
 class _FakeDownloader:
@@ -472,6 +486,72 @@ def test_enrich_haelt_die_bekannte_groesse_wenn_die_kopfanfrage_nichts_liefert()
     )
 
     assert result[0].size == SIZE
+
+
+GERUNDET = 1048576
+"""Was ``api.gog.com`` als ``size`` nennt - auf volle MiB gerundet."""
+
+ECHT = 821824
+"""Was Content-Length und ``total_size`` des Checksum-XML nennen."""
+
+
+def test_enrich_nimmt_die_groesse_aus_dem_checksum_xml_ohne_kopfanfrage() -> None:
+    """Das XML wird für md5 ohnehin geholt - seine Größe kostet nichts.
+
+    Die Kopfanfrage darf hier NICHT laufen: sie wäre ein zweiter Request
+    pro Datei für einen Wert, der schon vorliegt.
+    """
+    api = _FakeApi(size=ECHT, xml_size=ECHT)
+
+    result = asyncio.run(
+        commands._enrich(api, [_remote(size=None, md5=None)], _bekannt(), strict_md5=True)
+    )
+
+    assert api.xml_abrufe == ["https://cdn.example/x.xml"]
+    assert api.kopfanfragen == [], "das XML hat die Größe bereits genannt"
+    assert result[0].size == ECHT
+    assert result[0].md5 == "bbbb"
+
+
+def test_strict_lauf_ersetzt_eine_gerundete_groesse_im_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Die Heilung nach dem Fehlgriff: 1048576 raus, 821824 rein.
+
+    Ausgangslage ist ein Manifest, das mit der gerundeten Größe aus der
+    Produkt-Payload gefüllt wurde. An diesem Wert scheitert jede spätere
+    Größenprüfung - der Import verwirft die Datei mit "size 821824 instead
+    of 1048576". Ein erneuter ``update --strict``-Lauf muss den Wert
+    ersetzen; keine Abkürzung in ``_enrich`` darf ihn stehen lassen.
+    """
+    dest = tmp_path / "sammlung"
+    store = _open(dest)
+    store.replace_products([ProductRef(PRODUCT_ID, "Spiel", SLUG)])
+    # So sieht das verdorbene Manifest aus: gerundete Größe, sonst intakt.
+    store.replace_remote(PRODUCT_ID, [_remote(size=GERUNDET, md5=None)], SEEN_1)
+    assert _einziger(store).size == GERUNDET
+    store.close()
+
+    api = _FakeApi(
+        products=[ProductRef(PRODUCT_ID, "Spiel", SLUG)],
+        # Die api-Schicht gibt die gerundete Größe gar nicht erst aus.
+        files={PRODUCT_ID: [_remote(size=None, md5=None)]},
+        size=ECHT,
+        xml_size=ECHT,
+    )
+    _install_api(monkeypatch, api)
+
+    ctx = _ctx(dest, config=_config(dest, strict_md5=True))
+    assert asyncio.run(commands.cmd_update(ctx, only=[], skip=[])) == 0
+
+    store = _open(dest)
+    try:
+        entry = _einziger(store)
+        assert entry.size == ECHT
+        assert entry.size != GERUNDET, "der gerundete Wert darf nicht überleben"
+        assert entry.md5 == "bbbb"
+    finally:
+        store.close()
 
 
 def test_geholte_groesse_macht_den_eintrag_veraltet(
@@ -783,3 +863,115 @@ def test_download_ohne_login_bricht_sofort_ab(
         asyncio.run(commands.cmd_download(_ctx(dest)))
 
     assert fehler.value.exit_code == 2
+
+
+# ------------------------------------------ BEFUND I: Spielstände und Goodies
+
+
+def test_scan_disk_blendet_spielstaende_aus_und_laesst_goodies_stehen(
+    tmp_path: Path,
+) -> None:
+    """``SaveFiles/`` gehört zu keinem Eintrag - ``extras/`` schon.
+
+    In der echten Sammlung liegen unterhalb der Spielverzeichnisse genau
+    zwei Arten von Unterordnern: ``extras`` und ``SaveFiles``. Nur der
+    zweite darf verschwinden.
+    """
+    dest = tmp_path / "sammlung"
+    _write(dest / SLUG / FILENAME, SIZE)
+    _write(dest / SLUG / "extras" / "handbuch.pdf", 50)
+    _write(dest / SLUG / "SaveFiles" / "saves" / "spielstand.sav", 64)
+
+    ohne = scan_disk(dest, include_saves=False)
+    assert set(ohne) == {dest / SLUG / FILENAME, dest / SLUG / "extras" / "handbuch.pdf"}
+
+    mit = scan_disk(dest, include_saves=True)
+    assert dest / SLUG / "SaveFiles" / "saves" / "spielstand.sav" in mit
+
+
+def test_scan_disk_erfasst_ohne_angabe_alles(tmp_path: Path) -> None:
+    """Der Vorgabewert der Funktion zeigt zu viel, nie zu wenig.
+
+    Wer den Parameter vergisst, bekommt Rauschen - das fällt auf. Ein
+    stilles Ausblenden fiele nicht auf und wäre die gefährlichere Wahl.
+    """
+    dest = tmp_path / "sammlung"
+    _write(dest / SLUG / "SaveFiles" / "spielstand.sav", 64)
+
+    assert dest / SLUG / "SaveFiles" / "spielstand.sav" in scan_disk(dest)
+
+
+def test_scan_disk_achtet_nicht_auf_gross_und_kleinschreibung(tmp_path: Path) -> None:
+    dest = tmp_path / "sammlung"
+    _write(dest / SLUG / "savefiles" / "spielstand.sav", 64)
+
+    assert scan_disk(dest, include_saves=False) == {}
+
+
+def test_import_meldet_spielstaende_nicht_als_fremdbestand(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Der Anlass für den Schalter: 4276 Meldungen über Spielstände."""
+    dest = tmp_path / "sammlung"
+    store = _bestand(dest)
+    store.close()
+    for nummer in range(3):
+        _write(dest / SLUG / "SaveFiles" / "saves" / f"stand{nummer}.sav", 64)
+
+    assert commands.cmd_import(_ctx(dest), trust="none", apply=False) == 0
+    assert "Not matchable" not in capsys.readouterr().out
+
+    mit_saves = _ctx(dest, config=_config(dest, include_saves=True))
+    assert commands.cmd_import(mit_saves, trust="none", apply=False) == 0
+    assert "Not matchable: 3 files" in capsys.readouterr().out
+
+
+def test_kommandozeile_setzt_die_neuen_voreinstellungen() -> None:
+    """Goodies an, Patches aus, Spielstände aus - ohne jeden Schalter."""
+    args = build_parser().parse_args(["status", "--dest", "/nirgendwo"])
+    assert args.extras is True
+    assert args.patches is False
+    assert args.include_saves is False
+
+    config = build_sync_config(args)
+    assert config.include_extras is True
+    assert config.include_patches is False
+    assert config.include_saves is False
+
+
+@pytest.mark.parametrize(
+    "argv, extras",
+    [
+        ([], True),
+        (["--skip-goodies"], False),
+        (["--extras"], True),
+        (["--no-extras"], False),
+        # Drei Aktionen auf demselben Zielnamen: die letzte Angabe gewinnt.
+        (["--no-extras", "--extras"], True),
+        (["--extras", "--skip-goodies"], False),
+    ],
+)
+def test_skip_goodies_und_die_alte_schreibweise(argv: list[str], extras: bool) -> None:
+    """``--no-extras`` bleibt als stille Zweitschreibweise gültig.
+
+    Der Schalter steht in bestehenden Cron-Aufrufen; ein Abbruch mit
+    "unrecognized arguments" wäre dort ein stiller Ausfall des Laufs.
+    """
+    args = build_parser().parse_args(["download", *argv])
+    assert args.extras is extras
+    assert build_sync_config(args).include_extras is extras
+
+
+def test_include_patches_und_include_saves_sind_abwaehlbar() -> None:
+    args = build_parser().parse_args(["download", "--include-patches", "--include-saves"])
+    config = build_sync_config(args)
+    assert config.include_patches is True
+    assert config.include_saves is True
+
+    # ``import`` liest die Platte ebenfalls ein und braucht den Schalter.
+    imp = build_parser().parse_args(["import", "--include-saves"])
+    assert build_sync_config(imp).include_saves is True
+
+    # ``clean`` löscht - dort muss die Sicht auf die Platte erst recht stimmen.
+    clean = build_parser().parse_args(["clean", "--include-saves"])
+    assert build_sync_config(clean).include_saves is True

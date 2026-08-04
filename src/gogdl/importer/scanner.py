@@ -191,14 +191,21 @@ def match_existing(
        Treffer. Der Name allein darf dabei ruhig auf mehrere passen: GOG
        liefert dieselbe Datei je Sprache unter demselben Namen aus, und
        die Sprachfassungen unterscheiden sich fast immer in der Größe.
-    4. Name und Größe treffen mehrere Einträge -> unsicherer Kandidat.
-       Hier ist wirklich nichts zu entscheiden.
-    5. Name passt, Größe zu keinem der gleichnamigen Einträge -> unsicherer
+    4. Name und Größe treffen mehrere Einträge, aber alle tragen dieselbe
+       Prüfsumme -> sicherer Treffer auf den Eintrag mit der kleinsten
+       ``file_id``. Bei gleicher Prüfsumme ist der Inhalt identisch, die
+       Sprache des Slots also ohne Bedeutung für die Datei. Einträge ohne
+       Sollgröße zählen dabei mit, weil sie sich nicht ausschließen
+       lassen; gewählt wird aber nur unter denen mit passender Größe.
+    5. Name und Größe treffen mehrere Einträge, und die Prüfsummen
+       unterscheiden sich oder fehlen -> unsicherer Kandidat. Hier ist
+       wirklich nichts zu entscheiden.
+    6. Name passt, Größe zu keinem der gleichnamigen Einträge -> unsicherer
        Kandidat. Das ist meist eine andere Version oder ein abgebrochener
        Download; beides darf nicht als vollständig gelten.
-    6. Kein Namenstreffer -> nicht zuordenbar. Über Präfixe oder
+    7. Kein Namenstreffer -> nicht zuordenbar. Über Präfixe oder
        Ähnlichkeit wird **nicht** geraten.
-    7. Verzeichnisse ohne bekannten Slug sind vollständig nicht zuordenbar.
+    8. Verzeichnisse ohne bekannten Slug sind vollständig nicht zuordenbar.
 
     Eindeutig heißt in beide Richtungen eindeutig: passt eine Datei auf
     zwei Einträge oder ein Eintrag auf zwei Dateien (derselbe Name in der
@@ -232,14 +239,14 @@ def match_existing(
         if path in occupied:
             continue  # Gehört bereits einem Eintrag mit lokaler Ablage.
         if len(parts) < 2 or parts[0] not in known_dirs:
-            # Regel 7: unbekanntes Verzeichnis - oder eine Datei direkt in
+            # Regel 8: unbekanntes Verzeichnis - oder eine Datei direkt in
             # der Wurzel, die zu keinem Produkt gehören kann.
             unmatched.append(path)
             continue
 
         candidates = by_key.get((parts[0], _fold(path.name)))
         if not candidates:
-            unmatched.append(path)  # Regel 6: kein Namenstreffer, kein Raten.
+            unmatched.append(path)  # Regel 7: kein Namenstreffer, kein Raten.
             continue
 
         chosen = _select_entry(candidates, path, size)
@@ -293,11 +300,14 @@ def _select_entry(
     Der Name allein taugt dort nicht als Schlüssel, die Bytegröße meistens
     schon.
 
+    Bleibt es nach der Größe mehrdeutig, entscheidet
+    :func:`_checksum_objection` als dritte Stufe.
+
     Zurück kommt entweder der eine passende Eintrag oder ein fertig
     begründeter :class:`ImportCandidate`. Die Begründungen sind bewusst
     unterscheidbar: "keine passende Größe" ist ein Fund (meist eine
-    veraltete Fassung), "gleicher Name **und** gleiche Größe" ist ein
-    echter Gleichstand, bei dem nichts zu entscheiden war.
+    veraltete Fassung), die Begründungen der dritten Stufe benennen
+    dagegen, warum die Gleichheit der Kandidaten nicht zu beweisen war.
     """
     if len(candidates) == 1:
         # Der Normalfall. Bewusst getrennt gehalten: hier kann die
@@ -317,37 +327,104 @@ def _select_entry(
             )
         return entry
 
-    # Ein Eintrag ohne Sollgröße lässt sich nicht ausschließen. Er wäre
-    # damit immer ein zweiter möglicher Empfänger - also kein Treffer.
-    unsized = [item for item in candidates if item.size is None]
-    if unsized:
-        return ImportCandidate(
-            path=path,
-            reason=(
-                f"{len(candidates)} entries share this name, {len(unsized)} "
-                "of them without expected size - not checkable"
-            ),
-        )
-
     by_size = [item for item in candidates if item.size == size]
-    if len(by_size) == 1:
+    # Ein Eintrag ohne Sollgröße lässt sich nicht ausschließen: er wäre
+    # immer ein zweiter möglicher Empfänger.
+    unsized = [item for item in candidates if item.size is None]
+
+    if not by_size:
+        if unsized:
+            return _unsized_objection(candidates, unsized, path)
+        expected = " or ".join(
+            str(item)
+            for item in sorted(
+                {item.size for item in candidates if item.size is not None}
+            )
+        )
+        return ImportCandidate(path=path, reason=f"size {size} instead of {expected}")
+
+    contenders = [*by_size, *unsized]
+    if len(contenders) == 1:
         return by_size[0]
-    if by_size:
-        # Zwei Sprachfassungen gleicher Größe. Weder Name noch Größe
-        # trennen sie, und geraten wird nicht.
+
+    # Dritte Stufe: die Prüfsumme. Sie entscheidet nicht, welcher Slot
+    # gemeint ist, sondern beweist, dass die Frage gegenstandslos ist.
+    objection = _checksum_objection(contenders, path)
+    if objection is None:
+        # Nachweislich derselbe Inhalt. Gewählt wird trotzdem nur unter den
+        # Einträgen mit passender Sollgröße, damit das Manifest die Datei
+        # weiterhin richtig beschreibt.
+        return min(by_size, key=lambda item: (item.file_id, item.slot.as_str()))
+    if unsized:
+        # Der schwächere Befund hat Vorrang: hier fehlt schon die Sollgröße.
+        return _unsized_objection(candidates, unsized, path)
+    return objection
+
+
+def _unsized_objection(
+    candidates: Sequence[ManifestEntry],
+    unsized: Sequence[ManifestEntry],
+    path: Path,
+) -> ImportCandidate:
+    """Begründung, wenn ein gleichnamiger Eintrag keine Sollgröße nennt."""
+    return ImportCandidate(
+        path=path,
+        reason=(
+            f"{len(candidates)} entries share this name, {len(unsized)} "
+            "of them without expected size - not checkable"
+        ),
+    )
+
+
+def _checksum_objection(
+    candidates: Sequence[ManifestEntry], path: Path
+) -> ImportCandidate | None:
+    """Prüft, ob der Gleichstand gleichnamiger Einträge belanglos ist.
+
+    ``None`` heißt: nachweislich derselbe Inhalt, die Wahl ist frei.
+    Andernfalls kommt der fertig begründete Einwand zurück.
+
+    Warum das trotz der Grundhaltung "bei Zweifeln nicht zuordnen" sicher
+    ist: Tragen alle Kandidaten dieselbe Prüfsumme, ist ihr Inhalt
+    identisch. GOG listet denselben mehrsprachigen Installer dann nur unter
+    mehreren Sprach-Slots. Für die Datei auf der Platte ist die Sprache des
+    Slots damit bedeutungslos - es gibt keine falsche Wahl, weil es nichts
+    zu wählen gibt. Der schlimmste Fall ist, dass ein Eintrag unter einem
+    Sprach-Slot steht, der eine byteidentische Datei beschreibt. Eine
+    Messung an einer echten Sammlung fand 99 solcher Gruppen, davon 93
+    nachweislich identisch.
+
+    Bewiesen ist die Gleichheit nur, wenn **jeder** Kandidat eine
+    Prüfsumme trägt. Fehlt eine, könnte der Kandidat ohne Prüfsumme sehr
+    wohl ein anderer Inhalt sein; unterscheiden sie sich, ist er es
+    nachweislich (gemessen einmal, ``setup_theme_hospital_v3_(28027).exe``).
+    Beides bleibt abgelehnt.
+
+    Solange das Manifest keine Prüfsummen führt - vor einem
+    ``update --strict`` also -, greift diese Stufe nie und es bleibt bei
+    der Ablehnung. Das ist der vorsichtige Zustand, nicht der neue.
+    """
+    unchecked = [item for item in candidates if not item.md5]
+    if unchecked:
         return ImportCandidate(
             path=path,
             reason=(
-                f"name and size match {len(by_size)} entries "
-                "- cannot tell which language"
+                f"name and size match {len(candidates)} entries, checksum "
+                f"missing for {len(unchecked)} of them"
             ),
         )
 
-    expected = " or ".join(
-        str(item)
-        for item in sorted({item.size for item in candidates if item.size is not None})
-    )
-    return ImportCandidate(path=path, reason=f"size {size} instead of {expected}")
+    digests = {item.md5.casefold() for item in candidates if item.md5}
+    if len(digests) > 1:
+        return ImportCandidate(
+            path=path,
+            reason=(
+                f"name and size match {len(candidates)} entries with "
+                "different checksums"
+            ),
+        )
+
+    return None
 
 
 def _resolve_entry_conflicts(

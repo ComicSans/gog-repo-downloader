@@ -10,12 +10,15 @@ injizierten ``AuthProvider``; es gibt bewusst keinen Cookie-Jar.
 Es gibt zwei Wege zur Dateiliste, und dieses Modul kennt beide.
 
 Primaerweg ist ``api.gog.com/products/{id}?expand=downloads,expanded_dlcs``.
-Er ist der bessere, weil er drei Dinge liefert, die der andere nicht hat:
-``size`` als exakten Bytewert je Teildatei, die Adresse des Checksum-XML
-als eigenes Feld ``checksum`` der Downlink-Antwort, und vier statt zwei
-Kategorien (``installers``, ``patches``, ``language_packs``,
-``bonus_content``). Ausserdem fasst er die Aktualisierungsmarker im
-GOG-Konto nicht an.
+Er ist der bessere, weil er zwei Dinge liefert, die der andere nicht hat:
+die Adresse des Checksum-XML als eigenes Feld ``checksum`` der
+Downlink-Antwort, und vier statt zwei Kategorien (``installers``,
+``patches``, ``language_packs``, ``bonus_content``). Ausserdem fasst er
+die Aktualisierungsmarker im GOG-Konto nicht an.
+
+Was er NICHT liefert, ist eine brauchbare Groesse - siehe die Messung in
+``_collect_api_group``. Beide Wege sind darin gleich schlecht, und beide
+setzen ``size=None``.
 
 Rueckfallweg ist der Offline-Weg von ``embed.gog.com``:
 ``account/gameDetails/{id}.json`` liefert die Dateiliste, und die dort
@@ -533,9 +536,11 @@ class GogApiClient:
 
         Nicht Teil des Protocols ``GogApi`` und bewusst getrennt von
         ``resolve_downlink``: das Modell ``ResolvedLink`` bleibt
-        unveraendert. Die ``size`` aus gameDetails ist gerundeter Text
-        ("1 MB") und als Aktualitaetssignal unbrauchbar; nur dieser Wert
-        taugt fuer §4.2.
+        unveraendert. Keiner der beiden Wege nennt eine brauchbare Groesse:
+        gameDetails liefert gerundeten Text ("1 MB"), api.gog.com eine auf
+        volle MiB gerundete Zahl (1048576 statt 821824). Als
+        Aktualitaetssignal nach §4.2 taugen nur dieser Wert und das
+        ``total_size`` des Checksum-XML.
 
         Fehlt der Header oder ist er unlesbar, ist das Ergebnis ``None``.
         Wie bei ``checksum`` ist ein nicht abrufbarer Wert kein Abbruch -
@@ -747,11 +752,26 @@ class GogApiClient:
         """``installers``/``patches``/``language_packs`` uebersetzen.
 
         Ein Eintrag der Liste ist genau EIN Slot; seine ``files`` sind die
-        Teile (§5.5). ``size`` steht dort als exakter Bytewert je Teil und
-        wird uebernommen - das ist der Gewinn gegenueber gameDetails, das
-        nur gerundeten Text ("1 MB") kennt. Bewusst nicht genommen wird das
-        ``total_size`` des Eintrags: bei einem mehrteiligen Installer waere
-        das fuer jeden einzelnen Teil die falsche Groesse.
+        Teile (§5.5).
+
+        Die ``size`` der Payload bleibt liegen - sie ist KEINE Bytegroesse.
+        Live gemessen an einem einzelnen Teil::
+
+            size aus api.gog.com : 1048576   <- auf volle MiB gerundet
+            Content-Length       :  821824   <- die Wahrheit
+            total_size aus XML   :  821824   <- ebenfalls die Wahrheit
+
+        Wer sie trotzdem als ``RemoteFile.size`` durchreicht, fuellt das
+        Manifest mit Werten, an denen jede spaetere Groessenpruefung
+        scheitert: der Import verwirft dann jede Datei mit "size 821824
+        instead of 1048576", und der Store haelt jeden Eintrag fuer
+        veraltet. Genau das ist einmal passiert. Die echte Groesse holt
+        ``cli/commands.py::_enrich`` aus ``total_size`` des Checksum-XML
+        oder per ``content_length``.
+
+        Auch ``total_size`` des Eintrags waere kein Ersatz: bei einem
+        mehrteiligen Installer ist es fuer jeden einzelnen Teil die
+        falsche Groesse.
 
         ``variant_prefix`` steuert den Diskriminator: ``None`` heisst "kein
         variant" (Installer sind durch os und Sprache eindeutig), ein
@@ -797,7 +817,9 @@ class GogApiClient:
                         slot=slot,
                         file_id=_api_file_id(part),
                         downlink=str(part.get("downlink") or "").strip(),
-                        size=_as_int(part.get("size")),
+                        # ``part["size"]`` ist auf volle MiB gerundet - siehe
+                        # die Messung im Docstring. Nur None ist hier ehrlich.
+                        size=None,
                         version=version,
                         part_index=index,
                         total_parts=total_parts,
@@ -864,7 +886,9 @@ class GogApiClient:
                         slot=slot,
                         file_id=_api_file_id(part),
                         downlink=str(part.get("downlink") or "").strip(),
-                        size=_as_int(part.get("size")),
+                        # Gerundet wie in _collect_api_group; dort steht die
+                        # Messung. Die echte Groesse holt _enrich.
+                        size=None,
                         version=version,
                         part_index=index,
                         total_parts=total_parts,

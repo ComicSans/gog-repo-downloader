@@ -83,6 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Match existing files against the manifest (for collections that grew over time)",
     )
     _add_dest(imp)
+    _add_saves_flag(imp)
     imp.add_argument("--apply", action="store_true", help="Commit the matching")
     imp.add_argument(
         "--trust",
@@ -163,13 +164,62 @@ def _add_filters(parser: argparse.ArgumentParser) -> None:
         "--dlc", action="store_true", default=True, help="Include DLC (default)"
     )
     parser.add_argument("--no-dlc", dest="dlc", action="store_false")
-    parser.add_argument("--extras", action="store_true", default=False, help="Include extras")
-    parser.add_argument("--no-extras", dest="extras", action="store_false")
-    # --patches gibt es bewusst nicht mehr: die genutzte GOG-Schnittstelle
-    # liefert unter gameDetails nur Installer und Extras, keine Patches.
-    # FileKind.PATCH bleibt im Modell, falls sich das wieder ändert.
+    # Goodies sind standardmäßig dabei; abgewählt wird ausdrücklich.
+    # ``--extras``/``--no-extras`` bleiben als stille Zweitschreibweise
+    # erhalten, damit bestehende Cron-Aufrufe nicht plötzlich abbrechen.
+    # Alle drei Aktionen setzen denselben Zielnamen und tragen denselben
+    # Vorgabewert, damit eine spätere Umsortierung ihn nicht still dreht.
+    parser.add_argument(
+        "--skip-goodies",
+        dest="extras",
+        action="store_false",
+        default=True,
+        help=(
+            "Skip goodies (manuals, maps, wallpapers, soundtracks). "
+            "Default: goodies are downloaded"
+        ),
+    )
+    parser.add_argument(
+        "--extras", dest="extras", action="store_true", default=True, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--no-extras", dest="extras", action="store_false", default=True, help=argparse.SUPPRESS
+    )
+    # Patches heben nur von einer Version auf die nächste; gewollt ist der
+    # vollständige Installer der aktuellen Version. Sprachpakete hängen mit
+    # daran, weil die Schnittstelle sie als FileKind.PATCH einliest
+    # (api/client.py) und die Planung nur nach Art unterscheidet.
+    parser.add_argument(
+        "--include-patches",
+        dest="patches",
+        action="store_true",
+        default=False,
+        help=(
+            "Also download patch files and language packs. Default: off - the "
+            "full installer of the current version is downloaded instead"
+        ),
+    )
+    _add_saves_flag(parser)
     parser.add_argument(
         "--strict", action="store_true", help="Compare MD5 for installers too"
+    )
+
+
+def _add_saves_flag(parser: argparse.ArgumentParser) -> None:
+    """``--include-saves`` - betrifft die Platte, nicht GOG.
+
+    Spielstandsordner gehören zu keinem Manifest-Eintrag und füllen sonst
+    jede Ausgabe mit "not matchable". Auch ``import`` braucht den Schalter,
+    denn genau dort fällt das auf.
+    """
+    parser.add_argument(
+        "--include-saves",
+        action="store_true",
+        default=False,
+        help=(
+            "Also look at local save game folders (SaveFiles) when reading the "
+            "collection. Default: off - they belong to no manifest entry"
+        ),
     )
 
 
