@@ -32,11 +32,14 @@ MAX_RETRIES = 5
 CHUNK_SIZE = 8 * 1024 * 1024
 """Blockgröße für Schreiben und Verifizieren.
 
-Nicht die Bandbreite begrenzt ein Netzlaufwerk, sondern die Latenz pro
-Roundtrip: auf einer SMB-Freigabe brachte dieselbe Datei mit 1-MiB-Blöcken
-2.6 MB/s und mit 8-MiB-Blöcken 3.9 MB/s. Bei ``--jobs`` gleichzeitigen
-Aufträgen hält der Prozess entsprechend viele Blöcke gleichzeitig im
-Speicher, deshalb nicht beliebig groß.
+Auf einer trägen SMB-Verbindung halbierte die kleinere Blockgröße den
+Durchsatz - dieselbe Datei las sich mit 1 MiB mit 5.3 MB/s, mit 8 MiB mit
+10.9 MB/s. Auf einer frisch aufgebauten Verbindung derselben Freigabe war
+der Unterschied dann verschwunden (11.2 gegen 10.8 MB/s): der Gewinn kommt
+nur zum Tragen, solange die Latenz pro Roundtrip hoch ist. Die größere
+Blockgröße kostet dort nichts und hilft im schlechten Fall, deshalb bleibt
+sie. Bei ``--jobs`` gleichzeitigen Aufträgen liegen entsprechend viele
+Blöcke gleichzeitig im Speicher, deshalb nicht beliebig groß.
 """
 
 TRASH_DIRNAME = ".trash"
