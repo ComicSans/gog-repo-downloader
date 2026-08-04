@@ -46,6 +46,17 @@ class AuthProvider(Protocol):
 
 
 @runtime_checkable
+class LoginProvider(AuthProvider, Protocol):
+    """Kann zusätzlich einen frischen Login abschließen.
+
+    Getrennt von ``AuthProvider``, weil nur ``gogdl login`` das braucht -
+    alle übrigen Kommandos kommen mit einem vorhandenen Refresh-Token aus.
+    """
+
+    async def exchange_code(self, code: str) -> Credentials: ...
+
+
+@runtime_checkable
 class GogApi(Protocol):
     """Lesezugriff auf Bibliothek, Produktdetails und Download-Links."""
 
@@ -91,15 +102,26 @@ class Store(Protocol):
 
 @runtime_checkable
 class ProgressReporter(Protocol):
-    """Zweistufige Fortschrittsanzeige, TTY-abhängig (KONZEPT.md §5.4)."""
+    """Zweistufige Fortschrittsanzeige, TTY-abhängig (KONZEPT.md §5.4).
+
+    ``start_file`` liefert ein undurchsichtiges Handle, das ``advance`` und
+    ``finish_file`` wieder entgegennehmen. Ohne dieses Handle rechnen bei
+    ``--jobs 2`` - dem Standard - zwei gleichzeitige Downloads ihre Bytes
+    gegenseitig der falschen Datei zu. Wird kein Handle übergeben, gilt die
+    zuletzt begonnene Datei; das ist nur bei einem einzelnen Auftrag sicher.
+    """
 
     def start_overall(self, total_files: int, total_bytes: int) -> None: ...
 
-    def start_file(self, name: str, total_bytes: int | None, already_done: int = 0) -> None: ...
+    def start_file(
+        self, name: str, total_bytes: int | None, already_done: int = 0
+    ) -> object: ...
 
-    def advance(self, n_bytes: int) -> None: ...
+    def advance(self, n_bytes: int, handle: object | None = None) -> None: ...
 
-    def finish_file(self, name: str, ok: bool, detail: str = "") -> None: ...
+    def finish_file(
+        self, name: str, ok: bool, detail: str = "", handle: object | None = None
+    ) -> None: ...
 
     def message(self, text: str) -> None: ...
 

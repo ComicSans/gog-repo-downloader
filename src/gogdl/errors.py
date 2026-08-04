@@ -21,6 +21,17 @@ class ApiError(GogdlError):
     exit_code = 3
 
 
+class NetworkError(GogdlError):
+    """Verbindung nicht zustande gekommen: DNS, Timeout, Abbruch.
+
+    Bewusst getrennt von ``AuthError`` und ``ApiError``: im Cron-Betrieb ist
+    ein Netzaussetzer etwas anderes als ein abgelaufenes Login, und der
+    Aufrufer soll das an der Diagnose erkennen, nicht am Text.
+    """
+
+    exit_code = 7
+
+
 class RateLimitError(ApiError):
     """HTTP 429. ``retry_after`` in Sekunden, falls GOG einen Wert nennt."""
 

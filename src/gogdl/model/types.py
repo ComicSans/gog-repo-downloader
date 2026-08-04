@@ -55,21 +55,44 @@ class SlotKey:
     """Kleinste Einheit, die als Ganzes aktuell oder veraltet ist.
 
     Ein Slot bündelt alle Teildateien einer Auslieferung (mehrteilige
-    Installer!). Prune arbeitet ausschließlich auf Slot-Ebene — siehe
+    Installer!). Prune arbeitet ausschließlich auf Slot-Ebene - siehe
     KONZEPT.md §5.5.
+
+    ``variant`` trennt Auslieferungen, die sich sonst denselben Schlüssel
+    teilen würden. Für die Prune-Sicherheit ist das entscheidend:
+
+    * Extras haben weder Plattform noch Sprache. Ohne Diskriminator fielen
+      Handbuch, Soundtrack und Wallpaper eines Spiels in einen Slot und
+      wären fürs Aufräumen eine einzige Auslieferung.
+    * GOG bietet pro Plattform und Sprache mehrere Patches mit
+      unterschiedlichen Versionsspannen an (2.0 auf 2.1, 2.1 auf 2.2).
+      Das ist dort der Normalfall, nicht die Ausnahme.
+
+    Bei Installern bleibt ``variant`` leer: Plattform und Sprache
+    identifizieren sie bereits eindeutig.
     """
 
     product_id: int
     kind: FileKind
     os: OsName | None = None
     language: str | None = None
+    variant: str | None = None
 
     def as_str(self) -> str:
-        parts = [str(self.product_id), self.kind.value]
-        if self.os is not None:
-            parts.append(self.os.value)
-        if self.language is not None:
-            parts.append(self.language)
+        """Stabiler Textschlüssel, auch wenn os/language fehlen.
+
+        Die Platzhalter sind nötig, weil SQLite NULL in einem
+        Unique-Constraint als verschieden behandelt und der Store deshalb
+        auf diesem String schlüsselt.
+        """
+        parts = [
+            str(self.product_id),
+            self.kind.value,
+            self.os.value if self.os is not None else "-",
+            self.language if self.language is not None else "-",
+        ]
+        if self.variant:
+            parts.append(self.variant)
         return "/".join(parts)
 
 
@@ -102,10 +125,16 @@ class RemoteFile:
     version: str | None = None
     part_index: int = 1
     total_parts: int = 1
+    dlc_of: int | None = None
+    """Produkt-ID des Hauptspiels, wenn diese Datei zu einem DLC gehört."""
 
     @property
     def product_id(self) -> int:
         return self.slot.product_id
+
+    @property
+    def is_dlc(self) -> bool:
+        return self.dlc_of is not None
 
 
 @dataclass(frozen=True)
@@ -148,6 +177,7 @@ class ManifestEntry:
     bytes_done: int = 0
     last_seen_utc: str | None = None
     last_verified_utc: str | None = None
+    dlc_of: int | None = None
 
     @property
     def product_id(self) -> int:
