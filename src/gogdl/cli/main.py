@@ -141,8 +141,9 @@ def _add_filters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-dlc", dest="dlc", action="store_false")
     parser.add_argument("--extras", action="store_true", default=False, help="Extras einschließen")
     parser.add_argument("--no-extras", dest="extras", action="store_false")
-    parser.add_argument("--patches", action="store_true", default=False, help="Patches einschließen")
-    parser.add_argument("--no-patches", dest="patches", action="store_false")
+    # --patches gibt es bewusst nicht mehr: die genutzte GOG-Schnittstelle
+    # liefert unter gameDetails nur Installer und Extras, keine Patches.
+    # FileKind.PATCH bleibt im Modell, falls sich das wieder ändert.
     parser.add_argument("--strict", action="store_true", help="MD5 auch bei Installern vergleichen")
 
 

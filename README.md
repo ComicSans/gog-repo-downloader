@@ -101,7 +101,6 @@ Filters, available on `update`, `status`, `download`, `verify`, `clean`, and `sy
 --os / --lang                  see above; defaults: current platform, en
 --dlc / --no-dlc               default: on
 --extras / --no-extras         default: off (bonus content is large and rarely needed)
---patches / --no-patches       default: off
 --strict                       compare MD5 for installers too, not only for extras
 ```
 
@@ -172,10 +171,10 @@ Exit codes:
 | 2 | authentication missing, expired, or rejected |
 | 3 | unexpected API response |
 | 4 | download or verification failure (rerun resumes where it stopped) |
-| 5 | a planned deletion failed its safety check |
 | 6 | manifest database not readable or writable |
-| 7 | network failure (DNS, timeout, connection loss) |
 | 130 | interrupted; a rerun resumes |
+
+Codes `1` and `5` and `7` are reserved and not currently emitted: a refused deletion is a normal reported outcome rather than an error, and network failures surface as `3` today.
 
 ## How it stores things
 
