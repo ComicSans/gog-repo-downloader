@@ -336,7 +336,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         if isinstance(exc, sqlite3.Error):
             raise
         raise StoreError(
-            f"Manifest kann nicht auf Schema {SCHEMA_VERSION:d} gehoben werden: {exc}"
+            f"Manifest cannot be upgraded to schema {SCHEMA_VERSION:d}: {exc}"
         ) from exc
     conn.execute("COMMIT")
 
@@ -369,13 +369,13 @@ class SqliteStore:
             self._conn.execute("PRAGMA synchronous = NORMAL")
             _migrate(self._conn)
         except (sqlite3.Error, OSError) as exc:
-            raise StoreError(f"Manifest {path!s} nicht nutzbar: {exc}") from exc
+            raise StoreError(f"Manifest {path!s} is not usable: {exc}") from exc
 
     # -- interne Helfer ---------------------------------------------------
 
     def _check_open(self) -> None:
         if self._closed:
-            raise StoreError("Manifest ist bereits geschlossen.")
+            raise StoreError("The manifest is already closed.")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -384,7 +384,7 @@ class SqliteStore:
         try:
             self._conn.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
-            raise StoreError(f"Manifest nicht beschreibbar: {exc}") from exc
+            raise StoreError(f"Manifest is not writable: {exc}") from exc
         try:
             yield self._conn
         except Exception as exc:
@@ -393,12 +393,12 @@ class SqliteStore:
             except sqlite3.Error:
                 pass
             if isinstance(exc, sqlite3.Error):
-                raise StoreError(f"Schreiben ins Manifest fehlgeschlagen: {exc}") from exc
+                raise StoreError(f"Writing to the manifest failed: {exc}") from exc
             raise
         try:
             self._conn.execute("COMMIT")
         except sqlite3.Error as exc:
-            raise StoreError(f"Commit fehlgeschlagen: {exc}") from exc
+            raise StoreError(f"Commit failed: {exc}") from exc
 
     def _query(
         self, sql: str, params: Sequence[object] | dict[str, object] = ()
@@ -407,7 +407,7 @@ class SqliteStore:
         try:
             return list(self._conn.execute(sql, params))
         except sqlite3.Error as exc:
-            raise StoreError(f"Lesen aus dem Manifest fehlgeschlagen: {exc}") from exc
+            raise StoreError(f"Reading from the manifest failed: {exc}") from exc
 
     # -- Store ------------------------------------------------------------
 
@@ -454,8 +454,8 @@ class SqliteStore:
             for file in files:
                 if file.slot.product_id != product_id:
                     raise StoreError(
-                        f"Datei {file.file_id} gehört zu Produkt "
-                        f"{file.slot.product_id}, nicht zu {product_id}."
+                        f"File {file.file_id} belongs to product "
+                        f"{file.slot.product_id}, not to {product_id}."
                     )
                 params = _remote_params(file, seen_utc)
                 conn.execute(_INSERT_REMOTE, params)
@@ -536,7 +536,7 @@ class SqliteStore:
         try:
             self._conn.close()
         except sqlite3.Error as exc:
-            raise StoreError(f"Manifest konnte nicht geschlossen werden: {exc}") from exc
+            raise StoreError(f"The manifest could not be closed: {exc}") from exc
 
     def __enter__(self) -> "SqliteStore":
         return self

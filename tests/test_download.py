@@ -625,7 +625,7 @@ async def test_ungeprueftes_ergebnis_ersetzt_vorhandene_zieldatei_nicht(tmp_path
     result = await downloader.fetch(item, reporter)
 
     assert result.ok is False and result.verified is False
-    assert "prüfbar" in (result.error or "")
+    assert "checkable" in (result.error or "")
     assert item.target.read_bytes() == ALT  # unverändert
     assert not old_path(item).exists()
     assert item.part_path.read_bytes() == BODY  # ``.part`` bleibt erhalten

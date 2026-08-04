@@ -240,7 +240,7 @@ def match_existing(
             unsure.append(
                 ImportCandidate(
                     path=path,
-                    reason=f"Name passt auf {len(matches)} Einträge - nicht eindeutig",
+                    reason=f"name matches {len(matches)} entries - not unique",
                 )
             )
             continue
@@ -250,7 +250,7 @@ def match_existing(
             unsure.append(
                 ImportCandidate(
                     path=path,
-                    reason="keine Sollgröße im Manifest - nicht prüfbar",
+                    reason="no expected size in the manifest - not checkable",
                     entry=entry,
                 )
             )
@@ -259,7 +259,7 @@ def match_existing(
             unsure.append(
                 ImportCandidate(
                     path=path,
-                    reason=f"Größe {size} statt {entry.size}",
+                    reason=f"size {size} instead of {entry.size}",
                     entry=entry,
                 )
             )
@@ -326,8 +326,8 @@ def _resolve_entry_conflicts(
                     ImportCandidate(
                         path=path,
                         reason=(
-                            f"{len(group)} Dateien passen auf denselben Eintrag "
-                            "- nicht eindeutig"
+                            f"{len(group)} files match the same entry "
+                            "- not unique"
                         ),
                     )
                 )

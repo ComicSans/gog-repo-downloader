@@ -128,7 +128,7 @@ class _FilesColumn(ProgressColumn):
             return Text("")
         done = task.fields.get("files_done", 0)
         total = task.fields.get("files_total", 0)
-        return Text(f"{done}/{total} Dateien", style="progress.percentage")
+        return Text(f"{done}/{total} files", style="progress.percentage")
 
 
 class _BytesColumn(ProgressColumn):
@@ -288,10 +288,10 @@ class RichReporter:
 
         if ok and self._quiet:
             return
-        marker, style = ("OK", "green") if ok else ("FEHLER", "bold red")
+        marker, style = ("OK", "green") if ok else ("FAILED", "bold red")
         line = Text.assemble((marker, style), " ", str(name))
         if detail:
-            line.append(f" — {detail}")
+            line.append(f" - {detail}")
         self._print(line)
 
     def message(self, text: str) -> None:
@@ -345,7 +345,7 @@ class RichReporter:
         if self._overall is not None:
             return
         self._overall = self._progress.add_task(
-            "Gesamt ",
+            "Total ",
             total=None,
             row=_ROW_OVERALL,
             files_done=self._files_ok + self._files_failed,
@@ -448,7 +448,7 @@ class PlainReporter:
         self._files_total = int(total_files)
         self._started_at = self._clock()
         if not self._quiet:
-            self._emit(f"Start: {self._files_total} Dateien, {human_bytes(total_bytes)}")
+            self._emit(f"Start: {self._files_total} files, {human_bytes(total_bytes)}")
 
     def start_file(
         self, name: str, total_bytes: int | None, already_done: int = 0
@@ -467,10 +467,10 @@ class PlainReporter:
         handle = self._register(state)
         if self._quiet:
             return handle
-        size = human_bytes(total_bytes) if total_bytes is not None else "unbekannte Größe"
-        line = f"[{state.index}/{self._files_total}] {state.name} — {size}"
+        size = human_bytes(total_bytes) if total_bytes is not None else "unknown size"
+        line = f"[{state.index}/{self._files_total}] {state.name} - {size}"
         if state.done:
-            line += f" (Fortsetzung ab {human_bytes(state.done)})"
+            line += f" (resuming at {human_bytes(state.done)})"
         self._emit(line)
         return handle
 
@@ -503,13 +503,13 @@ class PlainReporter:
         prefix = f"[{index}/{self._files_total}]"
         if ok:
             if not self._quiet:
-                line = f"{prefix} OK {name} — {human_bytes(done)}"
+                line = f"{prefix} OK {name} - {human_bytes(done)}"
                 line += f" in {human_duration(elapsed)}"
                 self._emit(line)
         else:
-            line = f"{prefix} FEHLER {name}"
+            line = f"{prefix} FAILED {name}"
             if detail:
-                line += f" — {detail}"
+                line += f" - {detail}"
             self._emit(line)
 
     def message(self, text: str) -> None:
@@ -600,11 +600,11 @@ def _summary_line(reporter: RichReporter | PlainReporter) -> str:
     done = reporter._files_ok
     total = reporter._files_total or done + reporter._files_failed
     line = (
-        f"Fertig: {done}/{total} Dateien, "
+        f"Done: {done}/{total} files, "
         f"{human_bytes(reporter._bytes_done)} in {human_duration(elapsed)}"
     )
     if reporter._files_failed:
-        line += f", {reporter._files_failed} Fehler"
+        line += f", {reporter._files_failed} failed"
     return line
 
 

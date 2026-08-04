@@ -37,23 +37,23 @@ def verify_entry(entry: ManifestEntry, path: Path, *, deep: bool = False) -> tup
     keine Löschung autorisiert.
     """
     if not path.exists():
-        return False, "Datei fehlt"
+        return False, "file is missing"
     if not path.is_file():
-        return False, "kein regulärer Datei-Eintrag"
+        return False, "not a regular file"
 
     actual_size = path.stat().st_size
     if entry.size is not None and actual_size != entry.size:
-        return False, f"Größe {actual_size} statt {entry.size}"
+        return False, f"size {actual_size} instead of {entry.size}"
 
     if not deep:
         if entry.size is None:
-            return False, "keine Sollgröße im Manifest - nicht prüfbar"
-        return True, "Größe stimmt"
+            return False, "no expected size in the manifest - not checkable"
+        return True, "size matches"
 
     if entry.md5:
         actual_md5 = file_md5(path)
         if actual_md5.lower() != entry.md5.lower():
-            return False, f"MD5 {actual_md5} statt {entry.md5}"
+            return False, f"MD5 {actual_md5} instead of {entry.md5}"
 
     if path.suffix.lower() in _ARCHIVE_SUFFIXES:
         ok, detail = _check_zip(path)
@@ -61,10 +61,10 @@ def verify_entry(entry: ManifestEntry, path: Path, *, deep: bool = False) -> tup
             return False, detail
 
     if entry.size is None and not entry.md5:
-        return False, "weder Größe noch MD5 im Manifest - nicht prüfbar"
+        return False, "neither size nor MD5 in the manifest - not checkable"
 
-    signals = [name for name, value in (("Größe", entry.size), ("MD5", entry.md5)) if value]
-    return True, " und ".join(signals) + " stimmen"
+    signals = [name for name, value in (("size", entry.size), ("MD5", entry.md5)) if value]
+    return True, "verified: " + " and ".join(signals)
 
 
 def _check_zip(path: Path) -> tuple[bool, str]:
@@ -72,9 +72,9 @@ def _check_zip(path: Path) -> tuple[bool, str]:
         with zipfile.ZipFile(path) as archive:
             broken = archive.testzip()
     except zipfile.BadZipFile as exc:
-        return False, f"Archiv defekt: {exc}"
+        return False, f"archive is damaged: {exc}"
     except OSError as exc:
-        return False, f"Archiv nicht lesbar: {exc}"
+        return False, f"archive is not readable: {exc}"
     if broken is not None:
-        return False, f"Archiv defekt bei {broken}"
-    return True, "Archiv in Ordnung"
+        return False, f"archive is damaged at {broken}"
+    return True, "archive is fine"

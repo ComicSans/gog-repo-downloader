@@ -38,7 +38,6 @@ uv venv && uv pip install -e .
 
 Requires Python 3.12+ either way. `pip install -e .` works just as well. Dependencies are `httpx` and `rich`, nothing else.
 
-Note: the CLI output is currently in German. The behavior documented here is language-independent.
 
 ## Quickstart
 

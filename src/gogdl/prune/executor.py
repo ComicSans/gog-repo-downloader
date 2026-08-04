@@ -95,21 +95,21 @@ class PruneExecutor:
         assert path is not None
 
         if not path.exists():
-            return PruneResult(item=item, removed=False, reason="nicht vorhanden")
+            return PruneResult(item=item, removed=False, reason="not present")
         if not path.is_file():
-            return PruneResult(item=item, removed=False, reason="keine reguläre Datei")
+            return PruneResult(item=item, removed=False, reason="not a regular file")
 
         refusal = self._replacement_refusal(item, path)
         if refusal is not None:
             return PruneResult(item=item, removed=False, reason=refusal)
 
         if dry_run:
-            return PruneResult(item=item, removed=True, reason="würde entfernt (dry-run)")
+            return PruneResult(item=item, removed=True, reason="would be removed (dry run)")
 
         try:
             detail = self._remove(path)
         except OSError as exc:
-            return PruneResult(item=item, removed=False, reason=f"Fehler beim Entfernen: {exc}")
+            return PruneResult(item=item, removed=False, reason=f"Error while removing: {exc}")
 
         self._prune_empty_dirs(path.parent)
         return PruneResult(item=item, removed=True, reason=detail)
@@ -124,7 +124,7 @@ class PruneExecutor:
         """
         raw = Path(item.path)
         if ".." in raw.parts:
-            return None, "unsicherer Pfad: '..'-Anteil"
+            return None, "unsafe path: contains '..'"
 
         candidate = raw if raw.is_absolute() else self._dest / raw
         candidate = Path(os.path.normpath(candidate))
@@ -139,11 +139,11 @@ class PruneExecutor:
             candidate = self._dest / candidate.relative_to(self._dest_given)
 
         if candidate == self._dest or not candidate.is_relative_to(self._dest):
-            return None, f"Pfad liegt außerhalb von {self._dest}"
+            return None, f"path lies outside {self._dest}"
 
         trash_root = self._dest / TRASH_DIRNAME
         if candidate == trash_root or candidate.is_relative_to(trash_root):
-            return None, "Pfad liegt im Papierkorb"
+            return None, "path lies inside the trash directory"
 
         # Kein Symlink auf dem gesamten Weg von dest bis zur Datei: sonst
         # zeigt ein Verzeichnis im Zielordner auf beliebige Fremddaten.
@@ -152,14 +152,14 @@ class PruneExecutor:
             current = current / part
             if current.is_symlink():
                 if current == candidate:
-                    return None, "Zieldatei ist ein Symlink"
-                return None, f"Symlink im Pfad: {current}"
+                    return None, "target file is a symlink"
+                return None, f"symlink in the path: {current}"
 
         # Gürtel und Hosenträger: nach dem Auflösen muss der Pfad immer
         # noch unter dest liegen.
         resolved = candidate.resolve()
         if not resolved.is_relative_to(self._dest):
-            return None, f"Pfad zeigt aufgelöst außerhalb von {self._dest}"
+            return None, f"resolved path points outside {self._dest}"
 
         return candidate, None
 
@@ -181,7 +181,7 @@ class PruneExecutor:
         if not item.replaced_by:
             if path.name.endswith(PART_SUFFIX):
                 return None
-            return "kein Ersatz benannt"
+            return "no replacement named"
 
         entries = {entry.file_id: entry for entry in self._store.entries_for_slot(item.slot)}
 
@@ -189,16 +189,16 @@ class PruneExecutor:
         for file_id in item.replaced_by:
             entry = entries.get(file_id)
             if entry is None:
-                return f"Ersatz {file_id} nicht im Manifest"
+                return f"replacement {file_id} is not in the manifest"
             if not entry.is_verified_complete:
-                return f"Ersatz {entry.filename} nicht verifiziert vollständig"
+                return f"replacement {entry.filename} is not verified complete"
             replacements.append(entry)
 
         # Schutz gegen einen fehlerhaften Plan, der die neue Datei löschen
         # würde: der Zielpfad eines Ersatzes darf nie das Löschziel sein.
         for entry in replacements:
             if self._same_file(self._entry_path(entry), path):
-                return "Datei ist selbst der benannte Ersatz"
+                return "the file is itself the named replacement"
 
         refusal = self._missing_part_refusal(replacements)
         if refusal is not None:
@@ -243,13 +243,13 @@ class PruneExecutor:
             try:
                 stat = ersatz.stat()
             except OSError:
-                return f"Ersatz {entry.filename} liegt nicht auf der Platte"
+                return f"replacement {entry.filename} is not on disk"
             if not ersatz.is_file() or ersatz.is_symlink():
-                return f"Ersatz {entry.filename} ist keine reguläre Datei"
+                return f"replacement {entry.filename} is not a regular file"
             if entry.size is not None and stat.st_size != entry.size:
                 return (
-                    f"Ersatz {entry.filename} hat {stat.st_size} statt "
-                    f"{entry.size} Bytes"
+                    f"replacement {entry.filename} has {stat.st_size} instead of "
+                    f"{entry.size} bytes"
                 )
         return None
 
@@ -269,10 +269,10 @@ class PruneExecutor:
 
         for (version, total_parts), seen in groups.items():
             if len(seen) < total_parts:
-                label = version or "ohne Version"
+                label = version or "no version"
                 return (
-                    f"Ersatz unvollständig: nur {len(seen)} von {total_parts} Teilen "
-                    f"({label}) als Ersatz benannt"
+                    f"replacement incomplete: only {len(seen)} of {total_parts} parts "
+                    f"({label}) named as replacement"
                 )
         return None
 
@@ -292,10 +292,10 @@ class PruneExecutor:
             except OSError:
                 # Dateisystemgrenze innerhalb von dest: dann eben kopieren.
                 shutil.move(str(path), str(target))
-            return f"in Papierkorb verschoben: {target.relative_to(self._dest)}"
+            return f"moved to trash: {target.relative_to(self._dest)}"
 
         path.unlink()
-        return "entfernt"
+        return "removed"
 
     def _trash_target(self, path: Path) -> Path:
         """``<dest>/.trash/<YYYY-MM-DD>/<relativer Pfad>``, kollisionsfrei."""

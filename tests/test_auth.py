@@ -292,7 +292,7 @@ async def test_abgelehnter_code_meldet_klaren_fehler(tmp_path):
     handler = Recorder(httpx.Response(400, json={"error": "invalid_grant"}))
     async with client_for(handler) as client:
         auth = GogAuth(store, client=client, now=lambda: NOW)
-        with pytest.raises(AuthError, match="abgelehnt"):
+        with pytest.raises(AuthError, match="rejected"):
             await auth.exchange_code(VALID_CODE)
 
 

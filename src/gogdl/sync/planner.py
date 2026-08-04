@@ -607,8 +607,8 @@ def plan_downloads(
                     path=_entry_target(entry, dest, slugs),
                     kind="orphaned",
                     detail=(
-                        f"{entry.filename}: von GOG nicht mehr angeboten "
-                        f"(Slot {entry.slot.as_str()}) — bleibt liegen"
+                        f"{entry.filename}: no longer offered by GOG "
+                        f"(slot {entry.slot.as_str()}) - left in place"
                     ),
                 )
             )
@@ -636,10 +636,10 @@ def plan_downloads(
                     path=target,
                     kind="collision",
                     detail=(
-                        f"Zielpfad bereits belegt von Slot "
+                        f"Target path already taken by slot "
                         f"{vorbesitzer.slot.as_str()} / {vorbesitzer.file_id} - "
-                        f"Slot {remote_file.slot.as_str()} / {remote_file.file_id} "
-                        f"wird nicht geladen"
+                        f"slot {remote_file.slot.as_str()} / {remote_file.file_id} "
+                        f"will not be downloaded"
                     ),
                 )
             )
@@ -686,7 +686,7 @@ def plan_downloads(
             Report(
                 path=path,
                 kind="foreign",
-                detail="nicht vom Tool angelegt — bleibt unangetastet",
+                detail="not created by this tool - left untouched",
             )
         )
 
@@ -1072,7 +1072,7 @@ def plan_prune(
         entries = by_slot[slot]
         new_version = next((e.version for e in entries if e.version is not None), None)
         replaced_by = tuple(sorted(entry.file_id for entry in entries))
-        ersatz = f"Version {new_version}" if new_version else "die aktuelle Version"
+        ersatz = f"version {new_version}" if new_version else "the current version"
 
         for path, size, old_version in _keep_newest_generations(
             per_slot.get(slot, ()), keep_old
@@ -1082,8 +1082,8 @@ def plan_prune(
                     path=path,
                     slot=slot,
                     reason=(
-                        f"Altversion {old_version or '(unbekannt)'} — ersetzt durch "
-                        f"{ersatz}; Slot {slot.as_str()} liegt vollständig verifiziert vor"
+                        f"old version {old_version or '(unknown)'} - replaced by "
+                        f"{ersatz}; slot {slot.as_str()} is complete and verified"
                     ),
                     size=size,
                     old_version=old_version,
@@ -1099,8 +1099,8 @@ def plan_prune(
                     path=path,
                     slot=slot,
                     reason=(
-                        f"unvollständiger Rest (.part) einer nicht mehr angebotenen "
-                        f"Version — ersetzt durch {ersatz}"
+                        f"incomplete leftover (.part) of a version that is no longer "
+                        f"offered - replaced by {ersatz}"
                     ),
                     size=size,
                     old_version=parsed[0] if parsed else None,
@@ -1121,9 +1121,9 @@ def plan_prune(
                         path=path,
                         slot=slot,
                         reason=(
-                            f"beiseitegelegte Vorgängerfassung (Generation "
-                            f"{generation}) von {basis} - ersetzt durch {ersatz}; "
-                            f"Slot {slot.as_str()} liegt vollständig verifiziert vor"
+                            f"set-aside previous version (generation "
+                            f"{generation}) of {basis} - replaced by {ersatz}; "
+                            f"slot {slot.as_str()} is complete and verified"
                         ),
                         size=size,
                         old_version=parsed[0] if parsed else None,

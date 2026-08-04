@@ -126,7 +126,7 @@ def test_ersatz_nicht_verifiziert_verhindert_loeschung(tmp_path: Path) -> None:
     results = make_executor(tmp_path, store).execute([make_item(alt, replaced_by=("neu",))])
 
     assert results[0].removed is False
-    assert "nicht verifiziert" in results[0].reason
+    assert "not verified" in results[0].reason
     assert alt.exists()
     assert freed_bytes(results) == 0
 
@@ -161,7 +161,7 @@ def test_nur_ein_teil_als_ersatz_benannt_wird_abgelehnt(tmp_path: Path) -> None:
     results = make_executor(tmp_path, store).execute([make_item(alt, replaced_by=("neu1",))])
 
     assert results[0].removed is False
-    assert "unvollständig" in results[0].reason
+    assert "incomplete" in results[0].reason
     assert alt.exists()
 
 
@@ -182,7 +182,7 @@ def test_ohne_ersatz_wird_abgelehnt(tmp_path: Path) -> None:
     results = make_executor(tmp_path, FakeStore()).execute([make_item(alt)])
 
     assert results[0].removed is False
-    assert results[0].reason == "kein Ersatz benannt"
+    assert results[0].reason == "no replacement named"
     assert alt.exists()
 
 
@@ -211,7 +211,7 @@ def test_ersatz_fehlt_auf_der_platte_wird_abgelehnt(tmp_path: Path) -> None:
     results = make_executor(tmp_path, store).execute([make_item(alt, replaced_by=("neu",))])
 
     assert results[0].removed is False
-    assert "nicht auf der Platte" in results[0].reason
+    assert "not on disk" in results[0].reason
     assert alt.exists()
 
 
@@ -249,7 +249,7 @@ def test_ersatz_darf_nicht_selbst_geloescht_werden(tmp_path: Path) -> None:
     results = make_executor(tmp_path, store).execute([make_item(neu, replaced_by=("neu",))])
 
     assert results[0].removed is False
-    assert "selbst" in results[0].reason
+    assert "itself" in results[0].reason
     assert neu.exists()
 
 
@@ -299,7 +299,7 @@ def test_absoluter_pfad_ausserhalb_von_dest_wird_abgelehnt(tmp_path: Path) -> No
     results = make_executor(dest, store).execute([make_item(fremd, replaced_by=("neu",))])
 
     assert results[0].removed is False
-    assert "außerhalb" in results[0].reason
+    assert "outside" in results[0].reason
     assert fremd.exists()
 
 
@@ -348,7 +348,7 @@ def test_symlink_als_elternverzeichnis_wird_abgelehnt(tmp_path: Path) -> None:
     )
 
     assert results[0].removed is False
-    assert "Symlink" in results[0].reason
+    assert "symlink" in results[0].reason
     assert opfer.exists()
 
 
@@ -362,7 +362,7 @@ def test_fehlende_datei_ist_kein_fehler(tmp_path: Path) -> None:
     results = make_executor(tmp_path, store).execute([make_item(fehlt, replaced_by=("neu",))])
 
     assert results[0].removed is False
-    assert results[0].reason == "nicht vorhanden"
+    assert results[0].reason == "not present"
 
 
 def test_dry_run_faesst_nichts_an(tmp_path: Path) -> None:
@@ -471,7 +471,7 @@ def test_permission_fehler_stoppt_den_lauf_nicht(tmp_path: Path) -> None:
         gesperrt_dir.chmod(0o700)
 
     assert [r.removed for r in results] == [False, True, True]
-    assert "Fehler beim Entfernen" in results[0].reason
+    assert "Error while removing" in results[0].reason
     assert gesperrt.exists()
     assert not frei.exists()
     assert not danach.exists()

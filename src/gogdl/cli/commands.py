@@ -55,16 +55,16 @@ def _auth(client: httpx.AsyncClient | None = None) -> GogAuth:
 
 async def cmd_login(ctx: AppContext, *, no_browser: bool = False) -> int:
     url = start_login(open_browser=not no_browser)
-    print("Melde dich in deinem Browser bei GOG an:")
+    print("Sign in to GOG in your browser:")
     print(f"\n  {url}\n")
     print(
-        "Nach erfolgreicher Anmeldung landest du auf einer Seite, die vermutlich leer aussieht.\n"
-        "Kopiere die komplette Adresszeile (sie enthält ?code=...) und füge sie hier ein."
+        "After signing in you land on a page that probably looks empty.\n"
+        "Copy the full address bar (it contains ?code=...) and paste it here."
     )
     try:
-        pasted = input("\nURL oder Code: ").strip()
+        pasted = input("\nURL or code: ").strip()
     except (EOFError, KeyboardInterrupt):
-        print("\nAbgebrochen.")
+        print("\nCancelled.")
         return 1
 
     code = extract_code(pasted)
@@ -74,7 +74,7 @@ async def cmd_login(ctx: AppContext, *, no_browser: bool = False) -> int:
         api = GogApiClient(auth, client=client)
         user = await api.user_data()
 
-    print(f"Angemeldet als {user.username}.")
+    print(f"Signed in as {user.username}.")
     return 0
 
 
@@ -107,7 +107,7 @@ async def cmd_update(ctx: AppContext, *, only: list[str], skip: list[str]) -> in
             store.replace_products(library)
 
             if not library:
-                print("Die Bibliothek ist leer - GOG nennt kein einziges Produkt.")
+                print("The library is empty - GOG lists no products at all.")
                 return 0
 
             products = _filter_products(library, only, skip)
@@ -116,7 +116,7 @@ async def cmd_update(ctx: AppContext, *, only: list[str], skip: list[str]) -> in
                 return 1
 
             reporter.message(
-                f"{len(products)} von {len(library)} Produkten in der Bibliothek."
+                f"{len(products)} of {len(library)} products in the library."
             )
             seen = now_utc()
             semaphore = asyncio.Semaphore(ctx.jobs)
@@ -134,7 +134,7 @@ async def cmd_update(ctx: AppContext, *, only: list[str], skip: list[str]) -> in
                     )
                     store.replace_remote(product.product_id, enriched, seen)
                     if not ctx.quiet:
-                        reporter.message(f"  {product.title}: {len(enriched)} Dateien")
+                        reporter.message(f"  {product.title}: {len(enriched)} files")
 
             results = await asyncio.gather(
                 *(one(p) for p in products), return_exceptions=True
@@ -159,12 +159,12 @@ def _melde_fehlgeschlagene_produkte(
     products: Sequence[ProductRef], failures: Sequence[tuple[ProductRef, Exception]]
 ) -> int:
     """Zusammenfassung und Rückgabewert eines unvollständigen Laufs."""
-    print(f"{len(products) - len(failures)} von {len(products)} Produkten aktualisiert.")
-    print(f"Nicht abgerufen ({len(failures)}) - ein erneuter Lauf holt sie nach:")
+    print(f"{len(products) - len(failures)} of {len(products)} products updated.")
+    print(f"Not fetched ({len(failures)}) - another run picks them up:")
     for product, exc in failures[:20]:
         print(f"  {product.title} ({product.slug}): {exc}")
     if len(failures) > 20:
-        print(f"  ... und {len(failures) - 20} weitere")
+        print(f"  ... and {len(failures) - 20} more")
 
     # Ein abgelehnter Zugang ist etwas anderes als ein wackelnder Endpunkt:
     # das eine braucht einen Menschen, das andere nur einen zweiten Lauf.
@@ -288,9 +288,9 @@ def _keine_auswahl(
     genannt = ", ".join(_needles(only) + _needles(skip))
     beispiele = ", ".join(sorted(p.slug for p in library)[:5])
     return (
-        f"Die Auswahl ({genannt}) trifft kein einziges der "
-        f"{len(library)} Produkte der Bibliothek. Erwartet werden Slug oder "
-        f"Produkt-ID, mehrere kommagetrennt. Vorhanden sind z. B.: {beispiele}"
+        f"The selection ({genannt}) matches none of the {len(library)} products "
+        f"in the library. Expected are a slug or a product id, several of them "
+        f"comma-separated. Available are for example: {beispiele}"
     )
 
 
@@ -492,37 +492,37 @@ def _relative_to(target: Path, dest: Path) -> Path:
 def _print_plan(plan: SyncPlan, prune_plan: SyncPlan, ctx: AppContext) -> None:
     if plan.downloads:
         print(
-            f"Zu laden: {len(plan.downloads)} Dateien, "
+            f"To download: {len(plan.downloads)} files, "
             f"{human_bytes(plan.download_bytes)}"
         )
         if ctx.verbose:
             for item in plan.downloads:
-                marker = "fortsetzen" if item.resume_from else "neu"
+                marker = "resume" if item.resume_from else "new"
                 print(f"  [{marker}] {item.target.name}")
     else:
-        print("Zu laden: nichts.")
+        print("To download: nothing.")
 
     if prune_plan.prunes:
         print(
-            f"Aufzuräumen: {len(prune_plan.prunes)} alte Dateien, "
-            f"{human_bytes(prune_plan.prune_bytes)} werden frei"
+            f"To clean up: {len(prune_plan.prunes)} old files, "
+            f"{human_bytes(prune_plan.prune_bytes)} will be freed"
         )
         if ctx.verbose:
             for item in prune_plan.prunes:
-                print(f"  [entfernen] {item.path.name} - {item.reason}")
+                print(f"  [remove] {item.path.name} - {item.reason}")
 
     for report in plan.reports:
         if report.kind == "orphaned":
-            print(f"Hinweis: {report.path.name} wird von GOG nicht mehr angeboten (bleibt liegen)")
+            print(f"Note: {report.path.name} is no longer offered by GOG (left in place)")
         elif report.kind == "collision":
             # Zwei Auslieferungen desselben Spiels tragen denselben Dateinamen.
             # Beide zu laden hiesse, sie in dieselbe Datei zu schreiben.
             print(
-                f"Übersprungen: {report.path.name} - zwei Auslieferungen wollen "
-                f"denselben Dateinamen. {report.detail}".rstrip()
+                f"Skipped: {report.path.name} - two releases claim the same "
+                f"filename. {report.detail}".rstrip()
             )
         elif ctx.verbose:
-            print(f"Hinweis: {report.path.name} gehört nicht zum Manifest (bleibt unangetastet)")
+            print(f"Note: {report.path.name} is not part of the manifest (left untouched)")
 
 
 # --------------------------------------------------------------------------- download
@@ -545,7 +545,7 @@ async def cmd_download(
             return EXIT_WORK_DONE if (plan.downloads or prune_plan.prunes) else EXIT_NOTHING_TO_DO
 
         if not plan.downloads:
-            reporter.message("Alles aktuell - nichts zu laden.")
+            reporter.message("Everything up to date - nothing to download.")
         else:
             reporter.start_overall(len(plan.downloads), plan.download_bytes)
             async with _http_client() as client:
@@ -556,8 +556,7 @@ async def cmd_download(
                 # ein zweiter Lauf heilt - hier muss ein Mensch ran.
                 if not auth.is_authenticated():
                     raise AuthError(
-                        "Keine gespeicherten Zugangsdaten. "
-                        "Bitte zuerst `gogdl login` ausführen."
+                        "Not signed in. Run `gogdl login` first."
                     )
                 api = GogApiClient(auth, client=client)
                 downloader = HttpDownloader(api, client=client, limit_rate=ctx.limit_rate)
@@ -584,7 +583,7 @@ async def cmd_download(
                         failed += 1
                         if auth.is_authenticated():
                             reporter.message(
-                                f"Fehlgeschlagen: {item.target.name} - {result.error}"
+                                f"Failed: {item.target.name} - {result.error}"
                             )
                         else:
                             # GOG hat den Refresh-Token abgelehnt, die
@@ -599,9 +598,8 @@ async def cmd_download(
 
             if zugang_verloren:
                 raise AuthError(
-                    "Der Zugang ist während des Laufs verfallen und ließ sich nicht "
-                    "erneuern. Bitte `gogdl login` wiederholen; bereits geladene "
-                    "Dateien bleiben erhalten."
+                    "Access expired during the run and could not be renewed. "
+                    "Run `gogdl login` again; files already downloaded are kept."
                 )
 
         # Was fertig auf der Platte liegt, aber im Manifest noch als unfertig
@@ -617,7 +615,7 @@ async def cmd_download(
         store.close()
 
     if failed:
-        print(f"{failed} Datei(en) fehlgeschlagen - erneut ausführen setzt dort fort.")
+        print(f"{failed} file(s) failed - running the command again resumes there.")
         return 4
     if downloaded or removed_bytes:
         return EXIT_WORK_DONE
@@ -653,7 +651,7 @@ def _prune_slot_if_complete(
     for result in executor.execute(fuer_slot, dry_run=ctx.dry_run):
         if result.removed:
             reporter.message(
-                f"entfernt: {result.item.path.name} ({human_bytes(result.item.size)})"
+                f"removed: {result.item.path.name} ({human_bytes(result.item.size)})"
             )
 
 
@@ -708,14 +706,14 @@ def _run_prune(
     for result in results:
         if result.removed:
             reporter.message(
-                f"entfernt: {result.item.path.name} ({human_bytes(result.item.size)})"
+                f"removed: {result.item.path.name} ({human_bytes(result.item.size)})"
                 f" - {result.item.reason}"
             )
         elif result.reason:
-            reporter.message(f"behalten: {result.item.path.name} - {result.reason}")
+            reporter.message(f"kept: {result.item.path.name} - {result.reason}")
     freed = freed_bytes(results)
     if freed:
-        reporter.message(f"Freigegeben: {human_bytes(freed)}")
+        reporter.message(f"Freed: {human_bytes(freed)}")
     return freed
 
 
@@ -749,18 +747,18 @@ def cmd_verify(ctx: AppContext, *, deep: bool) -> int:
                 bad += 1
                 entry.last_verified_utc = None
                 store.update_entry(entry)
-                print(f"FEHLER {path.name}: {detail}")
+                print(f"FAILED {path.name}: {detail}")
                 continue
             if entry.md5 and not deep:
                 unbestaetigt += 1
                 continue
             entry.last_verified_utc = now_utc()
             store.update_entry(entry)
-        print(f"{len(entries) - bad}/{len(entries)} Dateien in Ordnung.")
+        print(f"{len(entries) - bad}/{len(entries)} files are fine.")
         if unbestaetigt:
             print(
-                f"{unbestaetigt} Datei(en) führen eine Prüfsumme im Manifest, die nur "
-                "--deep prüft. Ihr Prüfstempel bleibt unverändert."
+                f"{unbestaetigt} file(s) carry a checksum in the manifest that only "
+                "--deep checks. Their verification stamp is left unchanged."
             )
     finally:
         store.close()
@@ -782,50 +780,53 @@ def cmd_import(ctx: AppContext, *, trust: str, apply: bool) -> int:
         entries = store.entries()
         if not entries:
             print(
-                "Das Manifest ist leer. Erst 'gogdl login' und 'gogdl update' "
-                "ausführen, sonst gibt es nichts, dem der Bestand zugeordnet "
-                "werden könnte."
+                "The manifest is empty. Run 'gogdl login' and 'gogdl update' "
+                "first, otherwise there is nothing to match the existing files "
+                "against."
             )
             return 1
 
         plan = match_existing(entries, scan_disk(ctx.dest), ctx.dest, _slugs(store))
 
-        print(f"Eindeutig zugeordnet: {len(plan.matches)} Dateien, {human_bytes(plan.match_bytes)}")
+        print(f"Matched: {len(plan.matches)} files, {human_bytes(plan.match_bytes)}")
         if plan.unsure:
-            print(f"Unsicher (Name passt, Größe nicht): {len(plan.unsure)} - werden übergangen")
+            print(f"Unsure (name fits, size does not): {len(plan.unsure)} - skipped")
             if ctx.verbose:
                 for candidate in plan.unsure:
                     print(f"  {candidate.path.name}: {candidate.reason}")
         if plan.unmatched:
-            print(f"Nicht zuordenbar: {len(plan.unmatched)} Dateien - bleiben unangetastet")
+            print(f"Not matchable: {len(plan.unmatched)} files - left untouched")
             if ctx.verbose:
                 for path in plan.unmatched[:50]:
                     print(f"  {path}")
 
         if not apply:
-            print("\nNichts verändert. Mit --apply wird der Bestand ins Manifest übernommen.")
+            print("\nNothing changed. Use --apply to adopt these files into the manifest.")
             return EXIT_WORK_DONE if plan.matches else EXIT_NOTHING_TO_DO
 
         level = Trust(trust)
         if level is Trust.MD5:
-            print("Prüfe Prüfsummen. Das dauert bei großen Sammlungen lange.")
+            print("Computing checksums. This takes a long time on large collections.")
         summary = apply_import(plan, store, now_utc(), trust=level)
 
         print(
-            f"Übernommen: {len(summary.imported)} Dateien, "
+            f"Adopted: {len(summary.imported)} files, "
             f"{human_bytes(summary.imported_bytes)}"
         )
         if summary.rejected:
-            print(f"Abgelehnt: {len(summary.rejected)}")
+            print(f"Rejected: {len(summary.rejected)}")
         if level is Trust.NONE:
             print(
-                "Hinweis: Ohne --trust size oder md5 gilt der Bestand als unbestätigt. "
-                "Das Aufräumen alter Versionen bleibt damit wirkungslos."
+                "Note: without --trust size or md5 these files count as unverified. "
+                "Pruning old versions stays inert for them."
             )
         else:
-            print(f"Als geprüft vermerkt: {summary.verified_count}")
+            print(f"Recorded as verified: {summary.verified_count}")
             if summary.unverifiable:
-                print(f"Ohne Prüfsumme im Manifest, daher unbestätigt: {len(summary.unverifiable)}")
+                print(
+                    f"No checksum in the manifest, therefore unverified: "
+                    f"{len(summary.unverifiable)}"
+                )
     finally:
         store.close()
     return EXIT_WORK_DONE
@@ -841,7 +842,7 @@ def cmd_clean(ctx: AppContext, *, apply: bool) -> int:
         reporter.close()
         store.close()
     if not apply:
-        print("Nichts verändert. Mit --apply wird tatsächlich gelöscht.")
+        print("Nothing changed. Use --apply to actually delete.")
     return EXIT_WORK_DONE if freed else EXIT_NOTHING_TO_DO
 
 

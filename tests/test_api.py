@@ -353,7 +353,7 @@ async def test_unbekannte_sprache_warnt_nur_einmal(caplog):
         await client.product_files(1207658930)
         await client.product_files(1207658930)
 
-    treffer = [r for r in caplog.records if "Unbekannte Sprache" in r.getMessage()]
+    treffer = [r for r in caplog.records if "Unknown language" in r.getMessage()]
     assert len(treffer) == 1
 
 
@@ -384,7 +384,7 @@ async def test_unbekannte_plattform_warnt_nur_einmal(caplog):
         await client.product_files(1207658930)
         await client.product_files(1207658930)
 
-    treffer = [r for r in caplog.records if "Betriebssystem" in r.getMessage()]
+    treffer = [r for r in caplog.records if "operating system" in r.getMessage()]
     assert len(treffer) == 1
 
 
@@ -550,7 +550,7 @@ async def test_dlc_ohne_id_laeuft_unter_der_produkt_id_des_hauptspiels(caplog):
     # Die Zugehörigkeit bleibt trotzdem erkennbar.
     assert file.dlc_of == 1207658930
     assert file.is_dlc is True
-    assert any("ohne eigene id" in record.getMessage() for record in caplog.records)
+    assert any("without an id of its own" in record.getMessage() for record in caplog.records)
 
 
 async def test_produkt_ohne_downloads_liefert_leere_liste():

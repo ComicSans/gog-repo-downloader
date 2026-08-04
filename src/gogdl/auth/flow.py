@@ -55,7 +55,7 @@ _DIR_MODE = 0o700
 _DEFAULT_EXPIRES_IN = 3600.0
 """Fallback, falls GOG die Lebensdauer einmal nicht mitschickt (§2.2)."""
 
-_LOGIN_HINT = "Bitte zuerst `gogdl login` ausführen."
+_LOGIN_HINT = "Run `gogdl login` first."
 
 _CODE_IN_URL = re.compile(r"(?:^|[?&#])code=([^&#?]+)")
 _BARE_CODE = re.compile(r"^[A-Za-z0-9._~-]{8,}$")
@@ -97,7 +97,7 @@ class FileCredentialStore:
         except FileNotFoundError:
             return None
         except OSError as exc:
-            raise AuthError(f"{self.path} ist nicht lesbar: {exc}") from exc
+            raise AuthError(f"{self.path} is not readable: {exc}") from exc
 
         try:
             data = json.loads(raw)
@@ -181,7 +181,7 @@ class GogAuth:
         """Gültiges Access-Token liefern, bei Ablauf still erneuern."""
         credentials = self._current()
         if credentials is None:
-            raise AuthError(f"Keine gespeicherten Zugangsdaten. {_LOGIN_HINT}")
+            raise AuthError(f"Not signed in. {_LOGIN_HINT}")
         if not credentials.is_expired(self._now()):
             return credentials.access_token
 
@@ -190,7 +190,7 @@ class GogAuth:
             # bereits erneuert, ist hier nichts mehr zu tun.
             credentials = self._current()
             if credentials is None:
-                raise AuthError(f"Keine gespeicherten Zugangsdaten. {_LOGIN_HINT}")
+                raise AuthError(f"Not signed in. {_LOGIN_HINT}")
             if not credentials.is_expired(self._now()):
                 return credentials.access_token
             refreshed = await self._refresh(credentials)
@@ -213,8 +213,8 @@ class GogAuth:
                 "redirect_uri": REDIRECT_URI,
             },
             rejected_message=(
-                "GOG hat den Authorization-Code abgelehnt (HTTP {status}). "
-                "Der Code ist einmalig und nur kurz gültig — bitte `gogdl login` wiederholen."
+                "GOG rejected the authorization code (HTTP {status}). "
+                "The code is single-use and short-lived - run `gogdl login` again."
             ),
             discard_on_reject=False,
         )
@@ -268,8 +268,7 @@ class GogAuth:
                 "refresh_token": credentials.refresh_token,
             },
             rejected_message=(
-                "Der gespeicherte Refresh-Token wurde von GOG abgelehnt (HTTP {status}). "
-                + _LOGIN_HINT
+                "GOG rejected the stored refresh token (HTTP {status}). " + _LOGIN_HINT
             ),
             discard_on_reject=True,
             previous=credentials,
@@ -292,21 +291,23 @@ class GogAuth:
             response = await client.get(TOKEN_URL, params=payload)
         except httpx.HTTPError as exc:
             # Netzwerkfehler ist kein abgelehnter Token: nichts verwerfen.
-            raise AuthError(f"Token-Endpunkt von GOG nicht erreichbar: {exc}") from exc
+            raise AuthError(f"GOG token endpoint not reachable: {exc}") from exc
 
         if response.status_code in (400, 401):
             if discard_on_reject:
                 self._forget()
             raise AuthError(rejected_message.format(status=response.status_code))
         if response.status_code >= 400:
-            raise AuthError(f"Token-Endpunkt von GOG antwortete mit HTTP {response.status_code}.")
+            raise AuthError(
+                f"GOG token endpoint responded with HTTP {response.status_code}."
+            )
 
         try:
             data = response.json()
         except ValueError as exc:
-            raise AuthError("Antwort des Token-Endpunkts ist kein JSON.") from exc
+            raise AuthError("The token endpoint response is not JSON.") from exc
         if not isinstance(data, dict):
-            raise AuthError("Antwort des Token-Endpunkts hat ein unerwartetes Format.")
+            raise AuthError("The token endpoint response has an unexpected format.")
 
         return self._credentials_from(data, requested_at=requested_at, previous=previous)
 
@@ -319,7 +320,7 @@ class GogAuth:
     ) -> Credentials:
         access_token = data.get("access_token")
         if not isinstance(access_token, str) or not access_token:
-            raise AuthError("Antwort des Token-Endpunkts enthält kein access_token.")
+            raise AuthError("The token endpoint response contains no access_token.")
 
         # GOG rotiert den Refresh-Token gelegentlich mit; fehlt er in der
         # Antwort, gilt der bisherige weiter.
@@ -327,7 +328,7 @@ class GogAuth:
         if not isinstance(refresh_token, str) or not refresh_token:
             refresh_token = previous.refresh_token if previous is not None else None
         if not refresh_token:
-            raise AuthError("Antwort des Token-Endpunkts enthält kein refresh_token.")
+            raise AuthError("The token endpoint response contains no refresh_token.")
 
         try:
             expires_in = float(data.get("expires_in", _DEFAULT_EXPIRES_IN))
@@ -359,7 +360,7 @@ def extract_code(pasted: str) -> str:
     """
     text = "".join(pasted.split()) if pasted else ""
     if not text:
-        raise AuthError("Keine Eingabe. Bitte die Redirect-URL oder den Code einfügen.")
+        raise AuthError("No input. Paste the redirect URL or the code.")
 
     if "code=" in text:
         match = _CODE_IN_URL.search(text)
@@ -368,15 +369,15 @@ def extract_code(pasted: str) -> str:
             if code:
                 return code
         raise AuthError(
-            "In der eingefügten URL steht kein verwertbarer `code`-Parameter. "
-            "Erwartet wird die vollständige Adresse von on_login_success."
+            "The pasted URL carries no usable `code` parameter. "
+            "Expected is the full address of on_login_success."
         )
 
     if _BARE_CODE.match(text):
         return text
 
     raise AuthError(
-        "Eingabe sieht weder nach der Redirect-URL noch nach einem Authorization-Code aus."
+        "The input looks like neither the redirect URL nor an authorization code."
     )
 
 

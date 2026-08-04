@@ -135,7 +135,7 @@ def test_plain_ausgabe_ohne_ansi_sequenzen() -> None:
     text = stream.getvalue()
     assert ANSI not in text
     assert "setup_bg3_de.bin" in text
-    assert "Fertig:" in text
+    assert "Done:" in text
 
 
 def test_plain_start_und_abschlusszeile_pro_datei() -> None:
@@ -164,7 +164,7 @@ def test_plain_quiet_meldet_erfolg_nur_im_abschluss() -> None:
     reporter.close()
     out = lines(stream)
     assert len(out) == 1
-    assert out[0].startswith("Fertig:")
+    assert out[0].startswith("Done:")
 
 
 def test_plain_quiet_meldet_fehler() -> None:
@@ -176,7 +176,7 @@ def test_plain_quiet_meldet_fehler() -> None:
 
     out = lines(stream)
     assert len(out) == 1
-    assert "FEHLER" in out[0]
+    assert "FAILED" in out[0]
     assert "a.bin" in out[0]
     assert "HTTP 403" in out[0]
     assert ANSI not in out[0]
@@ -262,7 +262,7 @@ def test_plain_advance_ohne_start_file_crasht_nicht() -> None:
     reporter.close()
 
     assert ANSI not in stream.getvalue()
-    assert "Fertig:" in stream.getvalue()
+    assert "Done:" in stream.getvalue()
 
 
 def test_plain_doppeltes_close_schreibt_nur_eine_zeile() -> None:
@@ -273,7 +273,7 @@ def test_plain_doppeltes_close_schreibt_nur_eine_zeile() -> None:
     reporter.close()
     reporter.close()
 
-    assert sum(1 for line in lines(stream) if line.startswith("Fertig:")) == 1
+    assert sum(1 for line in lines(stream) if line.startswith("Done:")) == 1
 
 
 def test_plain_zaehlt_fehler_in_der_abschlusszeile() -> None:
@@ -286,9 +286,9 @@ def test_plain_zaehlt_fehler_in_der_abschlusszeile() -> None:
     reporter.finish_file("b.bin", ok=False, detail="Abbruch")
     reporter.close()
 
-    summary = [line for line in lines(stream) if line.startswith("Fertig:")][0]
-    assert "1/2 Dateien" in summary
-    assert "1 Fehler" in summary
+    summary = [line for line in lines(stream) if line.startswith("Done:")][0]
+    assert "1/2 files" in summary
+    assert "1 failed" in summary
 
 
 # --------------------------------------------------------------------------
@@ -378,7 +378,7 @@ def test_plain_unbekanntes_und_veraltetes_handle_werfen_nicht() -> None:
     assert plain_done(reporter, b) == 0  # nichts landet bei der falschen Datei
     assert reporter._bytes_done == 16  # die Bytes sind trotzdem geflossen
     reporter.close()
-    assert "Fertig:" in stream.getvalue()
+    assert "Done:" in stream.getvalue()
 
 
 def test_rich_unbekanntes_und_veraltetes_handle_werfen_nicht() -> None:
@@ -395,7 +395,7 @@ def test_rich_unbekanntes_und_veraltetes_handle_werfen_nicht() -> None:
     assert rich_done(reporter, b) == 0
     assert reporter._bytes_done == 16
     reporter.close()
-    assert "Fertig:" in stream.getvalue()
+    assert "Done:" in stream.getvalue()
 
 
 def test_plain_finish_file_mit_handle_schliesst_genau_diesen_eintrag() -> None:
@@ -515,7 +515,7 @@ def test_plain_zeilen_nennen_bei_parallelen_downloads_die_datei() -> None:
     assert ANSI not in stream.getvalue()
     # Jede Zeile außer Start- und Abschlussmeldung nennt ihre Datei.
     for line in out:
-        if line.startswith("Start:") or line.startswith("Fertig:"):
+        if line.startswith("Start:") or line.startswith("Done:"):
             continue
         assert "a.bin" in line or "b.bin" in line
 
@@ -546,8 +546,8 @@ def test_rich_durchlaeuft_kompletten_zyklus_ohne_exception() -> None:
 
     text = stream.getvalue()
     assert "setup_bg3_de.bin" in text
-    assert "FEHLER" in text
-    assert "Fertig:" in text
+    assert "FAILED" in text
+    assert "Done:" in text
 
 
 def test_rich_kommt_mit_unbekannter_gesamtgroesse_klar() -> None:
@@ -587,7 +587,7 @@ def test_rich_doppeltes_close_crasht_nicht() -> None:
     reporter.close()
     reporter.close()
 
-    assert stream.getvalue().count("Fertig:") == 1
+    assert stream.getvalue().count("Done:") == 1
 
 
 def test_rich_quiet_zeigt_nur_fehler_und_abschluss() -> None:
@@ -605,9 +605,9 @@ def test_rich_quiet_zeigt_nur_fehler_und_abschluss() -> None:
 
     text = stream.getvalue()
     assert "unterdrueckt" not in text
-    assert "FEHLER" in text
+    assert "FAILED" in text
     assert "b.bin" in text
-    assert "Fertig:" in text
+    assert "Done:" in text
 
 
 def test_rich_dateiname_mit_markup_wird_nicht_interpretiert() -> None:

@@ -315,7 +315,7 @@ class GogApiClient:
             for item in data.get("products") or []:
                 product_id = _as_int(item.get("id"))
                 if product_id is None:
-                    _LOG.warning("Bibliothekseintrag ohne verwertbare id übersprungen")
+                    _LOG.warning("Skipped a library entry without a usable id")
                     continue
                 products.append(
                     ProductRef(
@@ -379,7 +379,7 @@ class GogApiClient:
         if response.status_code in _REDIRECT_STATUS:
             location = response.headers.get("Location")
             if not location:
-                raise ApiError(f"Weiterleitung ohne Location-Header: {url}")
+                raise ApiError(f"Redirect without a Location header: {url}")
             # Absolute Location unveraendert uebernehmen: die signierte URL
             # traegt ihr Token im Pfad, und jede Normalisierung koennte die
             # Signatur zerstoeren.
@@ -390,7 +390,7 @@ class GogApiClient:
             signed = str(response.url)
         filename = _filename_from_url(signed)
         if not filename:
-            raise ApiError(f"Kein Dateiname in der signierten URL ableitbar: {url}")
+            raise ApiError(f"No filename can be derived from the signed URL: {url}")
         return ResolvedLink(
             url=signed,
             filename=filename,
@@ -417,7 +417,7 @@ class GogApiClient:
         except RateLimitError:
             raise
         except ApiError as exc:
-            _LOG.debug("Groesse nicht abrufbar (%s): %s", url, exc)
+            _LOG.debug("Size not retrievable (%s): %s", url, exc)
             return None
         return _as_int(response.headers.get("Content-Length"))
 
@@ -441,27 +441,27 @@ class GogApiClient:
         except RateLimitError:
             raise
         except ApiError as exc:
-            _LOG.debug("Checksum nicht abrufbar (%s): %s", url, exc)
+            _LOG.debug("Checksum not retrievable (%s): %s", url, exc)
             return None
 
         text = response.text.strip()
         if not text:
-            _LOG.debug("Leeres Checksum-XML: %s", url)
+            _LOG.debug("Empty checksum XML: %s", url)
             return None
         try:
             root = ET.fromstring(text)
         except ET.ParseError as exc:
-            _LOG.debug("Checksum-XML nicht parsebar (%s): %s", url, exc)
+            _LOG.debug("Checksum XML not parsable (%s): %s", url, exc)
             return None
 
         node = root if root.tag == "file" else root.find("file")
         if node is None:
-            _LOG.debug("Checksum-XML ohne <file>-Element: %s", url)
+            _LOG.debug("Checksum XML without a <file> element: %s", url)
             return None
         name = node.get("name")
         md5 = node.get("md5")
         if not name or not md5:
-            _LOG.debug("Checksum-XML ohne name/md5: %s", url)
+            _LOG.debug("Checksum XML without name/md5: %s", url)
             return None
         return FileChecksum(filename=name, md5=md5, total_size=_as_int(node.get("total_size")))
 
@@ -513,8 +513,8 @@ class GogApiClient:
                 # zusammen; die Warnung unten in _register_slot meldet das.
                 dlc_id = root_id
                 _LOG.warning(
-                    "DLC ohne eigene id in Produkt %s - Dateien laufen unter der "
-                    "Produkt-ID des Hauptspiels",
+                    "DLC without an id of its own in product %s - its files run under "
+                    "the product id of the base game",
                     root_id,
                 )
             self._collect_details(
@@ -617,7 +617,7 @@ class GogApiClient:
             manual_url = entry.get("manualUrl")
             file_id = _file_id_from_manual(manual_url)
             if not file_id:
-                _LOG.warning("Extra ohne manualUrl in Produkt %s uebersprungen", product_id)
+                _LOG.warning("Skipped an extra without a manualUrl in product %s", product_id)
                 continue
             slot = SlotKey(
                 product_id=product_id,
@@ -644,7 +644,7 @@ class GogApiClient:
         """Doppelt vergebene Slots melden - Prune saehe sie als eine Einheit."""
         if slot in seen_slots:
             _LOG.warning(
-                "Zwei Eintraege teilen den Slot %s - Prune sieht sie als eine Auslieferung",
+                "Two entries share slot %s - prune treats them as one release",
                 slot.as_str(),
             )
         seen_slots.add(slot)
@@ -658,7 +658,7 @@ class GogApiClient:
         os_name = _OS_NAMES.get(key)
         if os_name is None and key not in self._warned_os:
             self._warned_os.add(key)
-            _LOG.warning("Unbekanntes Betriebssystem %r von GOG - Eintraege uebersprungen", raw)
+            _LOG.warning("Unknown operating system %r from GOG - entries skipped", raw)
         return os_name
 
     def _language_code(self, raw: Any) -> str | None:
@@ -673,7 +673,7 @@ class GogApiClient:
         if fallback and fallback not in self._warned_languages:
             self._warned_languages.add(fallback)
             _LOG.warning(
-                "Unbekannte Sprache %r von GOG - Code %r wird ersatzweise verwendet",
+                "Unknown language %r from GOG - falling back to code %r",
                 text,
                 fallback,
             )
@@ -711,9 +711,9 @@ class GogApiClient:
         try:
             data = response.json()
         except ValueError as exc:
-            raise ApiError(f"Keine gültige JSON-Antwort von {url}: {exc}") from exc
+            raise ApiError(f"No valid JSON response from {url}: {exc}") from exc
         if not isinstance(data, dict):
-            raise ApiError(f"Unerwartete JSON-Struktur von {url}: {type(data).__name__}")
+            raise ApiError(f"Unexpected JSON structure from {url}: {type(data).__name__}")
         return data
 
     async def _request(
@@ -746,7 +746,7 @@ class GogApiClient:
             except httpx.RequestError as exc:
                 if attempt >= self._max_retries:
                     raise ApiError(
-                        f"Netzwerkfehler bei {url} nach {attempt + 1} Versuchen: {exc}"
+                        f"Network error on {url} after {attempt + 1} attempts: {exc}"
                     ) from exc
                 await self._backoff(attempt)
                 attempt += 1
@@ -754,12 +754,12 @@ class GogApiClient:
 
             status = response.status_code
             if status == 401:
-                raise AuthError(f"GOG hat den Zugriff abgelehnt (HTTP 401): {url}")
+                raise AuthError(f"GOG denied access (HTTP 401): {url}")
             if status == 429:
                 retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
                 if attempt >= self._max_retries:
                     raise RateLimitError(
-                        f"GOG drosselt den Zugriff (HTTP 429): {url}", retry_after=retry_after
+                        f"GOG is rate-limiting access (HTTP 429): {url}", retry_after=retry_after
                     )
                 if retry_after is None:
                     await self._backoff(attempt)
@@ -770,13 +770,13 @@ class GogApiClient:
             if status >= 500:
                 if attempt >= self._max_retries:
                     raise ApiError(
-                        f"HTTP {status} von {url} nach {attempt + 1} Versuchen"
+                        f"HTTP {status} from {url} after {attempt + 1} attempts"
                     )
                 await self._backoff(attempt)
                 attempt += 1
                 continue
             if status >= 400:
-                raise ApiError(f"HTTP {status} von {url}")
+                raise ApiError(f"HTTP {status} from {url}")
             return response
 
     async def _backoff(self, attempt: int) -> None:

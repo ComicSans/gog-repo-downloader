@@ -10,6 +10,11 @@ from pathlib import Path
 from gogdl.constants import DB_FILENAME, STATE_DIRNAME, TRASH_DIRNAME
 from gogdl.model.types import OsName, Preference, PruneMode, SyncConfig
 
+_NOTATION_HINT = "A comma means 'otherwise', a plus means 'and'"
+"""Erklärung der ``--os``/``--lang``-Schreibweise. Hilfetexte und Fehler-
+meldungen benutzen sie wortgleich, sonst liest sich beides wie zwei
+verschiedene Funktionen."""
+
 
 def now_utc() -> str:
     """Zeitstempel für ``last_seen_utc``/``last_verified_utc``."""
@@ -69,9 +74,10 @@ def check_dest(dest: Path) -> str | None:
     """
     if (dest / ".git").exists():
         return (
-            f"{dest} ist ein Git-Arbeitsverzeichnis. Manifest, Papierkorb und "
-            "heruntergeladene Spiele landen dann im Repository. Gemeint war "
-            "vermutlich ein eigenes Zielverzeichnis, z. B. --dest ~/GOG"
+            f"{dest} is a git working tree. The manifest, the trash directory "
+            "and every downloaded game would end up in the repository. A "
+            "separate destination directory is probably meant, for example "
+            "--dest ~/GOG"
         )
     return None
 
@@ -132,9 +138,9 @@ def _parse_lang_preference(value: str | None) -> Preference:
     unbekannt = sorted(pref.all_values - _SPRACHCODES)
     if unbekannt and len(unbekannt) == len(pref.all_values):
         raise ValueError(
-            f"Keiner dieser Sprachcodes ist bekannt: {', '.join(unbekannt)}. "
-            "Erwartet werden Kürzel wie de, en, fr oder 'all' für alle Sprachen. "
-            "Komma heißt 'sonst', Plus heißt 'und': --lang de,en"
+            f"None of these language codes is known: {', '.join(unbekannt)}. "
+            "Expected are codes like de, en, fr, or 'all' for every language. "
+            f"{_NOTATION_HINT}: --lang de,en"
         )
     return pref
 
@@ -156,8 +162,8 @@ def _parse_os_preference(value: str | None) -> Preference:
     unbekannt = sorted(pref.all_values - erlaubt)
     if unbekannt:
         raise ValueError(
-            f"Unbekannte Plattform: {', '.join(unbekannt)}. "
-            "Erlaubt sind windows, linux, mac oder all. "
-            "Komma heißt 'sonst', Plus heißt 'und': --os linux+mac"
+            f"Unknown platform: {', '.join(unbekannt)}. "
+            "Allowed are windows, linux, mac or all. "
+            f"{_NOTATION_HINT}: --os linux+mac"
         )
     return pref

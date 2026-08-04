@@ -165,7 +165,7 @@ class HttpDownloader:
                 resume_from = 0
                 restarted = True
         except OSError as exc:
-            message = f"Dateisystemfehler: {exc}"
+            message = f"Filesystem error: {exc}"
             progress_handle = reporter.start_file(name, expected, 0)
             reporter.finish_file(name, False, message, handle=progress_handle)
             return self._failure(item, 0, restarted, message)
@@ -183,7 +183,7 @@ class HttpDownloader:
         except OSError as exc:
             # Volle Platte, fehlende Rechte: ein Lauf über viele Dateien soll
             # daran nicht sterben. Die ``.part`` bleibt liegen.
-            result = self._failure(item, 0, restarted, f"Dateisystemfehler: {exc}")
+            result = self._failure(item, 0, restarted, f"Filesystem error: {exc}")
         reporter.finish_file(name, result.ok, result.error or "", handle=progress_handle)
         return result
 
@@ -210,14 +210,14 @@ class HttpDownloader:
         while True:
             rounds += 1
             if rounds > max_rounds:
-                return self._failure(item, written, restarted, "Zu viele Versuche abgebrochen")
+                return self._failure(item, written, restarted, "Too many attempts, giving up")
 
             # Regel 1: die signierte URL wird nie wiederverwendet.
             try:
                 link = await self._api.resolve_downlink(entry.downlink)
             except Exception as exc:  # noqa: BLE001 - Fehler der API-Schicht durchreichen
                 return self._failure(
-                    item, written, restarted, f"Downlink nicht auflösbar: {exc}"
+                    item, written, restarted, f"Download link could not be resolved: {exc}"
                 )
 
             headers = {"Range": f"bytes={resume_from}-"} if resume_from > 0 else {}
@@ -229,7 +229,7 @@ class HttpDownloader:
                         attempts += 1
                         if attempts > self._max_retries:
                             return self._failure(
-                                item, written, restarted, "Rate-Limit (429) bleibt bestehen"
+                                item, written, restarted, "Rate limit (429) persists"
                             )
                         wait = _parse_retry_after(response.headers.get("Retry-After"))
                         if wait is None:
@@ -242,7 +242,7 @@ class HttpDownloader:
                         attempts += 1
                         if attempts > self._max_retries:
                             return self._failure(
-                                item, written, restarted, f"Serverfehler {status} bleibt bestehen"
+                                item, written, restarted, f"Server error {status} persists"
                             )
                         await self._nap(self._backoff(attempts))
                         resume_from = self._part_size(part)
@@ -259,7 +259,7 @@ class HttpDownloader:
                         range_failures += 1
                         if range_failures >= 2:
                             raise RangeNotHonoredError(
-                                f"CDN ignoriert Range wiederholt (200 statt 206) für "
+                                f"CDN keeps ignoring Range (200 instead of 206) for "
                                 f"{entry.filename or item.target.name}"
                             )
                         self._discard(part)
@@ -273,8 +273,8 @@ class HttpDownloader:
                             range_failures += 1
                             if range_failures >= 2:
                                 raise RangeNotHonoredError(
-                                    f"Content-Range passt wiederholt nicht "
-                                    f"(erwartet {resume_from}, erhalten {start})"
+                                    f"Content-Range keeps mismatching "
+                                    f"(expected {resume_from}, got {start})"
                                 )
                             self._discard(part)
                             resume_from = 0
@@ -284,7 +284,7 @@ class HttpDownloader:
 
                     if status not in (200, 206):
                         return self._failure(
-                            item, written, restarted, f"Unerwarteter HTTP-Status {status}"
+                            item, written, restarted, f"Unexpected HTTP status {status}"
                         )
 
                     written += await self._stream_to_part(
@@ -293,7 +293,7 @@ class HttpDownloader:
             except httpx.HTTPError as exc:
                 attempts += 1
                 if attempts > self._max_retries:
-                    return self._failure(item, written, restarted, f"Netzwerkfehler: {exc}")
+                    return self._failure(item, written, restarted, f"Network error: {exc}")
                 await self._nap(self._backoff(attempts))
                 # Die tatsächlich geschriebenen Bytes sind der neue Startpunkt.
                 resume_from = self._part_size(part)
@@ -373,7 +373,7 @@ class HttpDownloader:
         entry = item.entry
         part = item.part_path
         if not part.exists():
-            return self._failure(item, written, restarted, "Teildatei fehlt nach dem Download")
+            return self._failure(item, written, restarted, "Partial file is missing after the download")
 
         actual = part.stat().st_size
         checked = False
@@ -387,7 +387,7 @@ class HttpDownloader:
                     ok=False,
                     bytes_written=written,
                     verified=False,
-                    error=f"Größe falsch: {actual} statt {entry.size} Bytes",
+                    error=f"Wrong size: {actual} instead of {entry.size} bytes",
                     restarted=restarted,
                 )
 
@@ -401,7 +401,7 @@ class HttpDownloader:
                     ok=False,
                     bytes_written=written,
                     verified=False,
-                    error=f"MD5 falsch: {digest} statt {entry.md5}",
+                    error=f"Wrong MD5: {digest} instead of {entry.md5}",
                     restarted=restarted,
                 )
 
@@ -419,13 +419,13 @@ class HttpDownloader:
                     item,
                     written,
                     restarted,
-                    "Vorhandene Zieldatei nicht ersetzt: weder Größe noch MD5 prüfbar",
+                    "Existing target file not replaced: neither size nor MD5 is checkable",
                 )
             try:
                 self._preserve_existing(item.target)
             except OSError as exc:
                 return self._failure(
-                    item, written, restarted, f"Altbestand nicht beiseitezulegen: {exc}"
+                    item, written, restarted, f"Could not set the old version aside: {exc}"
                 )
         os.replace(part, item.target)
         return DownloadResult(

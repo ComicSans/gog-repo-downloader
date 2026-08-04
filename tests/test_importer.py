@@ -296,7 +296,7 @@ def test_eintrag_ohne_sollgroesse_wird_nicht_zugeordnet(tmp_path: Path) -> None:
 
     assert not plan.matches
     assert len(plan.unsure) == 1
-    assert "Sollgröße" in plan.unsure[0].reason
+    assert "expected size" in plan.unsure[0].reason
 
 
 def test_bereits_belegte_eintraege_bleiben_unberuehrt(tmp_path: Path) -> None:

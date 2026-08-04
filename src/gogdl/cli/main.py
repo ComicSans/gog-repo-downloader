@@ -11,17 +11,17 @@ from gogdl import __version__
 from gogdl.errors import GogdlError
 
 from . import commands
-from .context import AppContext, build_sync_config, check_dest
+from .context import _NOTATION_HINT, AppContext, build_sync_config, check_dest
 
-_FILTER_HELP = "Kommagetrennt, z. B. --lang de,en"
+_FILTER_HELP = "Comma-separated, e.g. --lang de,en"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gogdl",
         description=(
-            "Lädt die eigene GOG.com-Bibliothek herunter, hält sie aktuell "
-            "und räumt alte Versionen auf."
+            "Download your own GOG.com library, keep it up to date and clean "
+            "up old versions."
         ),
     )
     parser.add_argument("--version", action="version", version=f"gogdl {__version__}")
@@ -32,83 +32,93 @@ def build_parser() -> argparse.ArgumentParser:
         "--dest",
         default=os.environ.get("GOGDL_DEST") or "~/GOG",
         help=(
-            "Zielverzeichnis der Sammlung. Ohne Angabe gilt die Umgebungsvariable "
-            "GOGDL_DEST, sonst ~/GOG"
+            "Destination directory of the collection. Without this the "
+            "environment variable GOGDL_DEST applies, otherwise ~/GOG"
         ),
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Mehr Details")
-    parser.add_argument("-q", "--quiet", action="store_true", help="Nur Fehler ausgeben")
-    parser.add_argument("--json", dest="json_output", action="store_true", help="Maschinenlesbar")
+    parser.add_argument("-v", "--verbose", action="store_true", help="More detail")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Report errors only")
+    parser.add_argument(
+        "--json", dest="json_output", action="store_true", help="Machine-readable output"
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    login = sub.add_parser("login", help="Bei GOG anmelden (einmalig)")
+    login = sub.add_parser("login", help="Sign in to GOG (once)")
     _add_dest(login)
     login.add_argument(
-        "--no-browser", action="store_true", help="Browser nicht automatisch öffnen"
+        "--no-browser", action="store_true", help="Do not open the browser automatically"
     )
 
-    update = sub.add_parser("update", help="Metadaten von GOG holen")
+    update = sub.add_parser("update", help="Fetch metadata from GOG")
     _add_selection(update)
     _add_filters(update)
-    update.add_argument("--jobs", type=int, default=4, help="Parallele Metadaten-Abrufe")
+    update.add_argument("--jobs", type=int, default=4, help="Parallel metadata fetches")
 
-    status = sub.add_parser("status", help="Zeigen, was zu tun wäre - ohne etwas zu tun")
+    status = sub.add_parser("status", help="Show what would happen, change nothing")
     _add_selection(status)
     _add_filters(status)
     # Ohne diese Schalter kann status den Aufraeumteil von download nicht
     # vorhersagen, obwohl genau das sein Zweck ist.
     _add_prune_flags(status)
 
-    download = sub.add_parser("download", help="Fehlende und veraltete Dateien laden")
+    download = sub.add_parser("download", help="Download missing and outdated files")
     _add_selection(download)
     _add_filters(download)
     _add_prune_flags(download)
-    download.add_argument("--jobs", type=int, default=2, help="Parallele Downloads")
-    download.add_argument("--dry-run", action="store_true", help="Nur zeigen, nichts tun")
-    download.add_argument("--limit-rate", help="Drosselung, z. B. 5M")
+    download.add_argument("--jobs", type=int, default=2, help="Parallel downloads")
+    download.add_argument(
+        "--dry-run", action="store_true", help="Show what would happen, do nothing"
+    )
+    download.add_argument("--limit-rate", help="Throttle, e.g. 5M")
 
-    verify = sub.add_parser("verify", help="Lokalen Bestand prüfen")
+    verify = sub.add_parser("verify", help="Check local files against the manifest")
     _add_filters(verify)
-    verify.add_argument("--deep", action="store_true", help="MD5 und Archivtest statt nur Größe")
+    verify.add_argument(
+        "--deep", action="store_true", help="MD5 and archive test instead of size only"
+    )
 
     imp = sub.add_parser(
         "import",
-        help="Vorhandenen Bestand dem Manifest zuordnen (für gewachsene Sammlungen)",
+        help="Match existing files against the manifest (for collections that grew over time)",
     )
     _add_dest(imp)
-    imp.add_argument("--apply", action="store_true", help="Zuordnung tatsächlich übernehmen")
+    imp.add_argument("--apply", action="store_true", help="Commit the matching")
     imp.add_argument(
         "--trust",
         choices=["none", "size", "md5"],
         default="none",
         help=(
-            "Wie stark der vorhandene Bestand als geprüft gilt. "
-            "none: übernehmen, aber nichts bestätigen - Aufräumen bleibt wirkungslos. "
-            "size: Größenübereinstimmung genügt als Beleg. "
-            "md5: Prüfsummen rechnen, dauert bei großen Sammlungen sehr lange"
+            "How far existing files count as verified. "
+            "none: adopt them, but attest nothing - pruning stays inert. "
+            "size: a size match is accepted as evidence. "
+            "md5: compute checksums, takes a long time on large collections"
         ),
     )
 
-    clean = sub.add_parser("clean", help="Aufräumen nachholen (z. B. nach --no-prune)")
+    clean = sub.add_parser("clean", help="Run the cleanup separately (e.g. after --no-prune)")
     _add_filters(clean)
     _add_prune_flags(clean)
-    clean.add_argument("--apply", action="store_true", help="Tatsächlich löschen")
+    clean.add_argument("--apply", action="store_true", help="Actually delete")
 
-    sync = sub.add_parser("sync", help="update und download in einem Aufruf (für cron)")
+    sync = sub.add_parser("sync", help="update and download in one call (for cron)")
     _add_selection(sync)
     _add_filters(sync)
     _add_prune_flags(sync)
-    sync.add_argument("--jobs", type=int, default=2)
-    sync.add_argument("--dry-run", action="store_true")
-    sync.add_argument("--limit-rate")
+    sync.add_argument("--jobs", type=int, default=2, help="Parallel downloads")
+    sync.add_argument(
+        "--dry-run", action="store_true", help="Show what would happen, do nothing"
+    )
+    sync.add_argument("--limit-rate", help="Throttle, e.g. 5M")
 
     return parser
 
 
 def _add_selection(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--only", action="append", default=[], help="Nur diese Spiele (slug oder id)")
-    parser.add_argument("--skip", action="append", default=[], help="Diese Spiele auslassen")
+    parser.add_argument(
+        "--only", action="append", default=[], help="Restrict to these games (slug or id)"
+    )
+    parser.add_argument("--skip", action="append", default=[], help="Exclude these games")
 
 
 def _add_dest(parser: argparse.ArgumentParser) -> None:
@@ -120,7 +130,11 @@ def _add_dest(parser: argparse.ArgumentParser) -> None:
     sie wirklich angegeben wurden.
     """
     parser.add_argument(
-        "--dest", dest="dest_local", default=None, help="Zielverzeichnis der Sammlung"
+        "--dest",
+        dest="dest_local",
+        metavar="DEST",
+        default=None,
+        help="Destination directory of the collection",
     )
     parser.add_argument("-v", "--verbose", dest="verbose_local", action="store_true")
     parser.add_argument("-q", "--quiet", dest="quiet_local", action="store_true")
@@ -132,27 +146,31 @@ def _add_filters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--os",
         help=(
-            "Plattformen. Komma heißt 'sonst', Plus heißt 'und': "
-            "'linux+mac' lädt beide, 'mac,windows' nimmt Windows nur, wenn es "
-            "keine Mac-Fassung gibt. 'all' hebt die Auswahl auf. "
-            "Default: nur die laufende Plattform"
+            f"Platforms. {_NOTATION_HINT}: "
+            "'linux+mac' fetches both, 'mac,windows' takes Windows only where "
+            "there is no Mac build. 'all' lifts the restriction. "
+            "Default: the platform you are running on"
         ),
     )
     parser.add_argument(
         "--lang",
         help=(
-            "Sprachen, gleiche Schreibweise wie --os: 'de,en' nimmt Deutsch "
-            "und nur ersatzweise Englisch, 'de+en' beides. Default: en"
+            "Languages, same notation as --os: 'de,en' takes German and falls "
+            "back to English, 'de+en' takes both. Default: en"
         ),
     )
-    parser.add_argument("--dlc", action="store_true", default=True, help="DLC einschließen (Default)")
+    parser.add_argument(
+        "--dlc", action="store_true", default=True, help="Include DLC (default)"
+    )
     parser.add_argument("--no-dlc", dest="dlc", action="store_false")
-    parser.add_argument("--extras", action="store_true", default=False, help="Extras einschließen")
+    parser.add_argument("--extras", action="store_true", default=False, help="Include extras")
     parser.add_argument("--no-extras", dest="extras", action="store_false")
     # --patches gibt es bewusst nicht mehr: die genutzte GOG-Schnittstelle
     # liefert unter gameDetails nur Installer und Extras, keine Patches.
     # FileKind.PATCH bleibt im Modell, falls sich das wieder ändert.
-    parser.add_argument("--strict", action="store_true", help="MD5 auch bei Installern vergleichen")
+    parser.add_argument(
+        "--strict", action="store_true", help="Compare MD5 for installers too"
+    )
 
 
 def _add_prune_flags(parser: argparse.ArgumentParser) -> None:
@@ -160,31 +178,30 @@ def _add_prune_flags(parser: argparse.ArgumentParser) -> None:
         "--prune",
         action="store_true",
         default=True,
-        help="Alte Versionen nach verifiziertem Ersatz entfernen (Default)",
+        help="Remove old versions once a verified replacement exists (default)",
     )
     parser.add_argument(
-        "--no-prune", dest="prune", action="store_false", help="Alle Versionen behalten"
+        "--no-prune", dest="prune", action="store_false", help="Keep every version"
     )
     parser.add_argument(
         "--keep-versions",
         type=int,
         default=1,
-        help="Wie viele Generationen behalten werden (Default 1 = nur die aktuelle)",
+        help="How many generations to keep (default 1 = the current one only)",
     )
     parser.add_argument(
         "--prune-mode",
         choices=["delete", "trash"],
         default="delete",
-        help="trash verschiebt nach <dest>/.trash statt zu löschen",
+        help="trash moves files to <dest>/.trash instead of deleting them",
     )
     parser.add_argument(
         "--keep-old",
         action="store_true",
         default=False,
         help=(
-            "Beiseitegelegte Vorgängerfassungen (.old) behalten. Ohne diesen "
-            "Schalter verschwinden sie, sobald die neue Fassung geprüft "
-            "vollständig vorliegt"
+            "Keep set-aside previous versions (.old). Without this switch they "
+            "are removed as soon as the new version is complete and verified"
         ),
     )
 
@@ -204,7 +221,7 @@ def _parse_rate(value: str | None) -> int | None:
     try:
         return int(float(text) * factor)
     except ValueError as exc:
-        raise ValueError(f"Ungültige Rate: {value!r}") from exc
+        raise ValueError(f"Invalid rate: {value!r}") from exc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -221,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
         config = build_sync_config(args)
         warning = check_dest(config.dest)
         if warning and args.command != "login":
-            print(f"Warnung: {warning}", file=sys.stderr)
+            print(f"Warning: {warning}", file=sys.stderr)
 
         ctx = AppContext(
             dest=config.dest,
@@ -254,16 +271,16 @@ def main(argv: list[str] | None = None) -> int:
             case "sync":
                 return asyncio.run(commands.cmd_sync(ctx, only=args.only, skip=args.skip))
             case _:  # pragma: no cover - argparse verhindert das
-                parser.error(f"Unbekanntes Kommando {args.command!r}")
+                parser.error(f"Unknown command {args.command!r}")
                 return 1
     except GogdlError as exc:
-        print(f"Fehler: {exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         return exc.exit_code
     except ValueError as exc:
-        print(f"Fehler: {exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("\nAbgebrochen. Ein erneuter Aufruf setzt fort.", file=sys.stderr)
+        print("\nInterrupted. Running the command again resumes.", file=sys.stderr)
         return 130
 
 
