@@ -81,7 +81,7 @@ def build_sync_config(args) -> SyncConfig:
     dest = Path(args.dest).expanduser().resolve()
 
     os_pref = _parse_os_preference(getattr(args, "os", None))
-    lang_pref = Preference.parse(getattr(args, "lang", None), default=Preference.of("en"))
+    lang_pref = _parse_lang_preference(getattr(args, "lang", None))
 
     # Die Mengen bleiben als Vorfilter erhalten; die eigentliche Auswahl mit
     # Rückfallebenen trifft sync/ pro Auslieferung.
@@ -104,6 +104,38 @@ def build_sync_config(args) -> SyncConfig:
         prune_mode=PruneMode(getattr(args, "prune_mode", "delete")),
         strict_md5=getattr(args, "strict", False),
     )
+
+
+_SPRACHCODES = {
+    "en", "de", "fr", "es", "it", "pl", "ru", "pt", "br", "cz", "hu", "jp", "ja",
+    "ko", "cn", "zh", "nl", "da", "sv", "no", "fi", "tr", "uk", "ro", "el", "he",
+    "ar", "th", "bl", "sk", "es_mx", "pt_br", "zh_hans", "zh_hant",
+}
+
+
+def _parse_lang_preference(value: str | None) -> Preference:
+    """``--lang`` auflösen und offensichtliche Tippfehler abfangen.
+
+    Ohne Prüfung bedeutet ein vertippter Sprachcode still "lade gar nichts",
+    und das sieht wie eine leere Bibliothek aus statt wie ein Fehler. Die
+    Liste ist bewusst großzügig: GOG führt gelegentlich Codes ein, die hier
+    nicht stehen, deshalb wird nur gewarnt, wenn ALLE angegebenen Codes
+    unbekannt sind.
+    """
+    if not value or not value.strip():
+        return Preference.of("en")
+    if value.strip().lower() == "all":
+        return Preference()
+
+    pref = Preference.parse(value)
+    unbekannt = sorted(pref.all_values - _SPRACHCODES)
+    if unbekannt and len(unbekannt) == len(pref.all_values):
+        raise ValueError(
+            f"Keiner dieser Sprachcodes ist bekannt: {', '.join(unbekannt)}. "
+            "Erwartet werden Kürzel wie de, en, fr oder 'all' für alle Sprachen. "
+            "Komma heißt 'sonst', Plus heißt 'und': --lang de,en"
+        )
+    return pref
 
 
 def _parse_os_preference(value: str | None) -> Preference:

@@ -49,6 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="Zeigen, was zu tun wäre - ohne etwas zu tun")
     _add_filters(status)
+    # Ohne diese Schalter kann status den Aufraeumteil von download nicht
+    # vorhersagen, obwohl genau das sein Zweck ist.
+    _add_prune_flags(status)
 
     download = sub.add_parser("download", help="Fehlende und veraltete Dateien laden")
     _add_filters(download)
@@ -101,16 +104,19 @@ def _add_selection(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_dest(parser: argparse.ArgumentParser) -> None:
-    """``--dest`` auch nach dem Unterkommando erlauben.
+    """Globale Schalter auch nach dem Unterkommando erlauben.
 
-    ``gogdl status --dest ~/GOG`` ist die naheliegende Schreibweise; ein
-    globales Argument allein würde sie mit einer Fehlermeldung abweisen.
-    Eigener Zielname, damit der Wert den globalen nur überschreibt, wenn er
-    wirklich angegeben wurde.
+    ``gogdl status --dest ~/GOG -v`` ist die naheliegende Schreibweise; ein
+    rein globales Argument würde sie mit einer Fehlermeldung abweisen.
+    Eigene Zielnamen, damit die Werte die globalen nur überschreiben, wenn
+    sie wirklich angegeben wurden.
     """
     parser.add_argument(
         "--dest", dest="dest_local", default=None, help="Zielverzeichnis der Sammlung"
     )
+    parser.add_argument("-v", "--verbose", dest="verbose_local", action="store_true")
+    parser.add_argument("-q", "--quiet", dest="quiet_local", action="store_true")
+    parser.add_argument("--json", dest="json_local", action="store_true")
 
 
 def _add_filters(parser: argparse.ArgumentParser) -> None:
@@ -187,9 +193,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        # Der Wert nach dem Unterkommando schlaegt den davor.
+        # Die Werte nach dem Unterkommando schlagen die davor.
         if getattr(args, "dest_local", None):
             args.dest = args.dest_local
+        args.verbose = args.verbose or getattr(args, "verbose_local", False)
+        args.quiet = args.quiet or getattr(args, "quiet_local", False)
+        args.json_output = args.json_output or getattr(args, "json_local", False)
         config = build_sync_config(args)
         warning = check_dest(config.dest)
         if warning and args.command != "login":
