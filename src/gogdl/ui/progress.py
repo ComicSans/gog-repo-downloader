@@ -3,21 +3,33 @@
 Zwei Implementierungen desselben Protocols ``model.protocols.ProgressReporter``:
 
 ``RichReporter``
-    Live-Anzeige im Terminal, auf ~4 Hz gedrosselt. Zwei Zeilen: eine
-    Gesamtzeile (Dateien x/y, Bytes, ETA) und eine Zeile für die laufende
-    Datei (Name, Bytes, Rate, ETA).
+    Live-Anzeige im Terminal, auf ~4 Hz gedrosselt. Ganz oben steht immer
+    die Gesamtzeile (Dateien x/y, Bytes, ETA), darunter je eine Zeile pro
+    gerade laufender Datei (Name, Bytes, Rate, ETA), die beim Abschluss
+    wieder verschwindet.
 
 ``PlainReporter``
-    Zeilenweise Meldungen ohne jedes ANSI-Steuerzeichen — für Cron, Pipes
-    und Logdateien. Zwischenstände werden stark gedrosselt, damit ein
-    nächtlicher Lauf keine Logdatei füllt.
+    Zeilenweise Meldungen ohne jedes ANSI-Steuerzeichen, für Cron, Pipes
+    und Logdateien. Jede Zeile nennt die Datei, denn bei ``--jobs 2`` sind
+    mehrere Downloads gleichzeitig unterwegs. Zwischenstände werden stark
+    gedrosselt, damit ein nächtlicher Lauf keine Logdatei füllt.
 
 ``make_reporter`` wählt anhand von ``stream.isatty()`` automatisch. Ein
 manueller Schalter ist nicht nötig, ``force_plain`` überschreibt trotzdem.
 
+Handles
+-------
+``start_file`` liefert ein undurchsichtiges Handle. Nur damit lassen sich
+gleichzeitige Downloads auseinanderhalten: ohne Handle würden bei
+``--jobs 2`` beide Läufe ihre Bytes derselben Zeile zurechnen. ``advance``
+und ``finish_file`` nehmen das Handle wieder entgegen. Wird keines
+übergeben, gilt die zuletzt begonnene, noch offene Datei - das ist nur bei
+einem einzelnen Auftrag sicher, bleibt aber laut Protocol erlaubt.
+
 Beide Reporter sind robust gegen Aufrufe in falscher Reihenfolge: ein
 ``advance()`` ohne vorheriges ``start_file()`` wird verbucht statt zu
-scheitern, und ``close()`` ist idempotent. Eine Anzeige darf einen laufenden
+scheitern, ein unbekanntes oder veraltetes Handle wird ignoriert statt zu
+werfen, und ``close()`` ist idempotent. Eine Anzeige darf einen laufenden
 Download unter keinen Umständen abbrechen.
 """
 
@@ -25,6 +37,7 @@ from __future__ import annotations
 
 import sys
 import time
+from dataclasses import dataclass
 from typing import Callable, TextIO
 
 from rich.console import Console
@@ -57,6 +70,49 @@ def _shorten(name: str, width: int = _NAME_WIDTH) -> str:
     if len(text) <= width:
         return text
     return "…" + text[-(width - 1) :]
+
+
+# --------------------------------------------------------------------------
+# Handles
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _FileHandle:
+    """Undurchsichtiges Handle einer laufenden Datei.
+
+    Der Aufrufer bekommt es von ``start_file`` und reicht es unverändert
+    zurück. Der Inhalt ist Implementierungsdetail: gültig ist ein Handle
+    nur bei dem Reporter, der es ausgegeben hat, und nur bis zu dessen
+    ``finish_file``.
+    """
+
+    id: int
+
+
+@dataclass
+class _PlainFile:
+    """Zustand einer offenen Datei im ``PlainReporter``.
+
+    Die Drosselung hängt an diesem Objekt, nicht am Reporter: sonst würde
+    eine schnelle Datei die Meldungen einer langsamen mit verschlucken.
+    """
+
+    name: str
+    total: int | None
+    index: int
+    started_at: float
+    done: int = 0
+    last_report_at: float = 0.0
+    last_report_percent: float = 0.0
+
+
+@dataclass
+class _RichFile:
+    """Zustand einer offenen Datei im ``RichReporter``: Name plus eigene Zeile."""
+
+    name: str
+    task: TaskID
 
 
 # --------------------------------------------------------------------------
@@ -115,10 +171,13 @@ class _EtaColumn(ProgressColumn):
 class RichReporter:
     """Zweistufige Live-Anzeige für Terminals.
 
-    Implementiert ``model.protocols.ProgressReporter``. ``quiet=True``
-    unterdrückt die Balken vollständig und meldet nur noch Fehler und den
-    Abschluss — im Zweifel ist eine stille Anzeige besser als eine, die
-    einen Logstrom mit Steuerzeichen zerlegt.
+    Implementiert ``model.protocols.ProgressReporter``. Die Gesamtzeile
+    wird als erste Aufgabe angelegt und steht damit immer oben; jede
+    laufende Datei bekommt darunter eine eigene Zeile, die bei
+    ``finish_file`` wieder entfernt wird. ``quiet=True`` unterdrückt die
+    Balken vollständig und meldet nur noch Fehler und den Abschluss - im
+    Zweifel ist eine stille Anzeige besser als eine, die einen Logstrom
+    mit Steuerzeichen zerlegt.
     """
 
     def __init__(
@@ -147,7 +206,8 @@ class RichReporter:
             refresh_per_second=refresh_per_second,
         )
         self._overall: TaskID | None = None
-        self._file: TaskID | None = None
+        self._files: dict[int, _RichFile] = {}
+        self._next_handle = 0
         self._live = False
         self._closed = False
 
@@ -164,64 +224,67 @@ class RichReporter:
         self._files_total = int(total_files)
         self._started_at = self._clock()
         self._ensure_live()
-        if self._overall is None:
-            self._overall = self._progress.add_task(
-                "Gesamt ",
-                total=total_bytes,
-                row=_ROW_OVERALL,
-                files_done=0,
-                files_total=self._files_total,
-            )
-        else:
-            self._progress.update(
-                self._overall,
-                total=total_bytes,
-                completed=0,
-                files_done=0,
-                files_total=self._files_total,
-            )
+        self._ensure_overall()
+        self._update(
+            self._overall,
+            total=total_bytes,
+            completed=0,
+            files_done=0,
+            files_total=self._files_total,
+        )
 
-    def start_file(self, name: str, total_bytes: int | None, already_done: int = 0) -> None:
+    def start_file(
+        self, name: str, total_bytes: int | None, already_done: int = 0
+    ) -> object:
         self._ensure_live()
-        # Die alte Zeile wird ersetzt, nicht zurückgesetzt: ``reset()`` und
-        # ``update()`` behandeln ``total=None`` als „nicht angegeben" und
-        # würden die vorige Größe stehen lassen — eine Datei unbekannter
-        # Größe bekäme dann keinen unbestimmten Balken.
-        if self._file is not None:
-            try:
-                self._progress.remove_task(self._file)
-            except Exception:  # pragma: no cover - Anzeige darf nie werfen
-                pass
+        # Die Gesamtzeile zuerst anlegen, damit sie in der Reihenfolge der
+        # Aufgaben oben bleibt, auch wenn ``start_overall`` fehlt.
+        self._ensure_overall()
+        # Jede Datei bekommt eine eigene Zeile. Sie wird nie wiederverwendet:
+        # ``reset()`` und ``update()`` behandeln ``total=None`` als „nicht
+        # angegeben" und würden die vorige Größe stehen lassen - eine Datei
+        # unbekannter Größe bekäme dann keinen unbestimmten Balken.
+        #
         # ``already_done`` zählt nicht zur Gesamtsumme: die enthält nur noch
         # zu ladende Bytes (SyncPlan.download_bytes rechnet ``resume_from``
         # bereits heraus).
-        self._file = self._progress.add_task(
+        task = self._progress.add_task(
             _shorten(name),
             total=total_bytes,
             completed=already_done,
             row=_ROW_FILE,
         )
+        return self._register(_RichFile(name=str(name), task=task))
 
-    def advance(self, n_bytes: int) -> None:
+    def advance(self, n_bytes: int, handle: object | None = None) -> None:
         if self._closed or not n_bytes or n_bytes < 0:
             return
+        # Die Gesamtsumme stimmt auch dann, wenn das Handle nicht mehr
+        # auflösbar ist: die Bytes sind tatsächlich geflossen.
         self._bytes_done += n_bytes
-        if self._file is not None:
-            self._progress.advance(self._file, n_bytes)
-        if self._overall is not None:
-            self._progress.advance(self._overall, n_bytes)
+        entry = self._resolve(handle)
+        if entry is not None:
+            self._advance_task(entry.task, n_bytes)
+        self._advance_task(self._overall, n_bytes)
 
-    def finish_file(self, name: str, ok: bool, detail: str = "") -> None:
+    def finish_file(
+        self, name: str, ok: bool, detail: str = "", handle: object | None = None
+    ) -> None:
         if ok:
             self._files_ok += 1
         else:
             self._files_failed += 1
-        if self._overall is not None:
-            self._progress.update(
-                self._overall, files_done=self._files_ok + self._files_failed
-            )
-        if self._file is not None:
-            self._progress.update(self._file, visible=False)
+        self._update(self._overall, files_done=self._files_ok + self._files_failed)
+
+        entry_id = self._resolve_id(handle, name)
+        if entry_id is not None:
+            entry = self._files.pop(entry_id)
+            # Die Zeile verschwindet, statt nur unsichtbar zu werden: bei
+            # mehreren gleichzeitigen Dateien sammelt sich sonst Altbestand.
+            try:
+                self._progress.remove_task(entry.task)
+            except Exception:  # pragma: no cover - Anzeige darf nie werfen
+                pass
 
         if ok and self._quiet:
             return
@@ -250,6 +313,60 @@ class RichReporter:
         self._flush()
 
     # -- intern ------------------------------------------------------------
+
+    def _register(self, entry: _RichFile) -> _FileHandle:
+        self._next_handle += 1
+        self._files[self._next_handle] = entry
+        return _FileHandle(self._next_handle)
+
+    def _resolve(self, handle: object | None) -> _RichFile | None:
+        """Eintrag zum Handle. Ohne Handle die zuletzt begonnene offene Datei."""
+        entry_id = self._resolve_id(handle, None)
+        return None if entry_id is None else self._files[entry_id]
+
+    def _resolve_id(self, handle: object | None, name: str | None) -> int | None:
+        """Schlüssel des gemeinten Eintrags, ``None`` wenn keiner passt.
+
+        Ein unbekanntes oder veraltetes Handle liefert ``None`` statt eines
+        falschen Eintrags: lieber nichts anzeigen als die falsche Datei.
+        """
+        if handle is not None:
+            if isinstance(handle, _FileHandle) and handle.id in self._files:
+                return handle.id
+            return None
+        if name is not None:
+            for key in reversed(list(self._files)):
+                if self._files[key].name == name:
+                    return key
+        return next(reversed(self._files), None)
+
+    def _ensure_overall(self) -> None:
+        """Gesamtzeile anlegen, falls sie noch fehlt."""
+        if self._overall is not None:
+            return
+        self._overall = self._progress.add_task(
+            "Gesamt ",
+            total=None,
+            row=_ROW_OVERALL,
+            files_done=self._files_ok + self._files_failed,
+            files_total=self._files_total,
+        )
+
+    def _advance_task(self, task: TaskID | None, n_bytes: int) -> None:
+        if task is None:
+            return
+        try:
+            self._progress.advance(task, n_bytes)
+        except Exception:  # pragma: no cover - Anzeige darf nie werfen
+            pass
+
+    def _update(self, task: TaskID | None, **fields: object) -> None:
+        if task is None:
+            return
+        try:
+            self._progress.update(task, **fields)
+        except Exception:  # pragma: no cover - Anzeige darf nie werfen
+            pass
 
     def _ensure_live(self) -> None:
         """Live-Anzeige verzögert starten — in ``quiet`` gar nicht."""
@@ -285,11 +402,15 @@ class PlainReporter:
     """Zeilenweise Ausgabe ohne ANSI-Steuerzeichen.
 
     Für Cron, Pipes und Logdateien. Pro Datei erscheinen eine Start- und
-    eine Abschlusszeile. Zwischenstände werden gedrosselt: eine Meldung
-    erst, wenn **sowohl** ``min_interval`` Sekunden vergangen **als auch**
-    ``min_percent`` Prozentpunkte hinzugekommen sind — die seltenere der
-    beiden Bedingungen bestimmt also den Takt. Bei unbekannter Dateigröße
-    entfällt die Prozentbedingung, es bleibt der Zeittakt.
+    eine Abschlusszeile, und jede Zeile nennt die Datei: bei ``--jobs 2``
+    verschränken sich sonst die Meldungen zweier Downloads unlesbar.
+    Zwischenstände werden gedrosselt: eine Meldung erst, wenn **sowohl**
+    ``min_interval`` Sekunden vergangen **als auch** ``min_percent``
+    Prozentpunkte hinzugekommen sind - die seltenere der beiden
+    Bedingungen bestimmt also den Takt. Bei unbekannter Dateigröße
+    entfällt die Prozentbedingung, es bleibt der Zeittakt. Gedrosselt wird
+    pro Datei, nicht pro Reporter, sonst verschluckt eine schnelle Datei
+    die Meldungen einer langsamen.
 
     ``clock`` ist injizierbar, damit die Drosselung deterministisch
     testbar ist.
@@ -317,54 +438,69 @@ class PlainReporter:
         self._bytes_done = 0
         self._started_at = self._clock()
 
-        self._name: str | None = None
-        self._file_total: int | None = None
-        self._file_done = 0
-        self._file_started_at = self._started_at
-        self._last_report_at = self._started_at
-        self._last_report_percent = 0.0
+        self._files: dict[int, _PlainFile] = {}
+        self._next_handle = 0
+        self._files_started = 0
 
     # -- Protokoll ---------------------------------------------------------
 
     def start_overall(self, total_files: int, total_bytes: int) -> None:
         self._files_total = int(total_files)
         self._started_at = self._clock()
-        self._last_report_at = self._started_at
         if not self._quiet:
             self._emit(f"Start: {self._files_total} Dateien, {human_bytes(total_bytes)}")
 
-    def start_file(self, name: str, total_bytes: int | None, already_done: int = 0) -> None:
+    def start_file(
+        self, name: str, total_bytes: int | None, already_done: int = 0
+    ) -> object:
         now = self._clock()
-        self._name = str(name)
-        self._file_total = total_bytes
-        self._file_done = max(int(already_done), 0)
-        self._file_started_at = now
-        self._last_report_at = now
-        self._last_report_percent = self._percent()
+        self._files_started += 1
+        state = _PlainFile(
+            name=str(name),
+            total=total_bytes,
+            index=self._files_started,
+            started_at=now,
+            done=max(int(already_done), 0),
+            last_report_at=now,
+        )
+        state.last_report_percent = self._percent(state)
+        handle = self._register(state)
         if self._quiet:
-            return
+            return handle
         size = human_bytes(total_bytes) if total_bytes is not None else "unbekannte Größe"
-        line = f"[{self._index()}/{self._files_total}] {self._name} — {size}"
-        if self._file_done:
-            line += f" (Fortsetzung ab {human_bytes(self._file_done)})"
+        line = f"[{state.index}/{self._files_total}] {state.name} — {size}"
+        if state.done:
+            line += f" (Fortsetzung ab {human_bytes(state.done)})"
         self._emit(line)
+        return handle
 
-    def advance(self, n_bytes: int) -> None:
+    def advance(self, n_bytes: int, handle: object | None = None) -> None:
         if self._closed or not n_bytes or n_bytes < 0:
             return
-        self._file_done += n_bytes
+        # Die Gesamtsumme stimmt auch dann, wenn das Handle nicht mehr
+        # auflösbar ist: die Bytes sind tatsächlich geflossen.
         self._bytes_done += n_bytes
-        self._maybe_report()
+        state = self._resolve(handle)
+        if state is None:
+            return
+        state.done += n_bytes
+        self._maybe_report(state)
 
-    def finish_file(self, name: str, ok: bool, detail: str = "") -> None:
-        elapsed = self._clock() - self._file_started_at
-        done = self._file_done
+    def finish_file(
+        self, name: str, ok: bool, detail: str = "", handle: object | None = None
+    ) -> None:
+        state_id = self._resolve_id(handle, name)
+        state = self._files.pop(state_id) if state_id is not None else None
+        now = self._clock()
+        elapsed = now - (state.started_at if state is not None else self._started_at)
+        done = state.done if state is not None else 0
         if ok:
             self._files_ok += 1
         else:
             self._files_failed += 1
 
-        prefix = f"[{self._index() - 1}/{self._files_total}]"
+        index = state.index if state is not None else self._files_ok + self._files_failed
+        prefix = f"[{index}/{self._files_total}]"
         if ok:
             if not self._quiet:
                 line = f"{prefix} OK {name} — {human_bytes(done)}"
@@ -375,10 +511,6 @@ class PlainReporter:
             if detail:
                 line += f" — {detail}"
             self._emit(line)
-
-        self._name = None
-        self._file_total = None
-        self._file_done = 0
 
     def message(self, text: str) -> None:
         if self._quiet:
@@ -393,36 +525,60 @@ class PlainReporter:
 
     # -- intern ------------------------------------------------------------
 
-    def _index(self) -> int:
-        """Laufende Nummer der aktuellen Datei, 1-basiert."""
-        return self._files_ok + self._files_failed + 1
+    def _register(self, state: _PlainFile) -> _FileHandle:
+        self._next_handle += 1
+        self._files[self._next_handle] = state
+        return _FileHandle(self._next_handle)
 
-    def _percent(self) -> float:
-        if not self._file_total:
+    def _resolve(self, handle: object | None) -> _PlainFile | None:
+        """Eintrag zum Handle. Ohne Handle die zuletzt begonnene offene Datei."""
+        state_id = self._resolve_id(handle, None)
+        return None if state_id is None else self._files[state_id]
+
+    def _resolve_id(self, handle: object | None, name: str | None) -> int | None:
+        """Schlüssel des gemeinten Eintrags, ``None`` wenn keiner passt.
+
+        Ein unbekanntes oder veraltetes Handle liefert ``None`` statt eines
+        falschen Eintrags: lieber nichts verbuchen als bei der falschen
+        Datei.
+        """
+        if handle is not None:
+            if isinstance(handle, _FileHandle) and handle.id in self._files:
+                return handle.id
+            return None
+        if name is not None:
+            for key in reversed(list(self._files)):
+                if self._files[key].name == name:
+                    return key
+        return next(reversed(self._files), None)
+
+    @staticmethod
+    def _percent(state: _PlainFile) -> float:
+        if not state.total:
             return 0.0
-        return 100.0 * self._file_done / self._file_total
+        return 100.0 * state.done / state.total
 
-    def _maybe_report(self) -> None:
-        """Zwischenstand nur ausgeben, wenn beide Drosseln geöffnet sind."""
-        if self._quiet or self._name is None:
+    def _maybe_report(self, state: _PlainFile) -> None:
+        """Zwischenstand nur ausgeben, wenn beide Drosseln dieser Datei offen sind."""
+        if self._quiet:
             return
         now = self._clock()
-        if now - self._last_report_at < self._min_interval:
+        if now - state.last_report_at < self._min_interval:
             return
-        percent = self._percent()
-        if self._file_total and percent - self._last_report_percent < self._min_percent:
+        percent = self._percent(state)
+        if state.total and percent - state.last_report_percent < self._min_percent:
             return
 
-        line = f"    {self._name}: {human_bytes(self._file_done)}"
-        if self._file_total:
-            line += f"/{human_bytes(self._file_total)} ({percent:.0f}%)"
-        elapsed = now - self._file_started_at
+        line = f"    {state.name}: {human_bytes(state.done)}"
+        if state.total:
+            line += f"/{human_bytes(state.total)} ({percent:.0f}%)"
+        elapsed = now - state.started_at
         if elapsed > 0:
-            line += f" · {human_bytes(self._file_done / elapsed)}/s"
+            line += f" · {human_bytes(state.done / elapsed)}/s"
         self._emit(line)
 
-        self._last_report_at = now
-        self._last_report_percent = percent
+        state.last_report_at = now
+        state.last_report_percent = percent
 
     def _emit(self, text: str) -> None:
         stream = self._stream if self._stream is not None else sys.stdout

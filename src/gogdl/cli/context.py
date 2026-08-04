@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from gogdl.constants import DB_FILENAME, STATE_DIRNAME, TRASH_DIRNAME
-from gogdl.model.types import OsName, PruneMode, SyncConfig
+from gogdl.model.types import OsName, Preference, PruneMode, SyncConfig
 
 
 def now_utc() -> str:
@@ -80,13 +80,22 @@ def build_sync_config(args) -> SyncConfig:
     """Übersetzt die geparsten Argumente in eine ``SyncConfig``."""
     dest = Path(args.dest).expanduser().resolve()
 
-    os_filter = _parse_os(getattr(args, "os", None))
-    languages = _parse_list(getattr(args, "lang", None)) or {"en"}
+    os_pref = _parse_os_preference(getattr(args, "os", None))
+    lang_pref = Preference.parse(getattr(args, "lang", None), default=Preference.of("en"))
+
+    # Die Mengen bleiben als Vorfilter erhalten; die eigentliche Auswahl mit
+    # Rückfallebenen trifft sync/ pro Auslieferung.
+    os_filter = (
+        {OsName(v) for v in os_pref.all_values} if os_pref else set(OsName)
+    )
+    languages = lang_pref.all_values or frozenset({"en"})
 
     return SyncConfig(
         dest=dest,
         os_filter=frozenset(os_filter),
         languages=frozenset(languages),
+        os_preference=os_pref,
+        language_preference=lang_pref,
         include_dlc=getattr(args, "dlc", True),
         include_extras=getattr(args, "extras", False),
         include_patches=getattr(args, "patches", False),
@@ -97,24 +106,25 @@ def build_sync_config(args) -> SyncConfig:
     )
 
 
-def _parse_os(value: str | None) -> set[OsName]:
-    """``--os`` auflösen. Ohne Angabe: nur die laufende Plattform (§10)."""
-    if not value:
-        return {OsName.current()}
+def _parse_os_preference(value: str | None) -> Preference:
+    """``--os`` auflösen und die Plattformnamen sofort prüfen.
+
+    Ohne Angabe: nur die laufende Plattform. ``all`` hebt die Einschränkung
+    auf. Ein Tippfehler soll hier auffliegen und nicht später als leeres
+    Ergebnis erscheinen.
+    """
+    if not value or not value.strip():
+        return Preference.of(OsName.current().value)
     if value.strip().lower() == "all":
-        return set(OsName)
-    result: set[OsName] = set()
-    for item in _parse_list(value) or []:
-        try:
-            result.add(OsName(item))
-        except ValueError as exc:
-            raise ValueError(
-                f"Unbekannte Plattform {item!r}. Erlaubt: windows, linux, mac, all"
-            ) from exc
-    return result or {OsName.current()}
+        return Preference()
 
-
-def _parse_list(value: str | None) -> set[str] | None:
-    if not value:
-        return None
-    return {part.strip().lower() for part in value.split(",") if part.strip()}
+    pref = Preference.parse(value)
+    erlaubt = {member.value for member in OsName}
+    unbekannt = sorted(pref.all_values - erlaubt)
+    if unbekannt:
+        raise ValueError(
+            f"Unbekannte Plattform: {', '.join(unbekannt)}. "
+            "Erlaubt sind windows, linux, mac oder all. "
+            "Komma heißt 'sonst', Plus heißt 'und': --os linux+mac"
+        )
+    return pref

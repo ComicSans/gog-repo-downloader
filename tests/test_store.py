@@ -7,6 +7,7 @@ Dateien, die GOG entfernt hat, dürfen nicht still verschwinden.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterator
 
 import pytest
@@ -27,10 +28,14 @@ from gogdl.store import SCHEMA_VERSION, SqliteStore
 PRODUCT_ID = 4242
 SEEN_1 = "2026-08-01T10:00:00Z"
 SEEN_2 = "2026-08-02T10:00:00Z"
+SEEN_3 = "2026-08-03T10:00:00Z"
 
 INSTALLER_EN = SlotKey(PRODUCT_ID, FileKind.INSTALLER, OsName.WINDOWS, "en")
 INSTALLER_DE = SlotKey(PRODUCT_ID, FileKind.INSTALLER, OsName.WINDOWS, "de")
 EXTRA_SLOT = SlotKey(PRODUCT_ID, FileKind.EXTRA)
+EXTRA_HANDBUCH = SlotKey(PRODUCT_ID, FileKind.EXTRA, variant="handbuch")
+EXTRA_SOUNDTRACK = SlotKey(PRODUCT_ID, FileKind.EXTRA, variant="soundtrack")
+PATCH_WIN = SlotKey(PRODUCT_ID, FileKind.PATCH, OsName.WINDOWS)
 
 
 @pytest.fixture
@@ -50,6 +55,7 @@ def remote(
     part_index: int = 1,
     total_parts: int = 1,
     filename: str | None = "setup.exe",
+    dlc_of: int | None = None,
 ) -> RemoteFile:
     return RemoteFile(
         slot=slot,
@@ -61,6 +67,7 @@ def remote(
         version=version,
         part_index=part_index,
         total_parts=total_parts,
+        dlc_of=dlc_of,
     )
 
 
@@ -205,6 +212,173 @@ def test_entfernte_datei_wird_orphaned_und_bleibt(store: SqliteStore) -> None:
     assert only(entries, "f1").last_seen_utc == SEEN_2
 
 
+def _verwaisen_lassen(store: SqliteStore) -> None:
+    """Zwei Läufe: ``f2`` ist erst da, dann weg - und damit ``ORPHANED``."""
+    store.replace_remote(PRODUCT_ID, [remote(), remote(file_id="f2")], SEEN_1)
+    store.replace_remote(PRODUCT_ID, [remote()], SEEN_2)
+    assert only(store.entries(), "f2").state is LocalState.ORPHANED
+
+
+def test_zurueckgekehrte_datei_mit_bestand_wird_wieder_complete(
+    store: SqliteStore,
+) -> None:
+    """Wieder angeboten heißt: nicht mehr verwaist (sonst nie wieder ladbar).
+
+    Der lokale Bestand ist unverändert gültig - Pfad vorhanden, Verifikation
+    hat den Abgleich überlebt -, also gilt wieder ``COMPLETE``.
+    """
+    store.replace_remote(PRODUCT_ID, [remote(), remote(file_id="f2")], SEEN_1)
+    entry = only(store.entries(), "f2")
+    entry.state = LocalState.COMPLETE
+    entry.relative_path = "Spiel/alt.exe"
+    entry.bytes_done = 1000
+    entry.last_verified_utc = SEEN_1
+    store.update_entry(entry)
+
+    store.replace_remote(PRODUCT_ID, [remote()], SEEN_2)
+    assert only(store.entries(), "f2").state is LocalState.ORPHANED
+
+    store.replace_remote(PRODUCT_ID, [remote(), remote(file_id="f2")], SEEN_3)
+
+    back = only(store.entries(), "f2")
+    assert back.state is not LocalState.ORPHANED
+    assert back.state is LocalState.COMPLETE
+    assert back.is_verified_complete
+    assert back.last_verified_utc == SEEN_1
+    assert back.relative_path == "Spiel/alt.exe"
+    assert back.last_seen_utc == SEEN_3
+
+
+def test_zurueckgekehrte_datei_ohne_bestand_wird_missing(store: SqliteStore) -> None:
+    """Ohne lokalen Pfad bleibt nur der Neuladen-Zustand."""
+    _verwaisen_lassen(store)
+
+    store.replace_remote(PRODUCT_ID, [remote(), remote(file_id="f2")], SEEN_3)
+
+    back = only(store.entries(), "f2")
+    assert back.state is not LocalState.ORPHANED
+    assert back.state is LocalState.MISSING
+    assert back.relative_path == ""
+    assert back.last_seen_utc == SEEN_3
+
+
+def test_zurueckgekehrte_datei_ohne_verifikation_wird_missing(
+    store: SqliteStore,
+) -> None:
+    """Pfad allein genügt nicht: unverifiziert ist der Bestand kein Beleg."""
+    store.replace_remote(PRODUCT_ID, [remote(), remote(file_id="f2")], SEEN_1)
+    entry = only(store.entries(), "f2")
+    entry.state = LocalState.COMPLETE
+    entry.relative_path = "Spiel/alt.exe"
+    store.update_entry(entry)  # last_verified_utc bleibt None
+
+    store.replace_remote(PRODUCT_ID, [remote()], SEEN_2)
+    store.replace_remote(PRODUCT_ID, [remote(), remote(file_id="f2")], SEEN_3)
+
+    back = only(store.entries(), "f2")
+    assert back.state is LocalState.MISSING
+    assert back.relative_path == "Spiel/alt.exe", "der Fund auf der Platte bleibt bekannt"
+
+
+def test_zurueckgekehrte_datei_mit_neuer_version_wird_missing(
+    store: SqliteStore,
+) -> None:
+    """GOG stellt sie neu ein: die alte Verifikation zählt nicht mehr."""
+    store.replace_remote(PRODUCT_ID, [remote(), remote(file_id="f2")], SEEN_1)
+    entry = only(store.entries(), "f2")
+    entry.state = LocalState.COMPLETE
+    entry.relative_path = "Spiel/alt.exe"
+    entry.last_verified_utc = SEEN_1
+    store.update_entry(entry)
+
+    store.replace_remote(PRODUCT_ID, [remote()], SEEN_2)
+    store.replace_remote(
+        PRODUCT_ID, [remote(), remote(file_id="f2", version="2.0.0")], SEEN_3
+    )
+
+    back = only(store.entries(), "f2")
+    assert back.last_verified_utc is None
+    assert back.state is LocalState.MISSING
+    assert back.version == "2.0.0"
+
+
+def test_rueckkehr_faesst_nicht_verwaiste_zustaende_nicht_an(store: SqliteStore) -> None:
+    """Der Rückweg gilt nur für ``ORPHANED``; alles andere bleibt stehen."""
+    store.replace_remote(PRODUCT_ID, [remote(), remote(file_id="f2")], SEEN_1)
+    entry = only(store.entries(), "f2")
+    entry.state = LocalState.PARTIAL
+    entry.bytes_done = 512
+    entry.relative_path = "Spiel/alt.exe"
+    store.update_entry(entry)
+
+    store.replace_remote(PRODUCT_ID, [remote(), remote(file_id="f2")], SEEN_2)
+
+    after = only(store.entries(), "f2")
+    assert after.state is LocalState.PARTIAL
+    assert after.bytes_done == 512
+
+
+def test_zwei_extras_mit_variant_kollidieren_nicht(store: SqliteStore) -> None:
+    """Handbuch und Soundtrack sind getrennte Slots - sonst prunt eins das andere."""
+    files = [
+        remote(EXTRA_HANDBUCH, "same", version=None, filename="handbuch.pdf"),
+        remote(EXTRA_SOUNDTRACK, "same", version=None, filename="ost.zip"),
+    ]
+    store.replace_remote(PRODUCT_ID, files, SEEN_1)
+
+    assert len(store.entries(PRODUCT_ID)) == 2
+
+    handbuch = store.entries_for_slot(EXTRA_HANDBUCH)
+    soundtrack = store.entries_for_slot(EXTRA_SOUNDTRACK)
+    assert len(handbuch) == 1 and len(soundtrack) == 1
+    assert handbuch[0].slot == EXTRA_HANDBUCH
+    assert handbuch[0].slot.variant == "handbuch"
+    assert handbuch[0].filename == "handbuch.pdf"
+    assert soundtrack[0].slot == EXTRA_SOUNDTRACK
+    assert soundtrack[0].slot.variant == "soundtrack"
+    assert soundtrack[0].filename == "ost.zip"
+
+    # Der variantenlose Slot ist ein dritter, eigener Schlüssel.
+    assert store.entries_for_slot(EXTRA_SLOT) == []
+
+    # ``variant`` überlebt auch den vollen Schreibweg.
+    entry = handbuch[0]
+    entry.state = LocalState.COMPLETE
+    entry.relative_path = "Spiel/extras/handbuch.pdf"
+    store.update_entry(entry)
+
+    assert len(store.entries(PRODUCT_ID)) == 2, "update_entry darf nicht doppeln"
+    wieder = store.entries_for_slot(EXTRA_HANDBUCH)
+    assert len(wieder) == 1
+    assert wieder[0].slot.variant == "handbuch"
+    assert wieder[0].state is LocalState.COMPLETE
+
+
+def test_dlc_of_ueberlebt_roundtrip_und_update(store: SqliteStore) -> None:
+    files = [
+        remote(dlc_of=99),
+        remote(EXTRA_SLOT, "x1", version=None, dlc_of=None),
+    ]
+    store.replace_remote(PRODUCT_ID, files, SEEN_1)
+
+    dlc = only(store.entries(), "f1")
+    assert dlc.dlc_of == 99
+    assert only(store.entries(), "x1").dlc_of is None
+
+    dlc.state = LocalState.COMPLETE
+    dlc.relative_path = "Spiel/dlc.exe"
+    store.update_entry(dlc)
+    assert only(store.entries(), "f1").dlc_of == 99
+
+    # Auch ein weiterer Remote-Lauf hält die Zuordnung.
+    store.replace_remote(PRODUCT_ID, files, SEEN_2)
+    assert only(store.entries(), "f1").dlc_of == 99
+
+    # Und eine aufgelöste Zuordnung wird übernommen, nicht konserviert.
+    store.replace_remote(PRODUCT_ID, [remote(dlc_of=None)], SEEN_3)
+    assert only(store.entries(), "f1").dlc_of is None
+
+
 def test_zwei_sprachslots_kollidieren_nicht(store: SqliteStore) -> None:
     """Gleiche file_id, anderer Slot — beides muss nebeneinander bestehen."""
     files = [
@@ -347,6 +521,159 @@ def test_pragmas_und_schemaversion(tmp_path) -> None:
         assert again._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     finally:
         again.close()
+
+
+SCHEMA_V1_ALT = """
+CREATE TABLE products (
+    product_id  INTEGER PRIMARY KEY,
+    title       TEXT    NOT NULL,
+    slug        TEXT    NOT NULL,
+    has_updates INTEGER NOT NULL DEFAULT 0,
+    is_new      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE files (
+    slot_key          TEXT    NOT NULL,
+    file_id           TEXT    NOT NULL,
+    product_id        INTEGER NOT NULL,
+    kind              TEXT    NOT NULL,
+    os                TEXT,
+    language          TEXT,
+    filename          TEXT    NOT NULL DEFAULT '',
+    version           TEXT,
+    size              INTEGER,
+    md5               TEXT,
+    downlink          TEXT    NOT NULL DEFAULT '',
+    part_index        INTEGER NOT NULL DEFAULT 1,
+    total_parts       INTEGER NOT NULL DEFAULT 1,
+    relative_path     TEXT    NOT NULL DEFAULT '',
+    state             TEXT    NOT NULL DEFAULT 'missing',
+    bytes_done        INTEGER NOT NULL DEFAULT 0,
+    last_seen_utc     TEXT,
+    last_verified_utc TEXT,
+    PRIMARY KEY (slot_key, file_id)
+);
+
+CREATE INDEX idx_files_product ON files(product_id);
+CREATE INDEX idx_files_state   ON files(state);
+"""
+"""Schema 1 wörtlich: ohne ``variant``, ohne ``dlc_of``."""
+
+# Schlüssel im alten Format: ohne Platzhalter für fehlende os/language.
+ALTE_ZEILEN = [
+    (
+        "4242/installer/windows/en", "f1", 4242, "installer", "windows", "en",
+        "setup.exe", "1.0.0", 1000, "aaaa", "/downlink/f1", 1, 1,
+        "Spiel/setup.exe", "complete", 1000, SEEN_1, SEEN_1,
+    ),
+    (
+        "4242/extra", "x1", 4242, "extra", None, None,
+        "handbuch.pdf", None, 50, None, "/downlink/x1", 1, 1,
+        "", "missing", 0, SEEN_1, None,
+    ),
+    (
+        "4242/patch/windows", "p1", 4242, "patch", "windows", None,
+        "patch.exe", "1.0.1", 20, None, "/downlink/p1", 1, 1,
+        "Spiel/patch.exe.part", "partial", 5, SEEN_1, None,
+    ),
+]
+
+
+def _lege_alte_datenbank_an(db_path) -> None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(SCHEMA_V1_ALT)
+        conn.executemany(
+            "INSERT INTO files (slot_key, file_id, product_id, kind, os, language, "
+            "filename, version, size, md5, downlink, part_index, total_parts, "
+            "relative_path, state, bytes_done, last_seen_utc, last_verified_utc) "
+            "VALUES (" + ", ".join("?" * 18) + ")",
+            ALTE_ZEILEN,
+        )
+        conn.execute(
+            "INSERT INTO products (product_id, title, slug, has_updates, is_new) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (PRODUCT_ID, "Spiel", "spiel", 1, 0),
+        )
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_migration_von_schema_1_auf_2(tmp_path) -> None:
+    """Bestand bleibt, Spalten kommen dazu, ``slot_key`` wird neu berechnet."""
+    db_path = tmp_path / "alt.sqlite3"
+    _lege_alte_datenbank_an(db_path)
+
+    store = SqliteStore(db_path)
+    try:
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+
+        entries = store.entries()
+        assert {e.file_id for e in entries} == {"f1", "x1", "p1"}
+        assert store.products() == [
+            ProductRef(PRODUCT_ID, "Spiel", "spiel", has_updates=True)
+        ]
+
+        # Kein Feld ist unterwegs verloren gegangen.
+        installer = only(entries, "f1")
+        assert installer.slot == INSTALLER_EN
+        assert installer.state is LocalState.COMPLETE
+        assert installer.relative_path == "Spiel/setup.exe"
+        assert installer.bytes_done == 1000
+        assert installer.md5 == "aaaa"
+        assert installer.last_verified_utc == SEEN_1
+        assert installer.is_verified_complete
+
+        patch = only(entries, "p1")
+        assert patch.slot == PATCH_WIN
+        assert patch.state is LocalState.PARTIAL
+        assert patch.bytes_done == 5
+
+        # Die neuen Spalten existieren und sind für Altbestand leer.
+        assert all(e.dlc_of is None for e in entries)
+        assert all(e.slot.variant is None for e in entries)
+
+        # Jeder gespeicherte Schlüssel entspricht wieder ``as_str()`` ...
+        gespeichert = {
+            row["file_id"]: row["slot_key"]
+            for row in store._conn.execute("SELECT file_id, slot_key FROM files")
+        }
+        assert gespeichert == {e.file_id: e.slot.as_str() for e in entries}
+        # ... und für die Zeilen ohne os/language ist das ein anderer als vorher.
+        assert gespeichert["x1"] != "4242/extra"
+        assert gespeichert["p1"] != "4242/patch/windows"
+        assert gespeichert["f1"] == "4242/installer/windows/en"
+
+        # Entscheidend: der Slot findet seine Dateien wieder.
+        for entry in entries:
+            assert [e.file_id for e in store.entries_for_slot(entry.slot)] == [
+                entry.file_id
+            ]
+
+        # Und der migrierte Schlüssel trägt durch den UPSERT, ohne zu doppeln.
+        patch.state = LocalState.COMPLETE
+        patch.relative_path = "Spiel/patch.exe"
+        store.update_entry(patch)
+        assert len(store.entries()) == 3
+        assert only(store.entries(), "p1").state is LocalState.COMPLETE
+
+        store.replace_remote(
+            PRODUCT_ID, [remote(EXTRA_SLOT, "x1", version=None, md5=None)], SEEN_2
+        )
+        assert len(store.entries()) == 3, "replace_remote trifft die migrierte Zeile"
+        assert only(store.entries(), "x1").last_seen_utc == SEEN_2
+    finally:
+        store.close()
+
+    # Ein zweites Öffnen migriert nicht noch einmal.
+    wieder = SqliteStore(db_path)
+    try:
+        assert wieder._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        assert {e.file_id for e in wieder.entries()} == {"f1", "x1", "p1"}
+    finally:
+        wieder.close()
 
 
 def test_zugriff_nach_close_meldet_storeerror(tmp_path) -> None:

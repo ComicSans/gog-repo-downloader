@@ -247,12 +247,80 @@ class Report:
 
 
 @dataclass(frozen=True)
+class Preference:
+    """Geordnete Auswahl mit Rückfallebenen.
+
+    Jede Ebene ist eine Menge gleichrangiger Werte. Ausgewählt wird alles
+    Vorhandene der ersten Ebene, die überhaupt etwas liefert; erst wenn eine
+    Ebene leer ausgeht, kommt die nächste zum Zug. Damit lassen sich beide
+    Wünsche in einer Notation ausdrücken:
+
+    * ``de,en`` -> [{de}, {en}]: deutsch, und nur falls es das nicht gibt,
+      englisch.
+    * ``linux+mac`` -> [{linux, mac}]: beide Plattformen, Windows nicht.
+    * ``de+en,fr`` -> [{de, en}, {fr}]: deutsch und englisch, ersatzweise
+      französisch.
+
+    Die Entscheidung fällt pro Auslieferung, nicht global: ein Spiel kann auf
+    einer Plattform deutsch anbieten und auf einer anderen nur englisch.
+    """
+
+    levels: tuple[frozenset[str], ...] = ()
+
+    @staticmethod
+    def parse(text: str | None, default: "Preference | None" = None) -> "Preference":
+        """``"de+en,fr"`` einlesen. Komma trennt Ebenen, Plus verbindet."""
+        if not text or not text.strip():
+            return default if default is not None else Preference()
+        levels = []
+        for chunk in text.split(","):
+            values = {part.strip().lower() for part in chunk.split("+") if part.strip()}
+            if values:
+                levels.append(frozenset(values))
+        return Preference(tuple(levels))
+
+    @staticmethod
+    def of(*values: str) -> "Preference":
+        """Eine einzelne Ebene aus gleichrangigen Werten."""
+        return Preference((frozenset(v.lower() for v in values),))
+
+    def select(self, available: "Iterable[str]") -> frozenset[str]:
+        """Aus dem tatsächlich Vorhandenen auswählen.
+
+        Leere Präferenz heißt "keine Einschränkung": dann kommt alles durch.
+        """
+        pool = {value.lower() for value in available}
+        if not self.levels:
+            return frozenset(pool)
+        for level in self.levels:
+            hit = pool & level
+            if hit:
+                return frozenset(hit)
+        return frozenset()
+
+    @property
+    def all_values(self) -> frozenset[str]:
+        """Alle genannten Werte über alle Ebenen hinweg."""
+        return frozenset().union(*self.levels) if self.levels else frozenset()
+
+    def __bool__(self) -> bool:
+        return bool(self.levels)
+
+    def as_str(self) -> str:
+        return ",".join("+".join(sorted(level)) for level in self.levels)
+
+
+@dataclass(frozen=True)
 class SyncConfig:
     """Filter und Verhaltensschalter für die Planung."""
 
     dest: Path
     os_filter: frozenset[OsName] = field(default_factory=lambda: frozenset({OsName.current()}))
     languages: frozenset[str] = field(default_factory=lambda: frozenset({"en"}))
+    os_preference: Preference = field(default_factory=Preference)
+    """Plattformwahl mit Rückfallebenen. Leer heißt: ``os_filter`` gilt."""
+    language_preference: Preference = field(default_factory=Preference)
+    """Sprachwahl mit Rückfallebenen. Leer heißt: ``languages`` gilt."""
     include_dlc: bool = True
     include_extras: bool = False
     include_patches: bool = False

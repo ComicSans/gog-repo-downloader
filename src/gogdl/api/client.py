@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import posixpath
+import re
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Iterable
 from email.utils import parsedate_to_datetime
@@ -75,6 +76,43 @@ def _as_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+_WHITESPACE = re.compile(r"\s+")
+_VARIANT_FORBIDDEN = re.compile(r"[^a-z0-9._-]")
+
+
+def _normalize_variant(raw: Any) -> str:
+    """Diskriminator auf eine stabile, dateinamentaugliche Form bringen.
+
+    Reihenfolge ist wichtig: erst kleinschreiben, dann Leerraum zu ``-``,
+    erst danach filtern. Andersherum würde aus "Game Soundtrack" ein
+    "gamesoundtrack" statt "game-soundtrack".
+
+    Die Regel muss über Läufe hinweg dasselbe Ergebnis liefern - sie darf
+    deshalb weder von Reihenfolge noch von Zählern abhängen, sonst gilt
+    beim nächsten Update jeder Slot als neu.
+    """
+    if raw is None or isinstance(raw, bool):
+        return ""
+    text = _WHITESPACE.sub("-", str(raw).strip().lower())
+    return _VARIANT_FORBIDDEN.sub("", text)
+
+
+def _pick_variant(candidates: Iterable[Any], entry_id: Any) -> str | None:
+    """Ersten brauchbaren Diskriminator wählen, sonst auf die id zurückfallen.
+
+    Liefert ``None``, wenn auch die id nichts hergibt. Dann teilen sich
+    mehrere Einträge einen Slot; ``_collect_group`` meldet das.
+    """
+    for candidate in candidates:
+        normalized = _normalize_variant(candidate)
+        if normalized:
+            return normalized
+    normalized = _normalize_variant(entry_id)
+    if normalized:
+        return normalized
+    return str(entry_id) if entry_id is not None else None
 
 
 def _retry_after_seconds(raw: str | None) -> float | None:
@@ -188,6 +226,7 @@ class GogApiClient:
         self._collect_product(
             payload,
             product_id=product_id,
+            root_id=product_id,
             include_dlc=include_dlc,
             out=out,
             visited=set(),
@@ -260,26 +299,39 @@ class GogApiClient:
         payload: Any,
         *,
         product_id: int,
+        root_id: int,
         include_dlc: bool,
         out: list[RemoteFile],
         visited: set[int],
         seen_slots: set[SlotKey],
     ) -> None:
-        """Ein Produkt und — rekursiv — seine DLCs einsammeln."""
+        """Ein Produkt und - rekursiv - seine DLCs einsammeln.
+
+        ``root_id`` ist immer das ursprünglich angefragte Hauptprodukt und
+        wird in der Rekursion nie neu gesetzt. Auch ein DLC im DLC zeigt
+        deshalb per ``dlc_of`` auf das Hauptspiel, nicht auf sein
+        unmittelbares Elternprodukt.
+        """
         if not isinstance(payload, dict) or product_id in visited:
             return
         visited.add(product_id)
 
+        dlc_of = root_id if product_id != root_id else None
         downloads = payload.get("downloads")
         if isinstance(downloads, dict):
             self._collect_group(
-                downloads.get("installers"), FileKind.INSTALLER, product_id, out, seen_slots
+                downloads.get("installers"),
+                FileKind.INSTALLER,
+                product_id,
+                out,
+                seen_slots,
+                dlc_of,
             )
             self._collect_group(
-                downloads.get("patches"), FileKind.PATCH, product_id, out, seen_slots
+                downloads.get("patches"), FileKind.PATCH, product_id, out, seen_slots, dlc_of
             )
             self._collect_group(
-                downloads.get("bonus_content"), FileKind.EXTRA, product_id, out, seen_slots
+                downloads.get("bonus_content"), FileKind.EXTRA, product_id, out, seen_slots, dlc_of
             )
 
         if not include_dlc:
@@ -294,6 +346,7 @@ class GogApiClient:
             self._collect_product(
                 dlc,
                 product_id=dlc_id,
+                root_id=root_id,
                 include_dlc=include_dlc,
                 out=out,
                 visited=visited,
@@ -307,32 +360,51 @@ class GogApiClient:
         product_id: int,
         out: list[RemoteFile],
         seen_slots: set[SlotKey],
+        dlc_of: int | None = None,
     ) -> None:
-        """Eine Liste (installers/patches/bonus_content) in RemoteFiles übersetzen."""
+        """Eine Liste (installers/patches/bonus_content) in RemoteFiles übersetzen.
+
+        ``variant`` trennt hier die Auslieferungen, die sich sonst einen
+        Slot teilen würden (KONZEPT.md §5.5): Extras haben weder Plattform
+        noch Sprache, und GOG bietet pro Plattform/Sprache mehrere Patches
+        mit verschiedenen Versionsspannen an. Installer brauchen es nicht.
+        """
         if not isinstance(entries, Iterable) or isinstance(entries, (str, bytes, dict)):
             return
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
+            entry_id = entry.get("id")
+            variant: str | None = None
             if kind is FileKind.EXTRA:
                 # Extras sind weder OS- noch sprachgebunden.
                 os_name: OsName | None = None
                 language: str | None = None
+                # Sprechender Diskriminator: type vor name vor id.
+                variant = _pick_variant((entry.get("type"), entry.get("name")), entry_id)
             else:
                 os_name = self._map_os(entry.get("os"))
                 if os_name is None:
                     continue
                 language = str(entry.get("language")) if entry.get("language") else None
             version = str(entry.get("version")) if entry.get("version") else None
+            if kind is FileKind.PATCH:
+                # Die Versionsspanne ist die Auslieferung; ohne sie die id.
+                variant = _pick_variant((version,), entry_id)
 
             parts = entry.get("files")
             if not isinstance(parts, list) or not parts:
                 continue
-            slot = SlotKey(product_id=product_id, kind=kind, os=os_name, language=language)
-            if slot in seen_slots and kind is FileKind.INSTALLER:
+            slot = SlotKey(
+                product_id=product_id,
+                kind=kind,
+                os=os_name,
+                language=language,
+                variant=variant,
+            )
+            if slot in seen_slots:
                 _LOG.warning(
-                    "Zwei Installer-Einträge teilen den Slot %s — Prune sieht sie als eine "
-                    "Auslieferung",
+                    "Zwei Einträge teilen den Slot %s - Prune sieht sie als eine Auslieferung",
                     slot.as_str(),
                 )
             seen_slots.add(slot)
@@ -355,6 +427,7 @@ class GogApiClient:
                         version=version,
                         part_index=index,
                         total_parts=total_parts,
+                        dlc_of=dlc_of,
                     )
                 )
 

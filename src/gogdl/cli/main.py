@@ -83,9 +83,21 @@ def _add_selection(parser: argparse.ArgumentParser) -> None:
 
 def _add_filters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--os", help="windows,linux,mac oder all (Default: nur die laufende Plattform)"
+        "--os",
+        help=(
+            "Plattformen. Komma heißt 'sonst', Plus heißt 'und': "
+            "'linux+mac' lädt beide, 'mac,windows' nimmt Windows nur, wenn es "
+            "keine Mac-Fassung gibt. 'all' hebt die Auswahl auf. "
+            "Default: nur die laufende Plattform"
+        ),
     )
-    parser.add_argument("--lang", help=f"Sprachen. {_FILTER_HELP}")
+    parser.add_argument(
+        "--lang",
+        help=(
+            "Sprachen, gleiche Schreibweise wie --os: 'de,en' nimmt Deutsch "
+            "und nur ersatzweise Englisch, 'de+en' beides. Default: en"
+        ),
+    )
     parser.add_argument("--dlc", action="store_true", default=True, help="DLC einschließen (Default)")
     parser.add_argument("--no-dlc", dest="dlc", action="store_false")
     parser.add_argument("--extras", action="store_true", default=False, help="Extras einschließen")

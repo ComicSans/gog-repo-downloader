@@ -89,9 +89,11 @@ class HttpDownloader:
     ``resolve_downlink``).
 
     Hinweis zum Fortschritt: ``start_file`` wird genau einmal pro Datei
-    gerufen. Muss eine ``.part`` verworfen werden, summiert sich ``advance``
-    danach über die Dateigröße hinaus — das ist gewollt, denn die Bytes sind
-    tatsächlich zweimal geflossen. ``start_overall``/``close`` ruft der
+    gerufen; das dabei zurückgegebene Handle geht an jedes ``advance`` und
+    an ``finish_file`` zurück, damit parallele Downloads ihre Bytes nicht
+    gegenseitig zurechnen. Muss eine ``.part`` verworfen werden, summiert
+    sich ``advance`` danach über die Dateigröße hinaus - das ist gewollt,
+    denn die Bytes sind tatsächlich zweimal geflossen. ``start_overall``/``close`` ruft der
     Aufrufer, nicht dieses Modul.
     """
 
@@ -144,22 +146,25 @@ class HttpDownloader:
                 restarted = True
         except OSError as exc:
             message = f"Dateisystemfehler: {exc}"
-            reporter.start_file(name, expected, 0)
-            reporter.finish_file(name, False, message)
+            progress_handle = reporter.start_file(name, expected, 0)
+            reporter.finish_file(name, False, message, handle=progress_handle)
             return self._failure(item, 0, restarted, message)
 
-        reporter.start_file(name, expected, resume_from)
+        # Das Handle gehört genau dieser Datei und geht an jedes ``advance``
+        # zurück. Ohne es rechnen bei ``--jobs 2`` zwei gleichzeitige
+        # Downloads ihre Bytes gegenseitig der falschen Zeile zu.
+        progress_handle = reporter.start_file(name, expected, resume_from)
         try:
-            result = await self._run(item, reporter, resume_from, restarted)
+            result = await self._run(item, reporter, progress_handle, resume_from, restarted)
         except RangeNotHonoredError as exc:
             self._discard(part)
-            reporter.finish_file(name, False, str(exc))
+            reporter.finish_file(name, False, str(exc), handle=progress_handle)
             raise
         except OSError as exc:
             # Volle Platte, fehlende Rechte: ein Lauf über viele Dateien soll
             # daran nicht sterben. Die ``.part`` bleibt liegen.
             result = self._failure(item, 0, restarted, f"Dateisystemfehler: {exc}")
-        reporter.finish_file(name, result.ok, result.error or "")
+        reporter.finish_file(name, result.ok, result.error or "", handle=progress_handle)
         return result
 
     # ------------------------------------------------------------- Ablauf
@@ -168,6 +173,7 @@ class HttpDownloader:
         self,
         item: DownloadItem,
         reporter: ProgressReporter,
+        progress_handle: object,
         resume_from: int,
         restarted: bool,
     ) -> DownloadResult:
@@ -264,7 +270,7 @@ class HttpDownloader:
 
                     hasher = self._make_hasher(entry.md5, part, resume_from)
                     written += await self._stream_to_part(
-                        response, part, resume_from, hasher, reporter
+                        response, part, resume_from, hasher, reporter, progress_handle
                     )
                     digest = hasher.hexdigest() if hasher is not None else None
             except httpx.HTTPError as exc:
@@ -290,8 +296,13 @@ class HttpDownloader:
         resume_from: int,
         hasher: Any,
         reporter: ProgressReporter,
+        progress_handle: object = None,
     ) -> int:
-        """Schreibt den Body nach ``.part`` und meldet jeden Chunk."""
+        """Schreibt den Body nach ``.part`` und meldet jeden Chunk.
+
+        ``progress_handle`` stammt aus ``start_file`` und ordnet die Bytes
+        der richtigen Datei zu; ``handle`` ist hier die offene ``.part``.
+        """
         written = 0
         started = time.monotonic()
         if resume_from > 0:
@@ -308,7 +319,7 @@ class HttpDownloader:
                 if hasher is not None:
                     hasher.update(chunk)
                 written += len(chunk)
-                reporter.advance(len(chunk))
+                reporter.advance(len(chunk), progress_handle)
                 await self._throttle(written, started)
         finally:
             handle.close()

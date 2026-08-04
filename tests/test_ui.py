@@ -58,6 +58,22 @@ def lines(stream: io.StringIO) -> list[str]:
     return [line for line in stream.getvalue().splitlines() if line.strip()]
 
 
+def plain_done(reporter: PlainReporter, handle: object) -> int:
+    """Bytes, die der PlainReporter dieser Datei zugerechnet hat."""
+    return reporter._files[handle.id].done  # type: ignore[attr-defined]
+
+
+def rich_done(reporter: RichReporter, handle: object) -> float:
+    """Bytes, die der RichReporter der Zeile dieser Datei zugerechnet hat."""
+    task_id = reporter._files[handle.id].task  # type: ignore[attr-defined]
+    return next(task for task in reporter._progress.tasks if task.id == task_id).completed
+
+
+def rich_rows(reporter: RichReporter) -> list[str]:
+    """Zeilenarten der Anzeige in Anzeigereihenfolge."""
+    return [str(task.fields.get("row")) for task in reporter._progress.tasks]
+
+
 # --------------------------------------------------------------------------
 # make_reporter
 # --------------------------------------------------------------------------
@@ -273,6 +289,235 @@ def test_plain_zaehlt_fehler_in_der_abschlusszeile() -> None:
     summary = [line for line in lines(stream) if line.startswith("Fertig:")][0]
     assert "1/2 Dateien" in summary
     assert "1 Fehler" in summary
+
+
+# --------------------------------------------------------------------------
+# Handles: parallele Dateien (KONZEPT.md §5.4, ``--jobs`` > 1)
+# --------------------------------------------------------------------------
+
+
+def test_plain_zwei_gleichzeitige_dateien_zaehlen_getrennt() -> None:
+    """Der Kern des Handle-Vertrags: verschränkte advance-Aufrufe.
+
+    Ignoriert ``advance`` das Handle und bucht stattdessen auf die zuletzt
+    begonnene Datei, landen alle Bytes bei ``b.bin`` und dieser Test fällt.
+    """
+    stream = FakeStream()
+    reporter = PlainReporter(stream, clock=FakeClock())
+    reporter.start_overall(2, 300)
+    a = reporter.start_file("a.bin", 100)
+    b = reporter.start_file("b.bin", 200)
+
+    reporter.advance(10, a)
+    reporter.advance(20, b)
+    reporter.advance(30, a)
+    reporter.advance(40, b)
+
+    assert plain_done(reporter, a) == 40
+    assert plain_done(reporter, b) == 60
+    assert reporter._bytes_done == 100  # Gesamtfortschritt ist die Summe
+
+
+def test_rich_zwei_gleichzeitige_dateien_zaehlen_getrennt() -> None:
+    reporter, _ = rich_reporter()
+    reporter.start_overall(2, 300)
+    a = reporter.start_file("a.bin", 100)
+    b = reporter.start_file("b.bin", 200)
+
+    reporter.advance(10, a)
+    reporter.advance(20, b)
+    reporter.advance(30, a)
+    reporter.advance(40, b)
+
+    assert rich_done(reporter, a) == 40
+    assert rich_done(reporter, b) == 60
+    overall = next(t for t in reporter._progress.tasks if t.fields.get("row") == "overall")
+    assert overall.completed == 100
+    assert reporter._bytes_done == 100
+    reporter.close()
+
+
+def test_plain_advance_ohne_handle_bucht_auf_die_zuletzt_begonnene_datei() -> None:
+    stream = FakeStream()
+    reporter = PlainReporter(stream, clock=FakeClock())
+    reporter.start_overall(2, 300)
+    a = reporter.start_file("a.bin", 100)
+    b = reporter.start_file("b.bin", 200)
+
+    reporter.advance(25)
+
+    assert plain_done(reporter, a) == 0
+    assert plain_done(reporter, b) == 25
+
+
+def test_rich_advance_ohne_handle_bucht_auf_die_zuletzt_begonnene_datei() -> None:
+    reporter, _ = rich_reporter()
+    reporter.start_overall(2, 300)
+    a = reporter.start_file("a.bin", 100)
+    b = reporter.start_file("b.bin", 200)
+
+    reporter.advance(25)
+
+    assert rich_done(reporter, a) == 0
+    assert rich_done(reporter, b) == 25
+    reporter.close()
+
+
+def test_plain_unbekanntes_und_veraltetes_handle_werfen_nicht() -> None:
+    stream = FakeStream()
+    reporter = PlainReporter(stream, clock=FakeClock())
+    reporter.start_overall(2, 300)
+    a = reporter.start_file("a.bin", 100)
+    b = reporter.start_file("b.bin", 200)
+    reporter.finish_file("a.bin", ok=True, handle=a)
+
+    reporter.advance(7, a)  # veraltet: die Datei ist schon abgeschlossen
+    reporter.advance(9, object())  # fremdes Objekt
+    reporter.finish_file("a.bin", ok=True, handle=a)  # doppelter Abschluss
+
+    assert plain_done(reporter, b) == 0  # nichts landet bei der falschen Datei
+    assert reporter._bytes_done == 16  # die Bytes sind trotzdem geflossen
+    reporter.close()
+    assert "Fertig:" in stream.getvalue()
+
+
+def test_rich_unbekanntes_und_veraltetes_handle_werfen_nicht() -> None:
+    reporter, stream = rich_reporter()
+    reporter.start_overall(2, 300)
+    a = reporter.start_file("a.bin", 100)
+    b = reporter.start_file("b.bin", 200)
+    reporter.finish_file("a.bin", ok=True, handle=a)
+
+    reporter.advance(7, a)
+    reporter.advance(9, object())
+    reporter.finish_file("a.bin", ok=True, handle=a)
+
+    assert rich_done(reporter, b) == 0
+    assert reporter._bytes_done == 16
+    reporter.close()
+    assert "Fertig:" in stream.getvalue()
+
+
+def test_plain_finish_file_mit_handle_schliesst_genau_diesen_eintrag() -> None:
+    stream = FakeStream()
+    reporter = PlainReporter(stream, clock=FakeClock())
+    reporter.start_overall(2, 300)
+    a = reporter.start_file("a.bin", 100)
+    b = reporter.start_file("b.bin", 200)
+
+    reporter.finish_file("b.bin", ok=True, handle=b)
+    reporter.advance(5)  # ohne Handle: die einzige noch offene Datei ist a
+
+    assert plain_done(reporter, a) == 5
+    assert any("OK b.bin" in line for line in lines(stream))
+
+
+def test_rich_finish_file_mit_handle_entfernt_genau_diese_zeile() -> None:
+    reporter, _ = rich_reporter()
+    reporter.start_overall(2, 300)
+    a = reporter.start_file("a.bin", 100)
+    b = reporter.start_file("b.bin", 200)
+    assert rich_rows(reporter) == ["overall", "file", "file"]
+
+    reporter.finish_file("b.bin", ok=True, handle=b)
+
+    # Die Gesamtzeile bleibt oben, nur die Zeile von b verschwindet.
+    assert rich_rows(reporter) == ["overall", "file"]
+    assert rich_done(reporter, a) == 0
+    reporter.advance(5, a)
+    assert rich_done(reporter, a) == 5
+    reporter.close()
+
+
+def test_plain_finish_file_trifft_bei_gleichem_namen_das_richtige_handle() -> None:
+    """Zwei Slots liefern oft denselben Dateinamen - nur das Handle trennt sie.
+
+    Löst ``finish_file`` über den Namen statt über das Handle auf, wird die
+    falsche (zweite) Datei geschlossen und ``plain_done`` findet sie nicht
+    mehr.
+    """
+    stream = FakeStream()
+    reporter = PlainReporter(stream, clock=FakeClock())
+    reporter.start_overall(2, 300)
+    a = reporter.start_file("setup.bin", 100)
+    b = reporter.start_file("setup.bin", 200)
+
+    reporter.advance(10, a)
+    reporter.finish_file("setup.bin", ok=True, handle=a)
+    reporter.advance(5)  # ohne Handle: b ist die einzige noch offene Datei
+
+    assert plain_done(reporter, b) == 5
+    assert a.id not in reporter._files  # type: ignore[attr-defined]
+
+
+def test_rich_finish_file_trifft_bei_gleichem_namen_das_richtige_handle() -> None:
+    reporter, _ = rich_reporter()
+    reporter.start_overall(2, 300)
+    a = reporter.start_file("setup.bin", 100)
+    b = reporter.start_file("setup.bin", 200)
+
+    reporter.advance(10, a)
+    reporter.finish_file("setup.bin", ok=True, handle=a)
+    reporter.advance(5)
+
+    assert rich_rows(reporter) == ["overall", "file"]
+    assert rich_done(reporter, b) == 5
+    assert a.id not in reporter._files  # type: ignore[attr-defined]
+    reporter.close()
+
+
+def test_rich_gesamtzeile_bleibt_oben_auch_wenn_start_file_zuerst_kommt() -> None:
+    reporter, _ = rich_reporter()
+    reporter.start_file("a.bin", 100)
+    reporter.start_overall(1, 100)
+
+    assert rich_rows(reporter)[0] == "overall"
+    reporter.close()
+
+
+def test_plain_drosselung_gilt_pro_datei() -> None:
+    """Eine schnelle Datei darf die Meldung einer zweiten nicht verschlucken."""
+    mb = 1024 * 1024
+    stream = FakeStream()
+    clock = FakeClock()
+    reporter = PlainReporter(stream, clock=clock, min_interval=10.0, min_percent=10.0)
+    reporter.start_overall(2, 200 * mb)
+    a = reporter.start_file("a.bin", 100 * mb)
+    b = reporter.start_file("b.bin", 100 * mb)
+    before = len(lines(stream))
+
+    clock.tick(30.0)
+    reporter.advance(50 * mb, a)
+    reporter.advance(50 * mb, b)  # ohne weiteren Takt der Uhr
+
+    out = lines(stream)[before:]
+    assert len(out) == 2  # eine gemeinsame Drossel hätte b verschluckt
+    assert "a.bin" in out[0]
+    assert "b.bin" in out[1]
+
+
+def test_plain_zeilen_nennen_bei_parallelen_downloads_die_datei() -> None:
+    """Ein Cron-Log muss auch bei ``--jobs 2`` zuzuordnen sein."""
+    stream = FakeStream()
+    clock = FakeClock()
+    reporter = PlainReporter(stream, clock=clock, min_interval=1.0, min_percent=1.0)
+    reporter.start_overall(2, 200)
+    a = reporter.start_file("a.bin", 100)
+    b = reporter.start_file("b.bin", 100)
+    clock.tick(5.0)
+    reporter.advance(50, a)
+    reporter.advance(50, b)
+    reporter.finish_file("a.bin", ok=False, detail="Timeout", handle=a)
+    reporter.finish_file("b.bin", ok=True, handle=b)
+    reporter.close()
+
+    out = lines(stream)
+    assert ANSI not in stream.getvalue()
+    # Jede Zeile außer Start- und Abschlussmeldung nennt ihre Datei.
+    for line in out:
+        if line.startswith("Start:") or line.startswith("Fertig:"):
+            continue
+        assert "a.bin" in line or "b.bin" in line
 
 
 # --------------------------------------------------------------------------

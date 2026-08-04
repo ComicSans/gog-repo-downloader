@@ -47,28 +47,52 @@ class FakeApi:
         return ResolvedLink(url=url, filename="setup.bin")
 
 
+class FakeHandle:
+    """Undurchsichtiges Handle der Attrappe - nur die Identität zählt."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
 class FakeReporter:
-    """``ProgressReporter``-Attrappe. ``start_overall``/``close`` sind verboten."""
+    """``ProgressReporter``-Attrappe. ``start_overall``/``close`` sind verboten.
+
+    Protokolliert zusätzlich, mit welchem Handle jeder Aufruf kam: nur so
+    lässt sich prüfen, dass die Engine das Handle aus ``start_file``
+    wirklich durchreicht.
+    """
 
     def __init__(self) -> None:
         self.started: list[tuple[str, int | None, int]] = []
         self.advanced: list[int] = []
         self.finished: list[tuple[str, bool, str]] = []
         self.messages: list[str] = []
+        self.handles: list[FakeHandle] = []
+        self.advance_handles: list[object] = []
+        self.finish_handles: list[object] = []
         self.overall_calls = 0
         self.close_calls = 0
 
     def start_overall(self, total_files: int, total_bytes: int) -> None:
         self.overall_calls += 1
 
-    def start_file(self, name: str, total_bytes: int | None, already_done: int = 0) -> None:
+    def start_file(
+        self, name: str, total_bytes: int | None, already_done: int = 0
+    ) -> object:
         self.started.append((name, total_bytes, already_done))
+        handle = FakeHandle(name)
+        self.handles.append(handle)
+        return handle
 
-    def advance(self, n_bytes: int) -> None:
+    def advance(self, n_bytes: int, handle: object | None = None) -> None:
         self.advanced.append(n_bytes)
+        self.advance_handles.append(handle)
 
-    def finish_file(self, name: str, ok: bool, detail: str = "") -> None:
+    def finish_file(
+        self, name: str, ok: bool, detail: str = "", handle: object | None = None
+    ) -> None:
         self.finished.append((name, ok, detail))
+        self.finish_handles.append(handle)
 
     def message(self, text: str) -> None:
         self.messages.append(text)
@@ -404,6 +428,92 @@ async def test_repeated_range_rejection_raises(tmp_path):
     assert not item.part_path.exists()  # Teildatei verworfen
     assert not item.target.exists()
     assert reporter.finished and reporter.finished[-1][1] is False
+
+
+# --------------------------------------------------------------------------
+# Fortschritts-Handle
+# --------------------------------------------------------------------------
+
+
+async def test_handle_aus_start_file_geht_an_jeden_advance(tmp_path):
+    """Ohne durchgereichtes Handle verbucht ``--jobs 2`` Bytes bei der falschen Datei."""
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    item = make_item(tmp_path, md5=BODY_MD5)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=BODY)
+
+    downloader = make_downloader(handler, api, sleep, chunk_size=16)
+    result = await downloader.fetch(item, reporter)
+
+    assert result.ok
+    assert len(reporter.handles) == 1  # genau ein ``start_file`` pro Datei
+    handle = reporter.handles[0]
+    assert len(reporter.advance_handles) > 1  # mehrere Chunks, sonst sagt der Test nichts
+    assert all(h is handle for h in reporter.advance_handles)
+    assert reporter.finish_handles == [handle]
+
+
+async def test_handle_bleibt_ueber_einen_neustart_gleich(tmp_path):
+    """Auch der verworfene Neustart meldet auf dasselbe Handle."""
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    item = make_item(tmp_path, md5=BODY_MD5)
+    item.part_path.parent.mkdir(parents=True)
+    item.part_path.write_bytes(JUNK)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=BODY)  # Range wird ignoriert
+
+    downloader = make_downloader(handler, api, sleep, chunk_size=16)
+    result = await downloader.fetch(item, reporter)
+
+    assert result.ok and result.restarted is True
+    assert len(reporter.handles) == 1
+    handle = reporter.handles[0]
+    assert all(h is handle for h in reporter.advance_handles)
+    assert reporter.finish_handles == [handle]
+
+
+async def test_handle_auch_im_fehlerpfad(tmp_path):
+    """``RangeNotHonoredError`` schließt dieselbe Zeile, die geöffnet wurde."""
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    item = make_item(tmp_path)
+    item.part_path.parent.mkdir(parents=True)
+    item.part_path.write_bytes(JUNK)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return httpx.Response(200, stream=FlakyStream(BODY[:50]))
+        return httpx.Response(200, content=BODY)
+
+    downloader = make_downloader(handler, api, sleep, chunk_size=25)
+    with pytest.raises(RangeNotHonoredError):
+        await downloader.fetch(item, reporter)
+
+    assert len(reporter.handles) == 1
+    assert reporter.finish_handles == [reporter.handles[0]]
+
+
+async def test_handle_auch_bei_dateisystemfehler(tmp_path):
+    """Der frühe Abbruch öffnet und schließt die Zeile mit demselben Handle."""
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    item = make_item(tmp_path)
+    # Ein Verzeichnis anstelle des ``.part``-Elternteils erzwingt den OSError.
+    blocker = item.part_path.parent
+    blocker.parent.mkdir(parents=True, exist_ok=True)
+    blocker.write_bytes(b"kein Verzeichnis")
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - nie erreicht
+        return httpx.Response(200, content=BODY)
+
+    downloader = make_downloader(handler, api, sleep)
+    result = await downloader.fetch(item, reporter)
+
+    assert result.ok is False
+    assert len(reporter.handles) == 1
+    assert reporter.finish_handles == [reporter.handles[0]]
 
 
 async def test_limit_rate_throttles(tmp_path):

@@ -231,8 +231,50 @@ async def test_patches_werden_als_patch_kind_erfasst():
     client, _ = make_client(lambda request: json_response(payload))
 
     (file,) = await client.product_files(1207658930)
-    assert file.slot == SlotKey(1207658930, FileKind.PATCH, OsName.LINUX, "en")
+    assert file.slot == SlotKey(1207658930, FileKind.PATCH, OsName.LINUX, "en", "2.0_to_2.1")
     assert file.version == "2.0_to_2.1"
+
+
+TWO_PATCHES = """
+[{"id": "en1patch0", "os": "windows", "language": "en", "version": "2.0 to 2.1",
+  "files": [{"id": "en1patch0", "size": 500, "downlink": "/dl/patch0"}]},
+ {"id": "en1patch1", "os": "windows", "language": "en", "version": "2.1 to 2.2",
+  "files": [{"id": "en1patch1", "size": 600, "downlink": "/dl/patch1"}]}]
+"""
+
+
+async def test_zwei_patches_gleicher_plattform_ergeben_zwei_slots():
+    """GOG bietet mehrere Versionsspannen pro (os, language) an - §5.5."""
+    payload = product_payload(downloads={"patches": json.loads(TWO_PATCHES)})
+    client, _ = make_client(lambda request: json_response(payload))
+
+    files = await client.product_files(1207658930)
+
+    assert len(files) == 2
+    assert {f.slot for f in files} == {
+        SlotKey(1207658930, FileKind.PATCH, OsName.WINDOWS, "en", "2.0-to-2.1"),
+        SlotKey(1207658930, FileKind.PATCH, OsName.WINDOWS, "en", "2.1-to-2.2"),
+    }
+    assert [f.version for f in files] == ["2.0 to 2.1", "2.1 to 2.2"]
+
+
+PATCH_OHNE_VERSION = """
+[{"id": "en1patch0", "os": "windows", "language": "en",
+  "files": [{"id": "a", "size": 1, "downlink": "/dl/a"}]},
+ {"id": "en1patch1", "os": "windows", "language": "en",
+  "files": [{"id": "b", "size": 2, "downlink": "/dl/b"}]}]
+"""
+
+
+async def test_patch_ohne_version_faellt_auf_die_eintrags_id_zurueck():
+    payload = product_payload(downloads={"patches": json.loads(PATCH_OHNE_VERSION)})
+    client, _ = make_client(lambda request: json_response(payload))
+
+    files = await client.product_files(1207658930)
+
+    assert [f.slot.variant for f in files] == ["en1patch0", "en1patch1"]
+    assert len({f.slot for f in files}) == 2
+    assert all(f.version is None for f in files)
 
 
 BONUS_CONTENT = """
@@ -246,11 +288,101 @@ async def test_extra_ohne_version():
     client, _ = make_client(lambda request: json_response(payload))
 
     (file,) = await client.product_files(1207658930)
-    assert file.slot == SlotKey(1207658930, FileKind.EXTRA, None, None)
+    assert file.slot == SlotKey(1207658930, FileKind.EXTRA, None, None, "manuals")
     assert file.slot.os is None and file.slot.language is None
     assert file.version is None
     assert file.file_id == "12345"
     assert file.size == 700
+
+
+TWO_EXTRAS = """
+[{"id": 12345, "name": "Handbuch (PDF)", "type": "manuals", "count": 1,
+  "files": [{"id": 12345, "size": 700, "downlink": "/dl/manual"}]},
+ {"id": 12346, "name": "Soundtrack", "type": "Game Soundtrack", "count": 1,
+  "files": [{"id": 12346, "size": 900, "downlink": "/dl/ost"}]}]
+"""
+
+
+async def test_zwei_extras_ergeben_zwei_slots():
+    """Ohne Diskriminator wären Handbuch und Soundtrack fürs Aufräumen eine
+    einzige Auslieferung - genau das verbietet §5.5."""
+    payload = product_payload(downloads={"bonus_content": json.loads(TWO_EXTRAS)})
+    client, _ = make_client(lambda request: json_response(payload))
+
+    files = await client.product_files(1207658930)
+
+    assert len(files) == 2
+    assert {f.slot for f in files} == {
+        SlotKey(1207658930, FileKind.EXTRA, None, None, "manuals"),
+        SlotKey(1207658930, FileKind.EXTRA, None, None, "game-soundtrack"),
+    }
+    assert all(f.slot.os is None and f.slot.language is None for f in files)
+
+
+EXTRA_OHNE_TYPE = """
+[{"id": 777, "name": "Avatare & Wallpaper",
+  "files": [{"id": 777, "size": 10, "downlink": "/dl/av"}]},
+ {"id": 778, "files": [{"id": 778, "size": 11, "downlink": "/dl/x"}]},
+ {"id": 779, "name": "!!!", "files": [{"id": 779, "size": 12, "downlink": "/dl/y"}]}]
+"""
+
+
+async def test_extra_diskriminator_faellt_von_type_auf_name_auf_id_zurueck():
+    payload = product_payload(downloads={"bonus_content": json.loads(EXTRA_OHNE_TYPE)})
+    client, _ = make_client(lambda request: json_response(payload))
+
+    files = await client.product_files(1207658930)
+
+    # "&" fällt weg, Leerraum wird zu "-"; leeres Ergebnis nutzt die id.
+    assert [f.slot.variant for f in files] == ["avatare--wallpaper", "778", "779"]
+    assert len({f.slot for f in files}) == 3
+
+
+async def test_mehrteiliger_extra_bleibt_ein_slot():
+    """Die Trennung nach variant darf die Bündelung der Teile nicht brechen."""
+    entry = json.loads(TWO_EXTRAS)[0]
+    entry["count"] = 2
+    entry["files"] = [
+        {"id": "manual_a", "size": 700, "downlink": "/dl/manual_a"},
+        {"id": "manual_b", "size": 300, "downlink": "/dl/manual_b"},
+    ]
+    payload = product_payload(downloads={"bonus_content": [entry]})
+    client, _ = make_client(lambda request: json_response(payload))
+
+    files = await client.product_files(1207658930)
+
+    assert len(files) == 2
+    assert {f.slot for f in files} == {SlotKey(1207658930, FileKind.EXTRA, None, None, "manuals")}
+    assert [f.part_index for f in files] == [1, 2]
+    assert [f.total_parts for f in files] == [2, 2]
+    assert [f.file_id for f in files] == ["manual_a", "manual_b"]
+
+
+async def test_variant_ist_ueber_laeufe_stabil():
+    """Der Diskriminator kommt aus der Payload, nicht aus der Reihenfolge -
+    sonst gälte beim nächsten Lauf jeder Slot als neu."""
+    eintraege = json.loads(TWO_EXTRAS)
+    payloads = [
+        product_payload(downloads={"bonus_content": eintraege}),
+        product_payload(downloads={"bonus_content": list(reversed(eintraege))}),
+    ]
+    client, _ = make_client(lambda request: json_response(payloads.pop(0)))
+
+    erster = await client.product_files(1207658930)
+    zweiter = await client.product_files(1207658930)
+
+    assert {f.slot for f in erster} == {f.slot for f in zweiter}
+    assert {f.file_id: f.slot.variant for f in erster} == {
+        f.file_id: f.slot.variant for f in zweiter
+    }
+
+
+async def test_installer_slot_bleibt_ohne_variant():
+    payload = product_payload(downloads={"installers": json.loads(TWO_LANGUAGES)})
+    client, _ = make_client(lambda request: json_response(payload))
+
+    files = await client.product_files(1207658930)
+    assert all(f.slot.variant is None for f in files)
 
 
 DLC_PAYLOAD = """
@@ -276,6 +408,22 @@ async def test_dlc_wird_rekursiv_mit_eigener_produkt_id_erfasst():
     assert dlc_files[0].slot == SlotKey(555, FileKind.INSTALLER, OsName.MAC, "en")
     assert dlc_files[0].file_id == "dlc_file"
     assert len(files) == 3
+
+
+async def test_dlc_datei_kennt_das_hauptspiel():
+    payload = product_payload(
+        downloads={"installers": json.loads(TWO_LANGUAGES)},
+        expanded_dlcs=json.loads(DLC_PAYLOAD),
+    )
+    client, _ = make_client(lambda request: json_response(payload))
+
+    files = await client.product_files(1207658930, include_dlc=True)
+
+    haupt = [f for f in files if f.product_id == 1207658930]
+    (dlc,) = [f for f in files if f.product_id == 555]
+    assert all(f.dlc_of is None and f.is_dlc is False for f in haupt)
+    assert dlc.dlc_of == 1207658930
+    assert dlc.is_dlc is True
 
 
 async def test_dlc_wird_bei_include_dlc_false_ausgelassen():
@@ -309,6 +457,8 @@ async def test_dlc_rekursion_geht_in_die_tiefe():
     (file,) = await client.product_files(1207658930)
     assert file.product_id == 556
     assert file.file_id == "nested"
+    # dlc_of zeigt auf das angefragte Hauptprodukt, nicht auf das Eltern-DLC 555.
+    assert file.dlc_of == 1207658930
 
 
 UNKNOWN_OS = """
