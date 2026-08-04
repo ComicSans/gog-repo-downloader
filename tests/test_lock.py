@@ -193,11 +193,15 @@ def test_status_laeuft_waehrend_die_sperre_gehalten_wird(
     dest = tmp_path.resolve()
     with dest_lock(dest):
         assert main(["status", "--dest", str(dest)]) in (0, 10)
-        # verify sperrt mit: es setzt und entwertet last_verified_utc,
-        # und genau ein falscher Stempel autorisiert spaeter eine Loeschung.
+        # status ist ein reiner Lesevorgang und darf neben einem laufenden
+        # Download jederzeit Auskunft geben.
+        assert "Another gogdl run" not in capsys.readouterr().err
+
+        # verify sperrt dagegen mit: es setzt und entwertet
+        # last_verified_utc, und genau ein falscher Stempel autorisiert
+        # spaeter eine Loeschung.
         assert main(["verify", "--dest", str(dest)]) == LockBusy.exit_code
-    fehler = capsys.readouterr().err
-    assert "Another gogdl run" not in fehler
+        assert "Another gogdl run" in capsys.readouterr().err
 
 
 def test_clean_mit_apply_wird_von_der_sperre_abgewiesen(
