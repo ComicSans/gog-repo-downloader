@@ -49,6 +49,14 @@ gogdl --dest ~/GOG status         # show what would happen, change nothing
 gogdl --dest ~/GOG download       # download, resume, verify, clean up
 ```
 
+Set `GOGDL_DEST` once and you can drop `--dest` entirely:
+
+```bash
+export GOGDL_DEST=/Volumes/Games/GOG
+```
+
+The manifest lives inside the collection, at `<dest>/.gogdl/`, not in your home directory. That keeps the collection self-describing - move the disk to another machine and everything the tool knows about it comes along - and lets you keep several collections side by side. The cost is that every command needs to know which one you mean.
+
 `--dest` defaults to `~/GOG` and deliberately not to the current directory: the tool writes a database there, downloads gigabytes into it, and deletes superseded files inside it. Pointing it at a git working tree prints a warning. `--dest` works before and after the subcommand: `gogdl --dest ~/GOG status` and `gogdl status --dest ~/GOG` are equivalent.
 
 By default this fetches installers for **your current platform** in **English**, including DLC. Everything else is opt-in:

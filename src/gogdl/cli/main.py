@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 
 from gogdl import __version__
@@ -28,7 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
     # lädt Gigabytes hinein und löscht darin alte Versionen. Ein versehentlicher
     # Aufruf im falschen Verzeichnis - etwa im Quellbaum - soll nichts anrichten.
     parser.add_argument(
-        "--dest", default="~/GOG", help="Zielverzeichnis der Sammlung (Default: ~/GOG)"
+        "--dest",
+        default=os.environ.get("GOGDL_DEST") or "~/GOG",
+        help=(
+            "Zielverzeichnis der Sammlung. Ohne Angabe gilt die Umgebungsvariable "
+            "GOGDL_DEST, sonst ~/GOG"
+        ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Mehr Details")
     parser.add_argument("-q", "--quiet", action="store_true", help="Nur Fehler ausgeben")
