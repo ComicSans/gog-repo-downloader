@@ -28,7 +28,16 @@ DEFAULT_TIMEOUT = 30.0
 """Verbindungs-/Lese-Timeout in Sekunden für Metadaten-Requests."""
 
 MAX_RETRIES = 5
-CHUNK_SIZE = 1024 * 1024
+
+CHUNK_SIZE = 8 * 1024 * 1024
+"""Blockgröße für Schreiben und Verifizieren.
+
+Nicht die Bandbreite begrenzt ein Netzlaufwerk, sondern die Latenz pro
+Roundtrip: auf einer SMB-Freigabe brachte dieselbe Datei mit 1-MiB-Blöcken
+2.6 MB/s und mit 8-MiB-Blöcken 3.9 MB/s. Bei ``--jobs`` gleichzeitigen
+Aufträgen hält der Prozess entsprechend viele Blöcke gleichzeitig im
+Speicher, deshalb nicht beliebig groß.
+"""
 
 TRASH_DIRNAME = ".trash"
 
