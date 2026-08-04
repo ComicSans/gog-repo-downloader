@@ -60,6 +60,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_filters(verify)
     verify.add_argument("--deep", action="store_true", help="MD5 und Archivtest statt nur Größe")
 
+    imp = sub.add_parser(
+        "import",
+        help="Vorhandenen Bestand dem Manifest zuordnen (für gewachsene Sammlungen)",
+    )
+    imp.add_argument("--apply", action="store_true", help="Zuordnung tatsächlich übernehmen")
+    imp.add_argument(
+        "--trust",
+        choices=["none", "size", "md5"],
+        default="none",
+        help=(
+            "Wie stark der vorhandene Bestand als geprüft gilt. "
+            "none: übernehmen, aber nichts bestätigen - Aufräumen bleibt wirkungslos. "
+            "size: Größenübereinstimmung genügt als Beleg. "
+            "md5: Prüfsummen rechnen, dauert bei großen Sammlungen sehr lange"
+        ),
+    )
+
     clean = sub.add_parser("clean", help="Aufräumen nachholen (z. B. nach --no-prune)")
     _add_filters(clean)
     _add_prune_flags(clean)
@@ -181,6 +198,8 @@ def main(argv: list[str] | None = None) -> int:
                 return asyncio.run(commands.cmd_download(ctx))
             case "verify":
                 return commands.cmd_verify(ctx, deep=args.deep)
+            case "import":
+                return commands.cmd_import(ctx, trust=args.trust, apply=args.apply)
             case "clean":
                 return commands.cmd_clean(ctx, apply=args.apply)
             case "sync":

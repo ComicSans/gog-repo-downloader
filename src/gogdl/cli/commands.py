@@ -354,6 +354,70 @@ def cmd_verify(ctx: AppContext, *, deep: bool) -> int:
     return 0 if bad == 0 else 4
 
 
+def cmd_import(ctx: AppContext, *, trust: str, apply: bool) -> int:
+    """Vorhandenen Bestand dem Manifest zuordnen.
+
+    Ohne diesen Schritt hält das Tool eine mit einem anderen Werkzeug
+    geladene Sammlung komplett für Fremdbestand: es lädt alles erneut und
+    räumt nichts auf. Der Import ändert ausschließlich die Datenbank, nie
+    eine Datei auf der Platte.
+    """
+    from gogdl.importer import Trust, apply_import, match_existing
+
+    store = SqliteStore(db_path(ctx.dest))
+    try:
+        entries = store.entries()
+        if not entries:
+            print(
+                "Das Manifest ist leer. Erst 'gogdl login' und 'gogdl update' "
+                "ausführen, sonst gibt es nichts, dem der Bestand zugeordnet "
+                "werden könnte."
+            )
+            return 1
+
+        plan = match_existing(entries, scan_disk(ctx.dest), ctx.dest, _slugs(store))
+
+        print(f"Eindeutig zugeordnet: {len(plan.matches)} Dateien, {human_bytes(plan.match_bytes)}")
+        if plan.unsure:
+            print(f"Unsicher (Name passt, Größe nicht): {len(plan.unsure)} - werden übergangen")
+            if ctx.verbose:
+                for candidate in plan.unsure:
+                    print(f"  {candidate.path.name}: {candidate.reason}")
+        if plan.unmatched:
+            print(f"Nicht zuordenbar: {len(plan.unmatched)} Dateien - bleiben unangetastet")
+            if ctx.verbose:
+                for path in plan.unmatched[:50]:
+                    print(f"  {path}")
+
+        if not apply:
+            print("\nNichts verändert. Mit --apply wird der Bestand ins Manifest übernommen.")
+            return EXIT_WORK_DONE if plan.matches else EXIT_NOTHING_TO_DO
+
+        level = Trust(trust)
+        if level is Trust.MD5:
+            print("Prüfe Prüfsummen. Das dauert bei großen Sammlungen lange.")
+        summary = apply_import(plan, store, now_utc(), trust=level)
+
+        print(
+            f"Übernommen: {len(summary.imported)} Dateien, "
+            f"{human_bytes(summary.imported_bytes)}"
+        )
+        if summary.rejected:
+            print(f"Abgelehnt: {len(summary.rejected)}")
+        if level is Trust.NONE:
+            print(
+                "Hinweis: Ohne --trust size oder md5 gilt der Bestand als unbestätigt. "
+                "Das Aufräumen alter Versionen bleibt damit wirkungslos."
+            )
+        else:
+            print(f"Als geprüft vermerkt: {summary.verified_count}")
+            if summary.unverifiable:
+                print(f"Ohne Prüfsumme im Manifest, daher unbestätigt: {len(summary.unverifiable)}")
+    finally:
+        store.close()
+    return EXIT_WORK_DONE
+
+
 def cmd_clean(ctx: AppContext, *, apply: bool) -> int:
     store = SqliteStore(db_path(ctx.dest))
     reporter = make_reporter(quiet=ctx.quiet)
