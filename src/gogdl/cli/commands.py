@@ -1,4 +1,4 @@
-"""Die Kommandos. Hier laufen die Fachmodule zusammen — sonst nirgends."""
+"""Die Kommandos. Hier laufen die Fachmodule zusammen - sonst nirgends."""
 
 from __future__ import annotations
 
@@ -509,11 +509,18 @@ def _print_plan(plan: SyncPlan, prune_plan: SyncPlan, ctx: AppContext) -> None:
         )
         if ctx.verbose:
             for item in prune_plan.prunes:
-                print(f"  [entfernen] {item.path.name} — {item.reason}")
+                print(f"  [entfernen] {item.path.name} - {item.reason}")
 
     for report in plan.reports:
         if report.kind == "orphaned":
             print(f"Hinweis: {report.path.name} wird von GOG nicht mehr angeboten (bleibt liegen)")
+        elif report.kind == "collision":
+            # Zwei Auslieferungen desselben Spiels tragen denselben Dateinamen.
+            # Beide zu laden hiesse, sie in dieselbe Datei zu schreiben.
+            print(
+                f"Übersprungen: {report.path.name} - zwei Auslieferungen wollen "
+                f"denselben Dateinamen. {report.detail}".rstrip()
+            )
         elif ctx.verbose:
             print(f"Hinweis: {report.path.name} gehört nicht zum Manifest (bleibt unangetastet)")
 
@@ -538,7 +545,7 @@ async def cmd_download(
             return EXIT_WORK_DONE if (plan.downloads or prune_plan.prunes) else EXIT_NOTHING_TO_DO
 
         if not plan.downloads:
-            reporter.message("Alles aktuell — nichts zu laden.")
+            reporter.message("Alles aktuell - nichts zu laden.")
         else:
             reporter.start_overall(len(plan.downloads), plan.download_bytes)
             async with _http_client() as client:
@@ -577,7 +584,7 @@ async def cmd_download(
                         failed += 1
                         if auth.is_authenticated():
                             reporter.message(
-                                f"Fehlgeschlagen: {item.target.name} — {result.error}"
+                                f"Fehlgeschlagen: {item.target.name} - {result.error}"
                             )
                         else:
                             # GOG hat den Refresh-Token abgelehnt, die
@@ -608,7 +615,7 @@ async def cmd_download(
         store.close()
 
     if failed:
-        print(f"{failed} Datei(en) fehlgeschlagen — erneut ausführen setzt dort fort.")
+        print(f"{failed} Datei(en) fehlgeschlagen - erneut ausführen setzt dort fort.")
         return 4
     if downloaded or removed_bytes:
         return EXIT_WORK_DONE
@@ -667,10 +674,10 @@ def _run_prune(
         if result.removed:
             reporter.message(
                 f"entfernt: {result.item.path.name} ({human_bytes(result.item.size)})"
-                f" — {result.item.reason}"
+                f" - {result.item.reason}"
             )
         elif result.reason:
-            reporter.message(f"behalten: {result.item.path.name} — {result.reason}")
+            reporter.message(f"behalten: {result.item.path.name} - {result.reason}")
     freed = freed_bytes(results)
     if freed:
         reporter.message(f"Freigegeben: {human_bytes(freed)}")
@@ -807,7 +814,7 @@ def cmd_clean(ctx: AppContext, *, apply: bool) -> int:
 
 
 async def cmd_sync(ctx: AppContext, *, only: list[str], skip: list[str]) -> int:
-    """``update`` und ``download`` in einem Aufruf — der Cron-Fall.
+    """``update`` und ``download`` in einem Aufruf - der Cron-Fall.
 
     Ein abgelehnter Zugang beendet den Lauf sofort: ohne Login ist auch der
     Download sinnlos. Fehlen dagegen nur einzelne Produkte, wird trotzdem

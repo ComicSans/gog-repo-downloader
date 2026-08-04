@@ -20,6 +20,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from gogdl.constants import STATE_DIRNAME, TRASH_DIRNAME
+from gogdl.constants import OLD_SUFFIX
 from gogdl.model.types import (
     DownloadItem,
     FileKind,
@@ -38,18 +39,29 @@ __all__ = ["is_stale", "plan_downloads", "plan_prune"]
 PART_SUFFIX = ".part"
 """Endung der noch unvollständigen Datei (KONZEPT.md §5.2)."""
 
-MIN_PREFIX_MATCH = 4
-"""Mindestlänge des gemeinsamen Namenspräfixes für die Slot-Zuordnung.
+MIN_PREFIX_MATCH = 8
+"""Mindestlänge des Namensteils **vor** dem Versionstoken.
 
-Kürzere Übereinstimmungen (``setup_``-Rauschen gibt es nicht, aber
-zweistellige Zufallstreffer schon) gelten als *keine* Zuordnung: dann
-bleibt die Datei liegen und wird nicht gelöscht.
+Der Teil vor der Version muss zwischen Kandidat und aktuellem Slot-Namen
+*exakt* übereinstimmen (siehe :func:`_attribute_slot`); diese Konstante
+verlangt zusätzlich, dass er lang genug ist, um überhaupt etwas
+auszusagen. Ein kurzer Rest wie ``gog_`` ist kein Namensschema, sondern
+ein Zufallstreffer - dann bleibt die Datei liegen und wird nicht
+gelöscht.
 """
 
 _VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
 """Versionsähnliches Token im Dateinamen, z. B. ``2.1.0`` in
 ``setup_spiel_2.1.0_(1).bin``. Mehrteiligkeit (``_(1)``) matcht bewusst
 nicht, weil mindestens ein Punkt gefordert ist."""
+
+_DIGITS_RE = re.compile(r"\d+")
+"""Jede Ziffernfolge - für Namensschema und Generationsvergleich."""
+
+_OLD_RE = re.compile(re.escape(OLD_SUFFIX) + r"(?:\.(\d+))?$")
+"""``<name>.old`` und ``<name>.old.<n>`` - vom Downloader beiseitegelegte
+Vorgängerfassungen (:data:`gogdl.download.OLD_SUFFIX`). Der Downloader
+zählt aufwärts, die höhere Nummer ist also die **jüngere** Fassung."""
 
 
 # ---------------------------------------------------------------------------
@@ -193,29 +205,99 @@ def _strip_part(name: str) -> str:
     return name[: -len(PART_SUFFIX)] if name.endswith(PART_SUFFIX) else name
 
 
-def _common_prefix_len(a: str, b: str) -> int:
-    a, b = a.lower(), b.lower()
-    n = 0
-    for left, right in zip(a, b):
-        if left != right:
-            break
-        n += 1
-    return n
+def _split_old(name: str) -> tuple[str, int] | None:
+    """``<basis>.old`` / ``<basis>.old.<n>`` zerlegen.
+
+    Rückgabe ist ``(basisname, generation)`` oder ``None``, wenn der Name
+    gar nicht beiseitegelegt wurde. ``<name>.old`` zählt als Generation
+    ``0``, jede durchnummerierte Fassung entsprechend höher - der
+    Downloader legt ``.old`` zuerst an und zählt bei Kollision aufwärts,
+    die höhere Nummer ist also die jüngere Fassung.
+
+    Diese Endung vergibt **nur** der Downloader. Sie ist damit der einzige
+    Fall, in dem eine Datei ohne eigenes Versionstoken trotzdem als
+    Vorgängerfassung gilt: ``manual.pdf.old`` neben ``manual.pdf`` sieht
+    der Namensheuristik zwar aus wie handverlesener Fremdbestand, ist aber
+    nachweislich vom Werkzeug selbst angelegt.
+    """
+    treffer = _OLD_RE.search(name)
+    if treffer is None:
+        return None
+    basis = name[: treffer.start()]
+    if not basis:
+        return None
+    return basis, int(treffer.group(1) or 0)
 
 
-def _parse_version(name: str) -> tuple[str, tuple[int, ...]] | None:
-    """Versionstoken aus einem Dateinamen ziehen.
+def _casefold(path: Path) -> str:
+    """Pfad für den Vergleich auf einem case-insensitiven Volume normieren.
+
+    macOS (und jedes andere case-insensitive Dateisystem) liefert im
+    Plattenzustand die Schreibweise, die auf der Platte steht. Weicht sie
+    von ``relative_path`` ab - weil der Nutzer umbenannt hat oder ein
+    rsync von einem case-sensitiven Volume kam -, würde ein
+    case-sensitiver Vergleich die **aktuelle** Datei für unbekannt halten
+    und sie zum Löschkandidaten machen. Deshalb wird casefold verglichen.
+    """
+    return str(path).casefold()
+
+
+def _split_version(name: str) -> tuple[str, str, tuple[int, ...], str] | None:
+    """Dateinamen am letzten Versionstoken zerlegen.
+
+    Rückgabe ist ``(präfix, token, sortierschlüssel, suffix)`` oder
+    ``None``, wenn der Name gar kein Versionstoken trägt.
 
     Genommen wird das **letzte** versionsähnliche Token: GOG setzt die
     Version ans Ende, direkt vor einen etwaigen Teilindex
     (``setup_spiel_2.1.0_(1).bin``), während im Spieltitel selbst
     Punkt-Ziffern-Folgen vorkommen können.
     """
-    matches = _VERSION_RE.findall(name)
-    if not matches:
+    treffer = list(_VERSION_RE.finditer(name))
+    if not treffer:
         return None
-    token = matches[-1]
-    return token, tuple(int(part) for part in token.split("."))
+    letzter = treffer[-1]
+    token = letzter.group(0)
+    schluessel = tuple(int(part) for part in token.split("."))
+    return name[: letzter.start()], token, schluessel, name[letzter.end() :]
+
+
+def _parse_version(name: str) -> tuple[str, tuple[int, ...]] | None:
+    """Nur Token und Sortierschlüssel - Bequemlichkeitshülle."""
+    zerlegt = _split_version(name)
+    if zerlegt is None:
+        return None
+    return zerlegt[1], zerlegt[2]
+
+
+def _schema(name: str) -> str:
+    """Namensschema: jede Ziffernfolge durch ``#`` ersetzt, casefold.
+
+    Zwei Fassungen derselben Auslieferung unterscheiden sich nur in ihren
+    Zahlen - Version, Update-Nummer, Build-Nummer. Alles andere ist das
+    Schema, und das muss übereinstimmen. Genau daran scheitert
+    ``soundtrack_flac.zip`` neben ``soundtrack.zip``, und genau daran
+    kommt der echte GOG-Fall vorbei::
+
+        setup_the_witcher_3_wild_hunt_4.04a_redkit_update_1_(73519).exe
+        setup_the_witcher_3_wild_hunt_4.04a_redkit_update_2_(73883).exe
+
+    Beide tragen dasselbe Schema und unterscheiden sich nur in Zahlen -
+    hier zählt die Update- und Build-Nummer, nicht das Versionstoken, das
+    in beiden Namen identisch ist.
+    """
+    return _DIGITS_RE.sub("#", name).casefold()
+
+
+def _digits(name: str) -> tuple[int, ...]:
+    """Alle Ziffernfolgen eines Namens der Reihe nach.
+
+    Bei gleichem Schema ist das der vollständige Generationsvergleich:
+    ``(3, 4, 4, 1, 73519) < (3, 4, 4, 2, 73883)``. Das Versionstoken
+    allein genügt dafür nicht, weil GOG die Generation auch in einer
+    Update- oder Build-Nummer hinter der Version führt.
+    """
+    return tuple(int(treffer) for treffer in _DIGITS_RE.findall(name))
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +570,13 @@ def plan_downloads(
     dabei aus den **ungefilterten** Remote- und Lokaldaten gebildet — ein
     ``--os``-Filter darf keine Fremdmeldungen erfinden. ``.part``-Dateien
     zu bekannten Einträgen sind ebenfalls nicht fremd.
+
+    **Ziel-Kollisionen** (``Report(kind="collision")``): Das Layout ist
+    flach, zwei Slots desselben Produkts können denselben Dateinamen
+    tragen (Installer und Extra heißen beide ``doku.pdf``). Beide würden
+    in dieselbe Datei und bei ``--jobs 2`` gleichzeitig in dieselbe
+    ``.part`` schreiben - stille Korruption. Der erste Eintrag behält den
+    Pfad, jeder weitere wird abgelehnt und gemeldet.
     """
     plan = SyncPlan()
     dest = config.dest
@@ -532,12 +621,31 @@ def plan_downloads(
     ]
     gewaehlt_os, gewaehlt_lang = _select_axes(planbar, config)
 
+    belegt: dict[Path, RemoteFile] = {}
     for remote_file in planbar:
         entry = by_key.get((remote_file.slot, remote_file.file_id))
         if not _passes_filters(remote_file, config, dlc_of, gewaehlt_os, gewaehlt_lang):
             continue
 
         target = _remote_target(remote_file, entry, dest, slugs)
+
+        vorbesitzer = belegt.get(target)
+        if vorbesitzer is not None:
+            plan.reports.append(
+                Report(
+                    path=target,
+                    kind="collision",
+                    detail=(
+                        f"Zielpfad bereits belegt von Slot "
+                        f"{vorbesitzer.slot.as_str()} / {vorbesitzer.file_id} - "
+                        f"Slot {remote_file.slot.as_str()} / {remote_file.file_id} "
+                        f"wird nicht geladen"
+                    ),
+                )
+            )
+            continue
+        belegt[target] = remote_file
+
         stale = entry is not None and is_stale(
             entry, remote_file, strict_md5=config.strict_md5
         )
@@ -565,14 +673,22 @@ def plan_downloads(
         )
 
     for path in disk:
-        if path not in known:
-            plan.reports.append(
-                Report(
-                    path=path,
-                    kind="foreign",
-                    detail="nicht vom Tool angelegt — bleibt unangetastet",
-                )
+        if path in known:
+            continue
+        # Vom Downloader beiseitegelegte Vorgängerfassungen sind kein
+        # Fremdbestand: eine Warnung über Dateien, die das Werkzeug gerade
+        # selbst angelegt hat, wäre irreführend. Aufgeräumt werden sie von
+        # ``plan_prune``, sobald der Slot verifiziert vollständig vorliegt.
+        beiseite = _split_old(path.name)
+        if beiseite is not None and path.with_name(beiseite[0]) in known:
+            continue
+        plan.reports.append(
+            Report(
+                path=path,
+                kind="foreign",
+                detail="nicht vom Tool angelegt — bleibt unangetastet",
             )
+        )
 
     plan.downloads.sort(key=lambda item: (item.entry.slot.as_str(), item.entry.file_id))
     plan.reports.sort(key=lambda report: (report.kind, str(report.path)))
@@ -584,71 +700,136 @@ def plan_downloads(
 # ---------------------------------------------------------------------------
 
 
-def _slot_is_replaceable(entries: Sequence[ManifestEntry]) -> bool:
+def _slot_is_replaceable(
+    entries: Sequence[ManifestEntry],
+    dest: Path,
+    slugs: Mapping[int, str] | None,
+    disk_norm: Mapping[str, int],
+) -> bool:
     """Darf dieser Slot eine Vorgängerversion ersetzen?
 
-    Vorbedingung jeder Löschung: **alle** Dateien des Slots sind
-    ``is_verified_complete`` (Zustand ``COMPLETE`` *und*
-    ``last_verified_utc`` gesetzt). Große Installer sind mehrteilig; wird
-    nach jeder fertigen Einzeldatei aufgeräumt, verschwindet Teil 1 der
-    alten Version, während Teil 2 der neuen noch fehlt — und es gibt gar
-    keine vollständige Version mehr (§5.5).
+    Zwei Vorbedingungen, und beide müssen erfüllt sein:
+
+    1. **Alle** Dateien des Slots sind ``is_verified_complete`` (Zustand
+       ``COMPLETE`` *und* ``last_verified_utc`` gesetzt). Große Installer
+       sind mehrteilig; wird nach jeder fertigen Einzeldatei aufgeräumt,
+       verschwindet Teil 1 der alten Version, während Teil 2 der neuen
+       noch fehlt - und es gibt gar keine vollständige Version mehr
+       (§5.5).
+    2. Jede dieser Dateien liegt **tatsächlich auf der Platte**, mit der
+       erwarteten Größe (soweit bekannt). §5.5 verlangt einen Ersatz auf
+       der Platte, nicht einen Ersatz im Manifest: das Manifest kann
+       ``COMPLETE`` behaupten, während die Datei längst verschoben,
+       gelöscht oder auf einem gerade nicht eingehängten Volume ist.
+       Ohne diese Prüfung würde die Altversion gelöscht und es bliebe gar
+       nichts.
+
+    Der Plattenvergleich läuft casefold (siehe :func:`_casefold`).
     """
     if not entries:
         return False
     if any(entry.state is LocalState.ORPHANED for entry in entries):
         return False
-    return all(entry.is_verified_complete for entry in entries)
+    if not all(entry.is_verified_complete for entry in entries):
+        return False
+    for entry in entries:
+        vorhanden = disk_norm.get(_casefold(_entry_target(entry, dest, slugs)))
+        if vorhanden is None:
+            return False
+        if entry.size is not None and vorhanden != entry.size:
+            return False
+    return True
 
 
 def _attribute_slot(
     candidate: str, slot_names: Mapping[SlotKey, tuple[str, ...]]
 ) -> SlotKey | None:
-    """Ordne eine unbekannte Datei dem Slot mit der größten Namensnähe zu.
+    """Ordne eine unbekannte Datei genau dann einem Slot zu, wenn sie
+    nachweislich eine ältere Fassung *dieses* Namensschemas ist.
 
-    Gemessen wird die Länge des gemeinsamen Präfixes zum längsten
-    passenden aktuellen Dateinamen. Zwei Slots desselben Produkts
-    unterscheiden sich im GOG-Namensschema früh (``setup_spiel_de_…``
-    gegen ``setup_spiel_en_…``), deshalb trägt das Präfix die Zuordnung.
-    Ohne klaren Sieger — zu kurzes Präfix oder Gleichstand zwischen zwei
-    Slots — wird **nicht** zugeordnet und damit auch nicht gelöscht.
+    Die Zuordnung ist bewusst eng, denn sie autorisiert eine Löschung.
+    Fünf Bedingungen, alle zwingend:
+
+    1. Der Kandidat trägt selbst ein Versionstoken
+       (:func:`_split_version`). Ohne Token ist er keine „Altversion",
+       sondern Fremdbestand - ``manual_v1_scan.pdf`` neben ``manual.pdf``
+       ist handverlesenes Material des Nutzers, kein GOG-Rest.
+    2. Der aktuelle Slot-Dateiname trägt **ebenfalls** ein Versionstoken.
+       Ein unversionierter Slot (typisch für Extras) kann gar keine
+       Vorgängerversion haben.
+    3. Der Namensteil **vor** dem Token stimmt exakt überein
+       (Groß-/Kleinschreibung ignoriert) und ist mindestens
+       ``MIN_PREFIX_MATCH`` Zeichen lang. Das trennt ``setup_spiel1_…``
+       von ``setup_spiel2_…``, was ein reiner Schemavergleich nicht
+       könnte.
+    4. Beide Namen tragen dasselbe :func:`_schema`, unterscheiden sich
+       also **nur in Zahlen**. Reine Präfixlänge genügt nicht:
+       ``soundtrack_flac.zip`` teilt zehn Zeichen mit ``soundtrack.zip``
+       und ist trotzdem etwas völlig anderes.
+    5. Der Kandidat ist über :func:`_digits` **echt älter**. Verglichen
+       werden alle Ziffernfolgen der Reihe nach, nicht nur das
+       Versionstoken: GOG führt die Generation auch in einer Update- oder
+       Build-Nummer hinter einer gleichbleibenden Version. Was neuer
+       aussieht als der aktuelle Stand, gilt nie als Altversion.
+
+    Passt mehr als ein Slot, ist die Zuordnung mehrdeutig und es wird
+    nichts gelöscht.
+
+    Bleibende Lücke, bewusst in Kauf genommen: Fehlt ein Teil eines
+    mehrteiligen Installers im Manifest, während ein anderer Teil
+    derselben Version dort steht, sieht der fehlende Teil wie eine
+    ältere Generation aus (kleinerer Teilindex). Das war vorher nicht
+    anders; die Slot-Regel in :func:`_slot_is_replaceable` fängt es nur
+    ab, solange das Manifest den Slot vollständig kennt.
     """
-    stem = _strip_part(candidate)
-    best: SlotKey | None = None
-    best_score = 0
-    tied = False
-    for slot, names in slot_names.items():
-        score = max((_common_prefix_len(stem, name) for name in names), default=0)
-        if score > best_score:
-            best, best_score, tied = slot, score, False
-        elif score == best_score and score > 0 and slot != best:
-            tied = True
-    if best is None or best_score < MIN_PREFIX_MATCH or tied:
+    stamm = _strip_part(candidate)
+    zerlegt = _split_version(stamm)
+    if zerlegt is None:
         return None
-    return best
+    praefix = zerlegt[0]
+    if len(praefix) < MIN_PREFIX_MATCH:
+        return None
+    schema, ziffern = _schema(stamm), _digits(stamm)
+
+    treffer: set[SlotKey] = set()
+    for slot, names in slot_names.items():
+        for name in names:
+            aktuell = _split_version(name)
+            if aktuell is None:
+                continue
+            if praefix.casefold() != aktuell[0].casefold():
+                continue
+            if schema != _schema(name):
+                continue
+            if ziffern >= _digits(name):
+                continue
+            treffer.add(slot)
+            break
+
+    if len(treffer) != 1:
+        return None
+    return next(iter(treffer))
 
 
 def _keep_newest_generations(
     candidates: Sequence[tuple[Path, int, str]], keep_old: int
-) -> list[tuple[Path, int, str | None]]:
+) -> list[tuple[Path, int, str]]:
     """Wähle aus den Altdateien eines Slots die löschbaren aus.
 
     ``keep_old`` ist ``keep_versions - 1``, also die Zahl der zusätzlich
     aufzubewahrenden Generationen (``--keep-versions 1`` = nur die
     aktuelle, ``2`` = eine Rückfallebene, §5.5).
 
-    Bei ``keep_old == 0`` fällt alles weg. Sobald eine Generation
-    aufbewahrt werden soll, brauchen wir eine Reihenfolge — Dateien ohne
-    erkennbares Versionstoken lassen sich nicht einsortieren und könnten
-    genau die aufzubewahrende Generation sein. Sie bleiben deshalb
-    liegen.
-    """
-    if keep_old <= 0:
-        return [
-            (path, size, (parsed[0] if (parsed := _parse_version(name)) else None))
-            for path, size, name in candidates
-        ]
+    Dateien ohne erkennbares Versionstoken fallen **bei jeder**
+    Einstellung heraus, nicht erst ab ``keep_old >= 1``. Sonst wäre
+    ausgerechnet der Default ``keep_versions=1`` die gefährlichste
+    Einstellung: er löschte Dateien, die eine höhere Einstellung
+    verschont - das erwartet niemand. Ohne Token lässt sich eine Datei
+    weder einsortieren noch als Vorgängerversion belegen.
 
+    Damit gilt: die Löschmenge von ``keep_versions=n+1`` ist stets eine
+    Teilmenge der von ``keep_versions=n``.
+    """
     versioned: dict[tuple[int, ...], list[tuple[Path, int, str]]] = {}
     for path, size, name in candidates:
         parsed = _parse_version(name)
@@ -657,10 +838,74 @@ def _keep_newest_generations(
         token, key = parsed
         versioned.setdefault(key, []).append((path, size, token))
 
-    doomed: list[tuple[Path, int, str | None]] = []
-    for key in sorted(versioned, reverse=True)[keep_old:]:
-        doomed.extend((path, size, token) for path, size, token in versioned[key])
+    doomed: list[tuple[Path, int, str]] = []
+    for key in sorted(versioned, reverse=True)[max(keep_old, 0) :]:
+        doomed.extend(versioned[key])
     return doomed
+
+
+def _slot_of_basis(
+    basis: str, slot_names: Mapping[SlotKey, tuple[str, ...]]
+) -> SlotKey | None:
+    """Slot einer beiseitegelegten Datei über ihren Basisnamen.
+
+    Der Regelfall des stillen Neu-Uploads (§4.1): die neue Fassung trägt
+    denselben Namen, der Basisname ist deshalb **wörtlich** der aktuelle
+    Slot-Dateiname. Nur wenn das nicht zutrifft - GOG hat zwischenzeitlich
+    auch noch umbenannt -, greift ersatzweise die Namensheuristik.
+    """
+    treffer = {
+        slot
+        for slot, names in slot_names.items()
+        if any(basis.casefold() == name.casefold() for name in names)
+    }
+    if len(treffer) == 1:
+        return next(iter(treffer))
+    if treffer:
+        return None  # mehrdeutig - dann lieber gar nichts
+    return _attribute_slot(basis, slot_names)
+
+
+def _keep_newest_old_generations(
+    candidates: Sequence[tuple[Path, int, int]], keep_old: int
+) -> list[tuple[Path, int, int]]:
+    """Beiseitegelegte Fassungen eines Basisnamens staffeln.
+
+    Das Versionstoken taugt hier nicht als Reihenfolge: beim stillen
+    Neu-Upload heißen alle Generationen gleich und trügen dasselbe Token.
+    Alle landeten in einem Bucket - bei ``--keep-versions 2`` wäre dann
+    nie etwas löschbar und die Dateien häuften sich unbegrenzt an, bei
+    ``--keep-versions 1`` fielen umgekehrt alle auf einmal weg. Maßgeblich
+    ist deshalb die laufende Nummer im Suffix; die höchste ist die
+    jüngste Fassung und wird als erste verschont.
+    """
+    geordnet = sorted(candidates, key=lambda eintrag: eintrag[2], reverse=True)
+    return geordnet[max(keep_old, 0) :]
+
+
+def _verwaltet_die_konfiguration(entries: Sequence[ManifestEntry], config: SyncConfig) -> bool:
+    """Räumt die aktuelle Konfiguration in diesem Slot überhaupt auf?
+
+    ``plan_prune`` bekommt den **gesamten** Manifestbestand, nicht die
+    gefilterte Auswahl. Ohne diese Prüfung räumt ``--no-extras`` das
+    Extras-Umfeld trotzdem auf: der Nutzer hat gesagt, dass er sich um
+    Extras nicht kümmern will, und bekommt dort trotzdem Löschungen.
+
+    Plattform und Sprache gehen bewusst **nicht** ein: sie steuern, was
+    geladen wird, nicht was bereits im Bestand liegt. Eine schon
+    vorhandene Mac-Fassung soll auch dann noch ihre Altversionen los
+    werden, wenn der Nutzer heute mit ``--os windows`` läuft.
+    """
+    kind = entries[0].slot.kind
+    if kind is FileKind.EXTRA and not config.include_extras:
+        return False
+    if kind is FileKind.PATCH and not config.include_patches:
+        return False
+    if not config.include_dlc:
+        parent = next((e.dlc_of for e in entries if e.dlc_of is not None), None)
+        if parent is not None and parent != entries[0].product_id:
+            return False
+    return True
 
 
 def plan_prune(
@@ -689,28 +934,52 @@ def plan_prune(
     1. Kandidat ist eine Datei **direkt** in ``<dest>/<slug>/`` eines
        Produkts, das Manifest-Einträge hat, und deren Pfad zu keinem
        aktuellen Eintrag (und zu keiner ``.part``-Datei eines aktuellen
-       Eintrags) gehört. Das Verzeichnis wird aus ``dest`` und dem Slug
-       gebildet, nicht aus ``relative_path``; Unterverzeichnisse wie
+       Eintrags) gehört. Der Vergleich läuft casefold, sonst wird auf
+       einem case-insensitiven Volume die **aktuelle** Datei zum
+       Kandidaten, nur weil ihre Schreibweise von ``relative_path``
+       abweicht. Das Verzeichnis wird aus ``dest`` und dem Slug gebildet,
+       nicht aus ``relative_path``; Unterverzeichnisse wie
        ``<slug>/extras/`` bleiben vollständig außen vor - auch für Slots,
        die selbst dort liegen.
-    2. Der Kandidat wird über die Länge des gemeinsamen Namenspräfixes
-       genau einem Slot zugeordnet (:func:`_attribute_slot`). Ohne klaren
-       Sieger bleibt er liegen.
-    3. Gelöscht wird nur, wenn dieser Slot vollständig **und** verifiziert
-       vorliegt.
+    2. Der Kandidat trägt nachweislich dasselbe Namensschema wie der Slot
+       und ein **älteres** Versionstoken (:func:`_attribute_slot`). Ohne
+       eindeutigen Treffer bleibt er liegen.
+    3. Gelöscht wird nur, wenn dieser Slot vollständig, verifiziert
+       **und auf der Platte vorhanden** ist (:func:`_slot_is_replaceable`).
+    4. Der Slot muss von der aktuellen Konfiguration überhaupt verwaltet
+       werden (:func:`_verwaltet_die_konfiguration`).
 
     Warum das nur bei nachweislich vollständigem Ersatz greift: Schritt 1
     kann eine Datei nicht von echtem Fremdbestand unterscheiden — der
     Name allein sagt nichts darüber, ob das Tool sie angelegt hat. Erst
     die Kombination „liegt im Produktverzeichnis + trägt das Namensschema
-    des Slots + der Slot liegt vollständig verifiziert daneben" macht die
-    Annahme *Vorgängerversion* belastbar. Fällt eine dieser Bedingungen
-    weg, ist die Datei nach §5.5 Fremdbestand: sie bleibt und wird
-    allenfalls gemeldet (durch :func:`plan_downloads`), nie gelöscht.
+    des Slots samt älterer Version + der Slot liegt vollständig
+    verifiziert daneben" macht die Annahme *Vorgängerversion* belastbar.
+    Fällt eine dieser Bedingungen weg, ist die Datei nach §5.5
+    Fremdbestand: sie bleibt und wird allenfalls gemeldet (durch
+    :func:`plan_downloads`), nie gelöscht.
 
     ``.part``-Reste zu einer nicht mehr angebotenen Version dürfen
     ebenfalls in den Plan; sie sind nie eine Rückfallebene und deshalb
-    von ``keep_versions`` ausgenommen.
+    von ``keep_versions`` ausgenommen. Auch sie müssen dafür das
+    Namensschema samt älterer Version tragen.
+
+    **Beiseitegelegte Fassungen** (``<name>.old``, ``<name>.old.<n>``,
+    siehe :data:`gogdl.download.OLD_SUFFIX`) laufen auf einer eigenen
+    Spur. Der Downloader legt sie an, wenn GOG eine neue Fassung unter
+    identischem Dateinamen ausliefert (§4.1); sie sind ausdrücklich kein
+    Fremdbestand, obwohl ihr Name zu keinem Manifest-Eintrag passt, und
+    brauchen deshalb auch kein eigenes Versionstoken. Die Vorbedingung
+    ist dieselbe wie sonst: der Slot muss vollständig, verifiziert und auf
+    der Platte vorhanden sein. Gestaffelt werden sie über die laufende
+    Nummer im Suffix, nicht über das Versionstoken - beim stillen
+    Neu-Upload heißen alle Generationen gleich
+    (:func:`_keep_newest_old_generations`). Beide Spuren haben ihr eigenes
+    ``keep_versions``-Budget: liegt neben einer echten Altversion auch
+    noch eine beiseitegelegte Fassung, bleiben bei ``keep_versions=2``
+    zwei Dateien liegen statt einer. Im Zweifel bleibt mehr liegen, nie
+    weniger - die beiden Spuren sind nicht vergleichbar, und ein
+    gemeinsamer Rang wäre geraten.
     """
     plan = SyncPlan()
     if not config.prune:
@@ -720,9 +989,10 @@ def plan_prune(
     disk = _relevant_disk(on_disk, dest)
     if not disk:
         return plan
+    disk_norm = {_casefold(path): size for path, size in disk.items()}
 
     by_slot: dict[SlotKey, list[ManifestEntry]] = {}
-    known: set[Path] = set()
+    known: set[str] = set()
     slot_dirs: dict[SlotKey, Path] = {}
     verschachtelt: set[SlotKey] = set()
     for entry in local:
@@ -731,8 +1001,8 @@ def plan_prune(
             # Hartes Sicherheitsnetz: nichts außerhalb von dest.
             continue
         by_slot.setdefault(entry.slot, []).append(entry)
-        known.add(target)
-        known.add(_part_of(target))
+        known.add(_casefold(target))
+        known.add(_casefold(_part_of(target)))
         # Das Kandidatenverzeichnis kommt aus dest und dem Slug, **nicht**
         # aus relative_path: sonst macht ein Eintrag in <slug>/extras/
         # diesen Unterordner zum Suchbereich.
@@ -754,6 +1024,11 @@ def plan_prune(
         # Falsche zu löschen. Keine vergessene Ecke, sondern die Abwägung.
         if slot in verschachtelt or slot not in slot_dirs:
             continue
+        # Ein Slot, um den sich die Konfiguration nicht kümmert, räumt auch
+        # nicht auf. Seine Dateien bleiben trotzdem in ``known`` und sind
+        # damit vor der Zuordnung zu einem anderen Slot geschützt.
+        if not _verwaltet_die_konfiguration(entries, config):
+            continue
         names = tuple(entry.filename for entry in entries if entry.filename)
         if not names:
             continue
@@ -761,16 +1036,30 @@ def plan_prune(
 
     per_slot: dict[SlotKey, list[tuple[Path, int, str]]] = {}
     part_leftovers: dict[SlotKey, list[tuple[Path, int]]] = {}
+    old_leftovers: dict[SlotKey, dict[str, list[tuple[Path, int, int]]]] = {}
     for path, size in disk.items():
-        if path in known:
+        if _casefold(path) in known:
             continue
         slot_names = dirs.get(path.parent)
         if not slot_names:
             continue  # Fremdverzeichnis oder dest-Wurzel — nie anfassen.
+
+        beiseite = _split_old(path.name)
+        if beiseite is not None:
+            basis, generation = beiseite
+            slot = _slot_of_basis(basis, slot_names)
+            if slot is None:
+                continue
+            if not _slot_is_replaceable(by_slot[slot], dest, slugs, disk_norm):
+                continue
+            gruppen = old_leftovers.setdefault(slot, {})
+            gruppen.setdefault(basis.casefold(), []).append((path, size, generation))
+            continue
+
         slot = _attribute_slot(path.name, slot_names)
         if slot is None:
             continue
-        if not _slot_is_replaceable(by_slot[slot]):
+        if not _slot_is_replaceable(by_slot[slot], dest, slugs, disk_norm):
             continue
         if path.name.endswith(PART_SUFFIX):
             part_leftovers.setdefault(slot, []).append((path, size))
@@ -779,7 +1068,7 @@ def plan_prune(
 
     keep_old = max(config.keep_versions, 1) - 1
 
-    for slot in set(per_slot) | set(part_leftovers):
+    for slot in set(per_slot) | set(part_leftovers) | set(old_leftovers):
         entries = by_slot[slot]
         new_version = next((e.version for e in entries if e.version is not None), None)
         replaced_by = tuple(sorted(entry.file_id for entry in entries))
@@ -819,6 +1108,25 @@ def plan_prune(
                     replaced_by=replaced_by,
                 )
             )
+
+        for basis, gruppe in sorted(old_leftovers.get(slot, {}).items()):
+            parsed = _parse_version(basis)
+            for path, size, generation in _keep_newest_old_generations(gruppe, keep_old):
+                plan.prunes.append(
+                    PruneItem(
+                        path=path,
+                        slot=slot,
+                        reason=(
+                            f"beiseitegelegte Vorgängerfassung (Generation "
+                            f"{generation}) von {basis} - ersetzt durch {ersatz}; "
+                            f"Slot {slot.as_str()} liegt vollständig verifiziert vor"
+                        ),
+                        size=size,
+                        old_version=parsed[0] if parsed else None,
+                        new_version=new_version,
+                        replaced_by=replaced_by,
+                    )
+                )
 
     plan.prunes.sort(key=lambda item: (item.slot.as_str(), str(item.path)))
     return plan

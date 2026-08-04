@@ -166,11 +166,17 @@ class PruneExecutor:
     # -- Prüfung 3 und 4: Ersatz ---------------------------------------
 
     def _replacement_refusal(self, item: PruneItem, path: Path) -> str | None:
-        """Ersatz muss benannt, vollständig und verifiziert sein.
+        """Ersatz muss benannt, vollständig, verifiziert und **da** sein.
 
         Ohne benannten Ersatz wird nur ein ``.part``-Rest freigegeben —
         eine unfertige Datei ist per Definition kein Bestand, den es zu
         schützen gäbe.
+
+        Die Reihenfolge der Ablehnungsgründe ist die vom Groben zum
+        Feinen: erst was das Manifest gar nicht kennt, dann was es
+        unverifiziert führt, dann der Selbstschutz, dann die
+        Vollständigkeit mehrteiliger Auslieferungen, zuletzt der Blick auf
+        die Platte.
         """
         if not item.replaced_by:
             if path.name.endswith(PART_SUFFIX):
@@ -191,10 +197,61 @@ class PruneExecutor:
         # Schutz gegen einen fehlerhaften Plan, der die neue Datei löschen
         # würde: der Zielpfad eines Ersatzes darf nie das Löschziel sein.
         for entry in replacements:
-            if self._entry_path(entry) == path:
+            if self._same_file(self._entry_path(entry), path):
                 return "Datei ist selbst der benannte Ersatz"
 
-        return self._missing_part_refusal(replacements)
+        refusal = self._missing_part_refusal(replacements)
+        if refusal is not None:
+            return refusal
+
+        return self._offline_refusal(replacements)
+
+    def _same_file(self, links: Path, rechts: Path) -> bool:
+        """Sind das dieselben zwei Pfade - oder dieselbe Datei?
+
+        Ein Pfadvergleich allein greift auf einem case-insensitiven Volume
+        nicht: liegt die Datei als ``Setup_Spiel_2.1.1.exe`` auf der
+        Platte, während das Manifest ``setup_spiel_2.1.1.exe`` führt, sind
+        die ``Path``-Objekte verschieden und dieselbe Datei. Deshalb
+        entscheidet ``st_ino``/``st_dev`` (``os.path.samefile``). Nur wenn
+        einer der beiden Pfade gar nicht existiert, bleibt der
+        casefold-Vergleich als Rückfall - dann lieber einmal zu viel
+        ablehnen als die einzige vorhandene Fassung löschen.
+        """
+        try:
+            return os.path.samefile(links, rechts)
+        except OSError:
+            return str(links).casefold() == str(rechts).casefold()
+
+    def _offline_refusal(self, replacements: Sequence[ManifestEntry]) -> str | None:
+        """Liegt der benannte Ersatz wirklich auf der Platte?
+
+        KONZEPT.md §5.5 verlangt einen Ersatz *auf der Platte*, nicht einen
+        Ersatz im Manifest. Das Manifest kann ``COMPLETE`` mit
+        ``last_verified_utc`` führen, während die Datei längst verschoben
+        oder gelöscht ist oder auf einem Volume liegt, das beim Scan nicht
+        eingehängt war. Ohne diese Prüfung verschwindet die Altversion und
+        es bleibt gar nichts.
+
+        Die Planung prüft dasselbe unabhängig gegen ihren
+        ``on_disk``-Abzug; hier wird zum Ausführungszeitpunkt frisch
+        gestatet, denn zwischen Plan und Löschung kann Zeit vergangen
+        sein.
+        """
+        for entry in replacements:
+            ersatz = self._entry_path(entry)
+            try:
+                stat = ersatz.stat()
+            except OSError:
+                return f"Ersatz {entry.filename} liegt nicht auf der Platte"
+            if not ersatz.is_file() or ersatz.is_symlink():
+                return f"Ersatz {entry.filename} ist keine reguläre Datei"
+            if entry.size is not None and stat.st_size != entry.size:
+                return (
+                    f"Ersatz {entry.filename} hat {stat.st_size} statt "
+                    f"{entry.size} Bytes"
+                )
+        return None
 
     def _missing_part_refusal(self, replacements: Sequence[ManifestEntry]) -> str | None:
         """Mehrteilige Auslieferungen nur als Ganzes als Ersatz zählen.

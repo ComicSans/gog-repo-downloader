@@ -57,7 +57,7 @@ BACKOFF_CAP = 60.0
 RETRY_AFTER_CAP = 300.0
 """Obergrenze für ein von GOG genanntes ``Retry-After`` — schützt vor Hängern."""
 
-OLD_SUFFIX = ".old"
+from gogdl.constants import OLD_SUFFIX  # noqa: E402  (Re-Export für Bestandscode)
 """Endung, unter der eine vorhandene Zieldatei beiseitegelegt wird.
 
 Bei Namenskollision wird durchnummeriert: ``<name>.old``, ``<name>.old.1``,

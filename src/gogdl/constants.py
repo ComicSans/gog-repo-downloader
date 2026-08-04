@@ -31,6 +31,17 @@ MAX_RETRIES = 5
 CHUNK_SIZE = 1024 * 1024
 
 TRASH_DIRNAME = ".trash"
+
+OLD_SUFFIX = ".old"
+"""Endung für eine beiseitegelegte Vorgängerfassung.
+
+Der Downloader vergibt sie, wenn GOG eine neue Fassung unter identischem
+Dateinamen ausliefert; ``prune/`` räumt sie später auf. Die Konstante steht
+hier und nicht im Downloader, damit ``sync/`` sie nutzen kann, ohne die
+Download-Schicht und damit ``httpx`` zu importieren - dieses Modul soll
+frei von I/O-Abhängigkeiten bleiben.
+"""
+
 STATE_DIRNAME = ".gogdl"
 DB_FILENAME = "manifest.sqlite3"
 

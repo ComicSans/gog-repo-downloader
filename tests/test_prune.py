@@ -195,6 +195,50 @@ def test_part_rest_darf_ohne_ersatz_weg(tmp_path: Path) -> None:
     assert not rest.exists()
 
 
+# -- Prüfung 5: Ersatz liegt wirklich auf der Platte -----------------------
+
+
+def test_ersatz_fehlt_auf_der_platte_wird_abgelehnt(tmp_path: Path) -> None:
+    """Das Manifest sagt COMPLETE, die Datei ist trotzdem weg.
+
+    Verschoben, geloescht, oder das Volume war beim Scan nicht
+    eingehaengt. KONZEPT.md §5.5 verlangt einen Ersatz *auf der Platte* -
+    sonst bleibt nach der Loeschung gar nichts uebrig.
+    """
+    alt = write(tmp_path / "spielname" / "setup_2.1.0.exe")
+    store = FakeStore(make_entry("neu", "setup_2.1.1.exe"))
+
+    results = make_executor(tmp_path, store).execute([make_item(alt, replaced_by=("neu",))])
+
+    assert results[0].removed is False
+    assert "nicht auf der Platte" in results[0].reason
+    assert alt.exists()
+
+
+def test_ersatz_mit_falscher_groesse_wird_abgelehnt(tmp_path: Path) -> None:
+    alt = write(tmp_path / "spielname" / "setup_2.1.0.exe")
+    write(tmp_path / "spielname" / "setup_2.1.1.exe", b"x" * 42)  # Soll waeren 100
+    store = FakeStore(make_entry("neu", "setup_2.1.1.exe"))
+
+    results = make_executor(tmp_path, store).execute([make_item(alt, replaced_by=("neu",))])
+
+    assert results[0].removed is False
+    assert "42" in results[0].reason
+    assert alt.exists()
+
+
+def test_ersatz_pruefung_auch_im_dry_run(tmp_path: Path) -> None:
+    """Der Trockenlauf darf keine Loeschung versprechen, die nie faellt."""
+    alt = write(tmp_path / "spielname" / "setup_2.1.0.exe")
+    store = FakeStore(make_entry("neu", "setup_2.1.1.exe"))
+
+    results = make_executor(tmp_path, store).execute(
+        [make_item(alt, replaced_by=("neu",))], dry_run=True
+    )
+
+    assert results[0].removed is False
+
+
 # -- Prüfung 4: Datei ist selbst der Ersatz --------------------------------
 
 
@@ -207,6 +251,26 @@ def test_ersatz_darf_nicht_selbst_geloescht_werden(tmp_path: Path) -> None:
     assert results[0].removed is False
     assert "selbst" in results[0].reason
     assert neu.exists()
+
+
+def test_abweichende_schreibweise_schuetzt_den_ersatz(tmp_path: Path) -> None:
+    """Auf der Platte steht eine andere Schreibweise als im Manifest.
+
+    Ein reiner ``Path``-Vergleich greift auf einem case-insensitiven
+    Volume nicht: der Selbstschutz laeuft ins Leere und die einzige
+    vorhandene Fassung wird geloescht. Der Vergleich muss deshalb ueber
+    ``st_ino``/``st_dev`` laufen, mit casefold als Rueckfall, wenn die
+    Datei unter der Manifest-Schreibweise gar nicht existiert.
+    """
+    auf_platte = write(tmp_path / "spielname" / "Setup_2.1.1.exe")
+    store = FakeStore(make_entry("neu", "setup_2.1.1.exe"))
+
+    results = make_executor(tmp_path, store).execute(
+        [make_item(auf_platte, replaced_by=("neu",))]
+    )
+
+    assert results[0].removed is False
+    assert auf_platte.exists()
 
 
 # -- Prüfung 1 und 2: Pfad -------------------------------------------------
@@ -246,6 +310,7 @@ def test_dest_ueber_symlink_benannt_blockiert_prune_nicht(tmp_path: Path) -> Non
     alias = tmp_path / "alias"
     alias.symlink_to(echt, target_is_directory=True)
     alt = write(alias / "spielname" / "setup_2.1.0.exe")
+    write(alias / "spielname" / "setup_2.1.1.exe")
     store = FakeStore(make_entry("neu", "setup_2.1.1.exe"))
 
     results = make_executor(alias, store).execute([make_item(alt, replaced_by=("neu",))])
@@ -303,6 +368,7 @@ def test_fehlende_datei_ist_kein_fehler(tmp_path: Path) -> None:
 def test_dry_run_faesst_nichts_an(tmp_path: Path) -> None:
     alt = write(tmp_path / "spielname" / "setup_2.1.0.exe")
     abgelehnt = write(tmp_path / "spielname" / "fremd.bin")
+    write(tmp_path / "spielname" / "setup_2.1.1.exe")
     store = FakeStore(make_entry("neu", "setup_2.1.1.exe"))
     items = [make_item(alt, replaced_by=("neu",)), make_item(abgelehnt)]
 
@@ -319,6 +385,7 @@ def test_dry_run_faesst_nichts_an(tmp_path: Path) -> None:
 
 def test_trash_modus_verschiebt_statt_zu_loeschen(tmp_path: Path) -> None:
     alt = write(tmp_path / "spielname" / "setup_2.1.0.exe")
+    write(tmp_path / "spielname" / "setup_2.1.1.exe")
     store = FakeStore(make_entry("neu", "setup_2.1.1.exe"))
 
     results = make_executor(tmp_path, store, PruneMode.TRASH).execute(
@@ -332,6 +399,7 @@ def test_trash_modus_verschiebt_statt_zu_loeschen(tmp_path: Path) -> None:
 
 
 def test_trash_modus_loest_namenskollision_auf(tmp_path: Path) -> None:
+    write(tmp_path / "spielname" / "setup_2.1.1.exe")
     store = FakeStore(make_entry("neu", "setup_2.1.1.exe"))
     executor = make_executor(tmp_path, store, PruneMode.TRASH)
     tag = tmp_path / ".trash" / "2026-08-04" / "spielname"
@@ -358,6 +426,7 @@ def test_papierkorb_wird_nicht_selbst_gepruned(tmp_path: Path) -> None:
 
 def test_leeres_verzeichnis_wird_entfernt_dest_nicht(tmp_path: Path) -> None:
     alt = write(tmp_path / "spielname" / "extras" / "setup_2.1.0.exe")
+    write(tmp_path / "anderswo" / "neu.exe")
     store = FakeStore(make_entry("neu", "setup_2.1.1.exe", relative_path="anderswo/neu.exe"))
 
     make_executor(tmp_path, store).execute([make_item(alt, replaced_by=("neu",))])
@@ -387,6 +456,7 @@ def test_permission_fehler_stoppt_den_lauf_nicht(tmp_path: Path) -> None:
     gesperrt = write(gesperrt_dir / "setup_2.1.0.exe")
     frei = write(tmp_path / "spielname" / "setup_2.1.0.exe")
     danach = write(tmp_path / "spielname2" / "setup_2.1.0.exe")
+    write(tmp_path / "anderswo" / "neu.exe")
     store = FakeStore(make_entry("neu", "setup_2.1.1.exe", relative_path="anderswo/neu.exe"))
     items = [
         make_item(gesperrt, replaced_by=("neu",)),

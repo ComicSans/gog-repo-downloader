@@ -648,6 +648,39 @@ def test_dlc_mapping_uebersteuert_die_angabe_an_der_datei():
     assert sorted(i.entry.file_id for i in plan.downloads) == ["d"]
 
 
+def test_zwei_eintraege_mit_gleichem_zielpfad_kollidieren():
+    """Das Layout ist flach - zwei Slots koennen denselben Namen tragen.
+
+    Installer und Extra heissen beide ``doku.pdf`` und landen im selben
+    Verzeichnis. Ohne Erkennung schreiben bei ``--jobs 2`` zwei Downloads
+    gleichzeitig in dieselbe ``.part``. Der erste Eintrag behaelt den
+    Pfad, der zweite wird abgelehnt und gemeldet.
+    """
+    files = [
+        remote(slot=WIN_SLOT, file_id="w", filename="doku.pdf", version=None),
+        remote(slot=EXTRA_SLOT, file_id="x", filename="doku.pdf", version=None),
+    ]
+    plan = plan_downloads(files, [], config(include_extras=True), {}, slugs=SLUGS)
+
+    assert [item.entry.file_id for item in plan.downloads] == ["w"]
+    kollisionen = [r for r in plan.reports if r.kind == "collision"]
+    assert len(kollisionen) == 1
+    assert kollisionen[0].path == GAME_DIR / "doku.pdf"
+    assert "x" in kollisionen[0].detail
+
+
+def test_gleicher_name_in_verschiedenen_produkten_kollidiert_nicht():
+    """Gegenprobe: das Verzeichnis trennt die beiden."""
+    files = [
+        remote(slot=WIN_SLOT, file_id="w", filename="doku.pdf", version=None),
+        remote(slot=DLC_SLOT, file_id="d", filename="doku.pdf", version=None),
+    ]
+    plan = plan_downloads(files, [], config(), {}, slugs=SLUGS)
+
+    assert sorted(item.entry.file_id for item in plan.downloads) == ["d", "w"]
+    assert [r for r in plan.reports if r.kind == "collision"] == []
+
+
 def test_download_eintrag_traegt_dlc_of_weiter():
     """Sonst stirbt die Zuordnung beim ersten Roundtrip durch den Store."""
     plan = plan_downloads(
@@ -802,9 +835,10 @@ def test_fremddatei_kommt_nie_in_den_prune_plan():
 def test_datei_ohne_namensnaehe_bleibt_liegen():
     """Im Produktverzeichnis, aber ohne Bezug zum Slot ⇒ Fremdbestand.
 
-    ``set_alt.dat`` teilt drei Zeichen mit ``setup_game_2.0.exe`` — ein
-    Zufallstreffer, der die Mindestlänge des Präfixes verfehlt und
-    deshalb nicht als Vorgängerversion durchgeht.
+    Beide Dateien tragen ueberhaupt kein Versionstoken und koennen damit
+    keine Vorgaengerversion sein - ``set_alt.dat`` teilt zwar drei Zeichen
+    mit ``setup_game_2.0.exe``, aber Namensnaehe allein autorisiert keine
+    Loeschung.
     """
     on_disk = {
         GAME_DIR / "setup_game_2.0.exe": 1000,
@@ -816,7 +850,12 @@ def test_datei_ohne_namensnaehe_bleibt_liegen():
 
 
 def test_mehrdeutige_zuordnung_bleibt_liegen():
-    """Zwei Slots mit identischem Präfix — Gleichstand löscht nichts."""
+    """``game_1.0.zi`` passt auf kein Namensschema - also bleibt es liegen.
+
+    Der Teil hinter dem Versionstoken (``.zi`` gegen ``.zip``) stimmt mit
+    keinem der beiden Slots ueberein, und der Teil davor (``game_``) ist
+    zu kurz. Namensnaehe allein genuegt nicht mehr.
+    """
     local = [
         entry(slot=WIN_SLOT, file_id="w", filename="game_2.0.zip"),
         entry(slot=MAC_SLOT, file_id="m", filename="game_2.0.zip.mac"),
@@ -871,7 +910,9 @@ def test_prune_greift_nie_in_ein_unterverzeichnis():
             relative_path="the_game/extras/handbuch.pdf",
         )
     ]
-    assert plan_prune(local, config(), on_disk, slugs=SLUGS).prunes == []
+    # include_extras=True, damit hier wirklich die Unterverzeichnis-Regel
+    # greift und nicht schon der Extras-Filter.
+    assert plan_prune(local, config(include_extras=True), on_disk, slugs=SLUGS).prunes == []
 
 
 def test_altdatei_im_unterordner_bleibt_liegen():
@@ -933,6 +974,314 @@ def test_prune_faellt_ohne_plattenzustand_nicht_um(keep):
 
 
 # ---------------------------------------------------------------------------
+# §5.5 — flacher Fremdbestand, Schreibweise, Ersatz auf der Platte
+# ---------------------------------------------------------------------------
+
+
+def test_flacher_fremdbestand_neben_extras_bleibt_liegen():
+    """Der teuerste Fall: handverlesenes Material neben einem Extra.
+
+    GOG-Extras haben ``os=None`` und ``language=None`` und landen deshalb
+    flach in ``<dest>/<slug>/`` - der Schutz fuer Unterverzeichnisse
+    greift hier nicht. Daneben liegt Material des Nutzers, das mit dem
+    Extra ein langes Praefix teilt (``manual_v1_scan.pdf`` neben
+    ``manual.pdf``, ``soundtrack_flac.zip`` neben ``soundtrack.zip``).
+    Keine dieser Dateien traegt ein Versionstoken, also ist keine von
+    ihnen eine Vorgaengerversion.
+    """
+    on_disk = {
+        GAME_DIR / "manual.pdf": 500,
+        GAME_DIR / "manual_v1_scan.pdf": 400,
+        GAME_DIR / "soundtrack.zip": 800,
+        GAME_DIR / "soundtrack_flac.zip": 900,
+    }
+    local = [
+        entry(slot=EXTRA_SLOT, file_id="x1", filename="manual.pdf", version=None, size=500),
+        entry(slot=EXTRA_SLOT, file_id="x2", filename="soundtrack.zip", version=None, size=800),
+    ]
+
+    plan = plan_prune(local, config(include_extras=True), on_disk, slugs=SLUGS)
+
+    assert plan.prunes == []
+
+
+def test_echte_altversion_neben_der_aktuellen_wird_weiterhin_geprunt():
+    """Gegenprobe zum Fremdbestand: der Normalfall muss leben."""
+    on_disk = {
+        GAME_DIR / "setup_spiel_2.1.1.exe": 1000,
+        GAME_DIR / "setup_spiel_2.1.0.exe": 900,
+    }
+    local = [entry(filename="setup_spiel_2.1.1.exe", version="2.1.1")]
+
+    plan = plan_prune(local, config(), on_disk, slugs=SLUGS)
+
+    assert [item.path for item in plan.prunes] == [GAME_DIR / "setup_spiel_2.1.0.exe"]
+    assert plan.prunes[0].old_version == "2.1.0"
+
+
+def test_echter_gog_name_mit_gleicher_version_aber_neuerem_build():
+    """Die Generation steckt nicht immer im Versionstoken.
+
+    Beide Namen tragen ``4.04``; unterschieden werden sie ueber
+    ``update_1``/``update_2`` und die Build-Nummer. Ein Vergleich, der nur
+    das Versionstoken kennt, wuerde hier nie aufraeumen - deshalb
+    vergleicht die Regel alle Ziffernfolgen der Reihe nach.
+    """
+    aktuell = "setup_the_witcher_3_wild_hunt_4.04a_redkit_update_2_(73883).exe"
+    alt = "setup_the_witcher_3_wild_hunt_4.04a_redkit_update_1_(73519).exe"
+    on_disk = {GAME_DIR / aktuell: 1000, GAME_DIR / alt: 800}
+    local = [entry(filename=aktuell, version="4.04a")]
+
+    plan = plan_prune(local, config(), on_disk, slugs=SLUGS)
+
+    assert [item.path.name for item in plan.prunes] == [alt]
+
+
+def test_anderes_spiel_mit_gleichem_schema_bleibt_liegen():
+    """Nur Zahlen unterscheiden - aber die Zahl steckt im Spielnamen.
+
+    ``setup_spiel1_…`` und ``setup_spiel2_…`` tragen dasselbe Schema und
+    duerfen sich trotzdem nicht gegenseitig aufraeumen. Dafuer muss der
+    Teil vor dem Versionstoken **woertlich** uebereinstimmen.
+    """
+    on_disk = {
+        GAME_DIR / "setup_spiel2_3.0.exe": 1000,
+        GAME_DIR / "setup_spiel1_2.0.exe": 900,
+    }
+    local = [entry(filename="setup_spiel2_3.0.exe", version="3.0")]
+
+    assert plan_prune(local, config(), on_disk, slugs=SLUGS).prunes == []
+
+
+def test_keep_versions_1_loescht_nichts_was_2_verschont():
+    """Der Default darf nicht die gefaehrlichste Einstellung sein.
+
+    Dieselbe Ausgangslage, zweimal geplant: eine Datei ohne
+    Versionstoken (``setup_game_beilage.exe``) darf bei **keiner**
+    Einstellung in den Plan geraten. Was ``keep_versions=1`` zusaetzlich
+    loescht, ist genau die juengste Altgeneration - nichts sonst.
+    """
+    on_disk = {
+        GAME_DIR / "setup_game_3.0.exe": 1000,
+        GAME_DIR / "setup_game_2.0.exe": 950,
+        GAME_DIR / "setup_game_1.0.exe": 900,
+        GAME_DIR / "setup_game_beilage.exe": 42,
+    }
+    local = [entry(filename="setup_game_3.0.exe", version="3.0")]
+
+    def namen(keep: int) -> set[str]:
+        plan = plan_prune(local, config(keep_versions=keep), on_disk, slugs=SLUGS)
+        return {item.path.name for item in plan.prunes}
+
+    eins, zwei = namen(1), namen(2)
+
+    assert "setup_game_beilage.exe" not in eins
+    assert "setup_game_beilage.exe" not in zwei
+    assert zwei <= eins
+    assert eins - zwei == {"setup_game_2.0.exe"}
+    assert eins == {"setup_game_1.0.exe", "setup_game_2.0.exe"}
+
+
+def test_abweichende_schreibweise_macht_die_aktuelle_datei_nicht_zum_kandidaten():
+    """macOS: die Platte schreibt anders als ``relative_path``.
+
+    Der Nutzer hat umbenannt oder ein rsync kam von einem case-sensitiven
+    Volume. Ein case-sensitiver Vergleich haelt die aktuelle Fassung fuer
+    unbekannt, ordnet sie ihrem eigenen Slot zu und loescht sie - die
+    einzige vorhandene Fassung.
+    """
+    on_disk = {
+        GAME_DIR / "Setup_Spiel_2.1.1.exe": 1000,
+        GAME_DIR / "setup_spiel_2.1.0.exe": 900,
+    }
+    local = [entry(filename="setup_spiel_2.1.1.exe", version="2.1.1")]
+
+    plan = plan_prune(local, config(), on_disk, slugs=SLUGS)
+
+    assert [item.path for item in plan.prunes] == [GAME_DIR / "setup_spiel_2.1.0.exe"]
+
+
+def test_ersatz_fehlt_auf_der_platte_verhindert_jede_loeschung():
+    """§5.5 verlangt einen Ersatz *auf der Platte*, nicht im Manifest.
+
+    Das Manifest sagt COMPLETE mit ``last_verified_utc``, die Datei ist
+    aber weg (verschoben, geloescht, externes Volume beim Scan nicht da).
+    Wuerde die Altversion trotzdem fallen, bliebe gar nichts uebrig.
+    """
+    on_disk = {GAME_DIR / "setup_game_1.0.exe": 900}
+
+    assert plan_prune([entry()], config(), on_disk, slugs=SLUGS).prunes == []
+
+
+def test_ersatz_mit_falscher_groesse_verhindert_jede_loeschung():
+    on_disk = {
+        GAME_DIR / "setup_game_2.0.exe": 512,  # Soll waeren 1000
+        GAME_DIR / "setup_game_1.0.exe": 900,
+    }
+
+    assert plan_prune([entry()], config(), on_disk, slugs=SLUGS).prunes == []
+
+
+def test_no_extras_raeumt_das_extras_umfeld_nicht_auf():
+    """Wer ``--no-extras`` setzt, will dort auch keine Loeschungen."""
+    on_disk = {
+        GAME_DIR / "handbuch_2.0.pdf": 500,
+        GAME_DIR / "handbuch_1.0.pdf": 400,
+    }
+    local = [
+        entry(
+            slot=EXTRA_SLOT, file_id="x1", filename="handbuch_2.0.pdf", version="2.0", size=500
+        )
+    ]
+
+    assert plan_prune(local, config(), on_disk, slugs=SLUGS).prunes == []
+
+    mit_extras = plan_prune(local, config(include_extras=True), on_disk, slugs=SLUGS)
+    assert [item.path.name for item in mit_extras.prunes] == ["handbuch_1.0.pdf"]
+
+
+def test_zwei_slots_mit_demselben_namensschema_bleiben_liegen():
+    """Passt der Kandidat auf zwei Slots, ist die Zuordnung wertlos."""
+    de_slot = SlotKey(1207658924, FileKind.INSTALLER, OsName.WINDOWS, "de")
+    local = [
+        entry(slot=WIN_SLOT, file_id="en", filename="setup_game_2.0.exe"),
+        entry(slot=de_slot, file_id="de", filename="setup_game_3.0.exe"),
+    ]
+    on_disk = {
+        GAME_DIR / "setup_game_2.0.exe": 1000,
+        GAME_DIR / "setup_game_3.0.exe": 1000,
+        GAME_DIR / "setup_game_1.0.exe": 900,
+    }
+
+    plan = plan_prune(local, config(languages=frozenset({"en", "de"})), on_disk, slugs=SLUGS)
+
+    assert plan.prunes == []
+
+
+def test_neuer_aussehende_datei_gilt_nicht_als_altversion():
+    """Nur ein *aelteres* Token macht eine Datei zur Vorgaengerversion."""
+    on_disk = {
+        GAME_DIR / "setup_game_2.0.exe": 1000,
+        GAME_DIR / "setup_game_3.0.exe": 1100,
+    }
+
+    assert plan_prune([entry()], config(), on_disk, slugs=SLUGS).prunes == []
+
+
+# ---------------------------------------------------------------------------
+# §4.1/§5.5 — vom Downloader beiseitegelegte Fassungen (<name>.old)
+# ---------------------------------------------------------------------------
+
+
+def test_beiseitegelegte_fassung_wird_geplant():
+    """GOG hat unter identischem Namen neu ausgeliefert.
+
+    Der Downloader hat die alte Datei nach ``<name>.old`` gerettet. Sie
+    traegt kein eigenes Versionstoken und passt zu keinem
+    Manifest-Eintrag - trotzdem ist sie kein Fremdbestand, denn diese
+    Endung vergibt nur das Werkzeug selbst.
+    """
+    aktuell = GAME_DIR / "setup_game_2.0.exe"
+    on_disk = {aktuell: 1000, GAME_DIR / "setup_game_2.0.exe.old": 950}
+
+    plan = plan_prune([entry()], config(), on_disk, slugs=SLUGS)
+
+    assert [item.path.name for item in plan.prunes] == ["setup_game_2.0.exe.old"]
+    assert plan.prunes[0].replaced_by == ("f1",)
+
+    # Und plan_downloads darf sie nicht als Fremdbestand melden.
+    reports = plan_downloads([remote()], [entry()], config(), on_disk, slugs=SLUGS).reports
+    assert reports == []
+
+
+def test_beiseitegelegte_fassung_ohne_versionstoken():
+    """Der Fall aus Befund 1 - nur eben vom Werkzeug selbst angelegt.
+
+    ``manual.pdf.old`` sieht der Namensheuristik aus wie
+    ``manual_v1_scan.pdf``. Der Unterschied ist die Endung.
+    """
+    on_disk = {
+        GAME_DIR / "manual.pdf": 500,
+        GAME_DIR / "manual.pdf.old": 480,
+        GAME_DIR / "manual_v1_scan.pdf": 400,
+    }
+    local = [entry(slot=EXTRA_SLOT, file_id="x1", filename="manual.pdf", version=None, size=500)]
+
+    plan = plan_prune(local, config(include_extras=True), on_disk, slugs=SLUGS)
+
+    assert [item.path.name for item in plan.prunes] == ["manual.pdf.old"]
+
+
+def test_beiseitegelegte_fassungen_werden_nach_laufender_nummer_gestaffelt():
+    """Alle Generationen heissen gleich - das Token taugt nicht als Ordnung.
+
+    Wuerden sie nach Versionstoken gruppiert, laege alles in einem Bucket:
+    bei ``keep_versions=2`` waere nie etwas loeschbar, bei ``1`` fiele
+    alles auf einmal weg. Massgeblich ist die laufende Nummer; die
+    hoechste ist die juengste Fassung.
+    """
+    on_disk = {
+        GAME_DIR / "setup_game_2.0.exe": 1000,
+        GAME_DIR / "setup_game_2.0.exe.old": 900,
+        GAME_DIR / "setup_game_2.0.exe.old.1": 910,
+        GAME_DIR / "setup_game_2.0.exe.old.2": 920,
+    }
+
+    zwei = plan_prune([entry()], config(keep_versions=2), on_disk, slugs=SLUGS)
+    assert sorted(item.path.name for item in zwei.prunes) == [
+        "setup_game_2.0.exe.old",
+        "setup_game_2.0.exe.old.1",
+    ]
+
+    eins = plan_prune([entry()], config(keep_versions=1), on_disk, slugs=SLUGS)
+    assert sorted(item.path.name for item in eins.prunes) == [
+        "setup_game_2.0.exe.old",
+        "setup_game_2.0.exe.old.1",
+        "setup_game_2.0.exe.old.2",
+    ]
+
+
+def test_beiseitegelegte_fassung_bei_unvollstaendigem_slot():
+    """Weder geplant noch als Fremdbestand gemeldet - einfach still liegen."""
+    on_disk = {
+        GAME_DIR / "setup_game_2.0.exe.part": 300,
+        GAME_DIR / "setup_game_2.0.exe.old": 950,
+    }
+    local = [entry(state=LocalState.PARTIAL, last_verified_utc=None)]
+
+    assert plan_prune(local, config(), on_disk, slugs=SLUGS).prunes == []
+
+    reports = plan_downloads([remote()], local, config(), on_disk, slugs=SLUGS).reports
+    assert [r for r in reports if r.kind == "foreign"] == []
+
+
+def test_beiseitegelegte_fassung_ohne_bezug_bleibt_fremd():
+    """``.old`` allein genuegt nicht - der Basisname muss zum Slot passen."""
+    on_disk = {
+        GAME_DIR / "setup_game_2.0.exe": 1000,
+        GAME_DIR / "meine_sicherung.zip.old": 700,
+    }
+
+    assert plan_prune([entry()], config(), on_disk, slugs=SLUGS).prunes == []
+
+    reports = plan_downloads([remote()], [entry()], config(), on_disk, slugs=SLUGS).reports
+    assert [r.path.name for r in reports] == ["meine_sicherung.zip.old"]
+
+
+def test_unversionierter_slot_hat_keine_altversion():
+    """Ohne Versionstoken im aktuellen Namen gibt es nichts zu ersetzen."""
+    on_disk = {
+        GAME_DIR / "handbuch.pdf": 500,
+        GAME_DIR / "handbuch_1.0.pdf": 400,
+    }
+    local = [
+        entry(slot=EXTRA_SLOT, file_id="x1", filename="handbuch.pdf", version=None, size=500)
+    ]
+
+    assert plan_prune(local, config(include_extras=True), on_disk, slugs=SLUGS).prunes == []
+
+
+# ---------------------------------------------------------------------------
 # §7 — sync/ ist I/O-frei
 # ---------------------------------------------------------------------------
 
@@ -950,9 +1299,17 @@ def test_planung_fasst_die_platte_nie_an(monkeypatch):
         GAME_DIR / "setup_game_2.0.exe": 1000,
         GAME_DIR / "setup_game_1.0.exe": 900,
         GAME_DIR / "setup_game_3.0.exe.part": 12,
+        GAME_DIR / "setup_game_2.0.exe.old": 950,
+        GAME_DIR / "setup_game_2.0.exe.old.1": 960,
         DEST / "fremd.bin": 5,
     }
     local = [entry(), entry(file_id="alt", filename="setup_game_0.9.exe", version="0.9",
                             slot=MAC_SLOT, state=LocalState.ORPHANED)]
-    plan_downloads([remote(version="3.0", size=2000)], local, config(), on_disk, slugs=SLUGS)
+    # Zwei Remote-Eintraege mit demselben Zielpfad: auch die
+    # Kollisionserkennung darf die Platte nicht anfassen.
+    kollidierend = [
+        remote(version="3.0", size=2000),
+        remote(slot=EXTRA_SLOT, file_id="x", filename="setup_game_2.0.exe", version=None),
+    ]
+    plan_downloads(kollidierend, local, config(include_extras=True), on_disk, slugs=SLUGS)
     plan_prune(local, config(keep_versions=2), on_disk, slugs=SLUGS)
