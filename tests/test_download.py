@@ -796,6 +796,26 @@ async def test_verification_reports_the_last_stretch(tmp_path, monkeypatch):
     assert "100%" in reporter.messages[-1]
 
 
+async def test_verification_announces_itself_before_the_first_block(tmp_path, monkeypatch):
+    """Der Beginn der Prüfung wird gemeldet, bevor der erste Block gelesen ist.
+
+    Die Fortschrittszeile der Datei steht zu diesem Zeitpunkt auf 100 % und
+    "ETA 0s"; ohne Ankündigung ist die Prüfung von einem Hänger nicht zu
+    unterscheiden.
+    """
+    monkeypatch.setattr(engine_mod, "VERIFY_ANNOUNCE_MIN", 1024)
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    path = tmp_path / "gross.bin"
+    path.write_bytes(b"x" * 4096)
+
+    downloader = make_downloader(
+        lambda request: httpx.Response(200, content=BODY), api, sleep, chunk_size=1024
+    )
+    await downloader._digest_file(path, reporter, total=4096)
+
+    assert reporter.messages[0] == "Verifying gross.bin ..."
+
+
 async def test_short_verification_stays_quiet(tmp_path):
     """Eine kurze Prüfung meldet gar nichts - sie ist schnell genug."""
     api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()

@@ -57,6 +57,12 @@ BACKOFF_CAP = 60.0
 RETRY_AFTER_CAP = 300.0
 """Obergrenze für ein von GOG genanntes ``Retry-After`` — schützt vor Hängern."""
 
+VERIFY_ANNOUNCE_MIN = 64 * 1024 * 1024
+"""Ab dieser Dateigröße wird der Beginn der Prüfung angekündigt.
+
+Darunter ist sie schnell genug, dass eine Meldung nur die Ausgabe flutet.
+"""
+
 VERIFY_REPORT_STEP = 512 * 1024 * 1024
 """Abstand zwischen zwei Fortschrittsmeldungen der MD5-Prüfung.
 
@@ -520,6 +526,12 @@ class HttpDownloader:
         ``ProgressReporter`` ist nicht threadsicher.
         """
         hasher = hashlib.md5()
+        # Vor dem ersten Block melden, nicht erst nach dem ersten Meldeabstand:
+        # die Fortschrittszeile der Datei steht zu diesem Zeitpunkt auf 100 %
+        # und "ETA 0s". Ohne Hinweis sieht die Prüfung dort aus wie ein Hänger -
+        # und genau so wurde sie auch gemeldet.
+        if reporter is not None and (total is None or total >= VERIFY_ANNOUNCE_MIN):
+            reporter.message(f"Verifying {path.name} ...")
         handle = await asyncio.to_thread(open, path, "rb")
         try:
             done = 0
