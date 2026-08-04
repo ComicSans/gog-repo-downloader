@@ -7,7 +7,8 @@ GOG sagt, und fasst ``bytes_done``/``relative_path`` nicht an
 (KONZEPT.md §4.3, §4.4). ``state`` und ``last_verified_utc`` folgen dem
 Remote-Stand nur dort, wo er sie widerlegt: eine verschwundene Datei wird
 ``ORPHANED``, eine zurückgekehrte verlässt diesen Zustand wieder, und eine
-geänderte Auslieferung entwertet die alte Verifikation.
+geänderte Auslieferung entwertet die alte Verifikation und macht einen
+vollständigen Bestand ``STALE``.
 """
 
 from __future__ import annotations
@@ -78,10 +79,26 @@ _ENTRY_COLUMNS = """
     relative_path, state, bytes_done, last_seen_utc, last_verified_utc
 """
 
-_KEEP_VERIFIED = """CASE
-        WHEN files.version IS NOT excluded.version
-          OR files.size    IS NOT excluded.size
-          OR (excluded.md5 IS NOT NULL AND files.md5 IS NOT excluded.md5)
+_SIGNALS_CHANGED = """(
+        files.version IS NOT excluded.version
+     OR files.size    IS NOT excluded.size
+     OR (excluded.md5 IS NOT NULL AND files.md5 IS NOT excluded.md5)
+    )"""
+"""Liefert GOG eine andere Auslieferung als die gespeicherte?
+
+Verglichen werden die drei Aktualitätssignale aus KONZEPT.md §4.2. Ein
+fehlender ``md5`` im Remote-Stand ist dabei keine Abweichung: er bedeutet
+nur, dass das Checksum-XML nicht abgerufen wurde.
+
+**Hier und nur hier fällt die Aktualitätsentscheidung.** Weiter oben in
+der Kette gibt es keinen zweiten Stand mehr, gegen den sich vergleichen
+ließe - der Manifest-Eintrag *ist* dort bereits der neue Stand. Der
+UPSERT ist der einzige Moment, in dem alter und neuer Wert nebeneinander
+liegen (``files.*`` gegen ``excluded.*``).
+"""
+
+_KEEP_VERIFIED = f"""CASE
+        WHEN {_SIGNALS_CHANGED}
         THEN NULL
         ELSE files.last_verified_utc
     END"""
@@ -112,6 +129,8 @@ ON CONFLICT(slot_key, file_id) DO UPDATE SET
     dlc_of        = excluded.dlc_of,
     last_seen_utc = excluded.last_seen_utc,
     state = CASE
+        WHEN files.state IS '{LocalState.COMPLETE.value}' AND {_SIGNALS_CHANGED}
+            THEN '{LocalState.STALE.value}'
         WHEN files.state IS NOT '{LocalState.ORPHANED.value}' THEN files.state
         WHEN files.relative_path <> '' AND ({_KEEP_VERIFIED}) IS NOT NULL
             THEN '{LocalState.COMPLETE.value}'
@@ -402,7 +421,16 @@ class SqliteStore:
         so bleibt sichtbar, wann die Datei zuletzt existierte
         (KONZEPT.md §4.3). Ändert sich ``version``, ``size`` oder ein neu
         gelieferter ``md5``, verfällt ``last_verified_utc``: die
-        Verifikation galt der alten Auslieferung.
+        Verifikation galt der alten Auslieferung. War der lokale Zustand
+        dabei ``COMPLETE``, wird er ``STALE`` - vollständig, aber überholt.
+
+        Dieser Zustandswechsel ist die eigentliche Aktualitätsentscheidung
+        des Werkzeugs, und er gehört hierher: ab dem Commit ist der alte
+        Stand nirgends mehr gespeichert. Wer später Manifest und
+        Remote-Angebot vergleicht, vergleicht denselben Wert mit sich
+        selbst und findet strukturell nie etwas. ``MISSING`` und
+        ``PARTIAL`` bleiben dagegen stehen: unfertig ist nicht veraltet,
+        und geladen werden sie ohnehin.
 
         Umgekehrt gilt: was im frischen Remote-Stand steht, ist per
         Definition nicht verwaist. Ein zurückgezogener und später wieder

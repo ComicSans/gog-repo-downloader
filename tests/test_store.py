@@ -154,11 +154,18 @@ def test_lokaler_zustand_ueberlebt_zweiten_remote_lauf(store: SqliteStore) -> No
 def test_geaendertes_signal_verwirft_verifikation(
     store: SqliteStore, changed: dict[str, object]
 ) -> None:
-    """Die Verifikation galt der alten Version — sie verfällt."""
+    """Die Verifikation galt der alten Version — sie verfällt.
+
+    Und der Zustand mit ihr: was vollständig war, ist gegenüber dem neuen
+    Angebot veraltet. Diese Entscheidung fällt hier und nirgends sonst -
+    der Vergleich weiter oben in der Kette hat keinen zweiten Stand mehr,
+    gegen den er prüfen könnte.
+    """
     store.replace_remote(PRODUCT_ID, [remote()], SEEN_1)
     entry = only(store.entries(), "f1")
     entry.state = LocalState.COMPLETE
     entry.bytes_done = 1000
+    entry.relative_path = "Spiel/setup.exe"
     entry.last_verified_utc = SEEN_1
     store.update_entry(entry)
 
@@ -166,10 +173,72 @@ def test_geaendertes_signal_verwirft_verifikation(
 
     after = only(store.entries(), "f1")
     assert after.last_verified_utc is None
-    assert after.state is LocalState.COMPLETE
+    assert after.state is LocalState.STALE
     assert after.bytes_done == 1000
+    assert after.relative_path == "Spiel/setup.exe", "was auf der Platte liegt, bleibt bekannt"
     for field, value in changed.items():
         assert getattr(after, field) == value
+
+
+@pytest.mark.parametrize(
+    "zustand",
+    [
+        pytest.param(LocalState.MISSING, id="missing"),
+        pytest.param(LocalState.PARTIAL, id="partial"),
+    ],
+)
+def test_geaendertes_signal_laesst_unfertige_zustaende_stehen(
+    store: SqliteStore, zustand: LocalState
+) -> None:
+    """``STALE`` meint „vollständig, aber überholt" - sonst wäre es eine Lüge.
+
+    Ein halb geladener Stand ist nicht veraltet, er ist unfertig; er wird
+    ohnehin geladen.
+    """
+    store.replace_remote(PRODUCT_ID, [remote()], SEEN_1)
+    entry = only(store.entries(), "f1")
+    entry.state = zustand
+    entry.bytes_done = 512
+    store.update_entry(entry)
+
+    store.replace_remote(PRODUCT_ID, [remote(version="2.0.0")], SEEN_2)
+
+    after = only(store.entries(), "f1")
+    assert after.state is zustand
+    assert after.bytes_done == 512
+
+
+def test_unveraenderter_stand_laesst_complete_stehen(store: SqliteStore) -> None:
+    """Die Gegenprobe: derselbe Stand darf nichts entwerten."""
+    store.replace_remote(PRODUCT_ID, [remote()], SEEN_1)
+    entry = only(store.entries(), "f1")
+    entry.state = LocalState.COMPLETE
+    entry.relative_path = "Spiel/setup.exe"
+    entry.last_verified_utc = SEEN_1
+    store.update_entry(entry)
+
+    store.replace_remote(PRODUCT_ID, [remote()], SEEN_2)
+
+    after = only(store.entries(), "f1")
+    assert after.state is LocalState.COMPLETE
+    assert after.last_verified_utc == SEEN_1
+
+
+def test_stale_bleibt_stale_bis_es_geladen_ist(store: SqliteStore) -> None:
+    """Ein zweiter Update-Lauf darf den Befund nicht zurücknehmen."""
+    store.replace_remote(PRODUCT_ID, [remote()], SEEN_1)
+    entry = only(store.entries(), "f1")
+    entry.state = LocalState.COMPLETE
+    entry.relative_path = "Spiel/setup.exe"
+    entry.last_verified_utc = SEEN_1
+    store.update_entry(entry)
+
+    store.replace_remote(PRODUCT_ID, [remote(version="2.0.0")], SEEN_2)
+    assert only(store.entries(), "f1").state is LocalState.STALE
+
+    store.replace_remote(PRODUCT_ID, [remote(version="2.0.0")], SEEN_3)
+
+    assert only(store.entries(), "f1").state is LocalState.STALE
 
 
 def test_fehlender_remote_md5_loescht_gespeicherten_nicht(store: SqliteStore) -> None:

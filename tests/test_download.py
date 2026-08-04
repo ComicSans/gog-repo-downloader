@@ -122,19 +122,26 @@ class FlakyStream(httpx.AsyncByteStream):
         raise httpx.ReadError("Verbindung abgebrochen")
 
 
-def make_item(tmp_path, *, size: int | None = len(BODY), md5: str | None = None) -> DownloadItem:
+def make_item(
+    tmp_path,
+    *,
+    size: int | None = len(BODY),
+    md5: str | None = None,
+    name: str = "setup.bin",
+    file_id: str = "file-1",
+) -> DownloadItem:
     slot = SlotKey(product_id=42, kind=FileKind.INSTALLER, os=OsName.WINDOWS, language="en")
     entry = ManifestEntry(
         slot=slot,
-        file_id="file-1",
-        filename="setup.bin",
+        file_id=file_id,
+        filename=name,
         version="1.0",
         size=size,
         md5=md5,
-        downlink="downlink/42/file-1",
+        downlink=f"downlink/42/{file_id}",
     )
     # Das Zielverzeichnis existiert bewusst noch nicht.
-    return DownloadItem(entry=entry, target=tmp_path / "spiel" / "setup.bin")
+    return DownloadItem(entry=entry, target=tmp_path / "spiel" / name)
 
 
 def make_downloader(handler, api: FakeApi, sleep: FakeSleep, **kwargs) -> HttpDownloader:
@@ -514,6 +521,188 @@ async def test_handle_auch_bei_dateisystemfehler(tmp_path):
     assert result.ok is False
     assert len(reporter.handles) == 1
     assert reporter.finish_handles == [reporter.handles[0]]
+
+
+# --------------------------------------------------------------------------
+# Altbestand am Zielpfad (KONZEPT.md §4.1: neue Fassung, gleicher Dateiname)
+# --------------------------------------------------------------------------
+
+ALT = bytes((i * 3 + 5) % 251 for i in range(150))
+"""Altfassung am Zielpfad - andere Länge und andere Bytes als ``BODY``."""
+
+
+def old_path(item: DownloadItem, suffix: str = "") -> object:
+    """``<name>.old`` bzw. ``<name>.old.1`` neben dem Zielpfad."""
+    return item.target.with_name(item.target.name + ".old" + suffix)
+
+
+async def test_altbestand_wandert_nach_old_statt_ueberschrieben_zu_werden(tmp_path):
+    """Der Kernfall: gleicher Dateiname, neue Fassung - die alte muss bleiben.
+
+    Ohne den Fix benennt ``_finish`` direkt über die vorhandene Datei um und
+    die Altfassung ist unwiederbringlich weg, noch bevor ``prune/`` überhaupt
+    gefragt wurde.
+    """
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    item = make_item(tmp_path, md5=BODY_MD5)
+    item.target.parent.mkdir(parents=True)
+    item.target.write_bytes(ALT)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=BODY)
+
+    downloader = make_downloader(handler, api, sleep)
+    result = await downloader.fetch(item, reporter)
+
+    assert result.ok and result.verified
+    assert item.target.read_bytes() == BODY
+    assert old_path(item).read_bytes() == ALT  # Altfassung noch da
+    assert not item.part_path.exists()
+
+
+async def test_zweites_update_nummeriert_die_old_datei_durch(tmp_path):
+    """Zwei Updates in Folge dürfen sich nicht gegenseitig die Rückfallebene nehmen."""
+    api, sleep = FakeApi(), FakeSleep()
+    item = make_item(tmp_path, md5=BODY_MD5)
+    item.target.parent.mkdir(parents=True)
+    item.target.write_bytes(ALT)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=BODY)
+
+    downloader = make_downloader(handler, api, sleep)
+    assert (await downloader.fetch(item, FakeReporter())).ok
+    assert (await downloader.fetch(item, FakeReporter())).ok
+
+    assert item.target.read_bytes() == BODY
+    assert old_path(item).read_bytes() == ALT  # erste Generation unangetastet
+    assert old_path(item, ".1").read_bytes() == BODY
+
+
+async def test_zweiteiliger_installer_behaelt_eine_vollstaendige_fassung(tmp_path):
+    """Teil 1 lädt durch, Teil 2 scheitert - die Altfassung muss komplett bleiben.
+
+    Genau hier verliert ein direktes ``os.replace`` den Bestand: danach läge
+    Teil 1 neu und Teil 2 alt vor, also keine vollständige Fassung mehr.
+    """
+    api, sleep = FakeApi(), FakeSleep()
+    eins = make_item(tmp_path, md5=BODY_MD5, name="setup_(1).bin", file_id="file-1")
+    zwei = make_item(tmp_path, md5=BODY_MD5, name="setup_(2).bin", file_id="file-2")
+    eins.target.parent.mkdir(parents=True)
+    eins.target.write_bytes(ALT)
+    zwei.target.write_bytes(ALT + b"!")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "file-2" in str(request.url):
+            return httpx.Response(500)  # Netz, Rate-Limit, Strg-C: einerlei
+        return httpx.Response(200, content=BODY)
+
+    downloader = make_downloader(handler, api, sleep)
+    ergebnis_eins = await downloader.fetch(eins, FakeReporter())
+    ergebnis_zwei = await downloader.fetch(zwei, FakeReporter())
+
+    assert ergebnis_eins.ok
+    assert ergebnis_zwei.ok is False
+    # Teil 1: neue Fassung am Zielpfad, alte daneben.
+    assert eins.target.read_bytes() == BODY
+    assert old_path(eins).read_bytes() == ALT
+    # Teil 2: nie ersetzt, liegt unverändert am ursprünglichen Pfad.
+    assert zwei.target.read_bytes() == ALT + b"!"
+    assert not old_path(zwei).exists()
+
+
+async def test_ungeprueftes_ergebnis_ersetzt_vorhandene_zieldatei_nicht(tmp_path):
+    """Weder ``size`` noch ``md5`` bekannt: eine bekannte gute Datei bleibt liegen."""
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    item = make_item(tmp_path, size=None, md5=None)
+    item.target.parent.mkdir(parents=True)
+    item.target.write_bytes(ALT)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=BODY)
+
+    downloader = make_downloader(handler, api, sleep)
+    result = await downloader.fetch(item, reporter)
+
+    assert result.ok is False and result.verified is False
+    assert "prüfbar" in (result.error or "")
+    assert item.target.read_bytes() == ALT  # unverändert
+    assert not old_path(item).exists()
+    assert item.part_path.read_bytes() == BODY  # ``.part`` bleibt erhalten
+    assert reporter.finished[0][1] is False
+
+
+async def test_ungeprueftes_ergebnis_ohne_zieldatei_bleibt_erlaubt(tmp_path):
+    """Ohne Altbestand ist nichts zu verlieren - der Download zählt wie bisher."""
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    item = make_item(tmp_path, size=None, md5=None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=BODY)
+
+    downloader = make_downloader(handler, api, sleep)
+    result = await downloader.fetch(item, reporter)
+
+    assert result.ok and result.verified is False
+    assert item.target.read_bytes() == BODY
+    assert not item.part_path.exists()
+
+
+async def test_digest_wird_ueber_die_datei_gebildet_nicht_ueber_den_stream(tmp_path):
+    """Verifiziert wird, was auf der Platte liegt - nicht, was durch den Puffer lief."""
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    item = make_item(tmp_path, md5=BODY_MD5)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=BODY)
+
+    downloader = make_downloader(handler, api, sleep)
+    original = downloader._stream_to_part
+
+    async def sabotage(response, part, resume_from, reporter_, progress_handle=None):
+        written = await original(response, part, resume_from, reporter_, progress_handle)
+        # Gleiche Länge, andere Bytes: nur ein Digest der Datei merkt das.
+        part.write_bytes(b"Z" * part.stat().st_size)
+        return written
+
+    downloader._stream_to_part = sabotage
+    result = await downloader.fetch(item, reporter)
+
+    assert result.ok is False and result.verified is False
+    assert "MD5" in (result.error or "")
+    assert not item.target.exists()
+    assert not item.part_path.exists()
+
+
+async def test_abgeschlossener_neustart_setzt_den_range_zaehler_zurueck(tmp_path):
+    """Zwei ignorierte Ranges mit einem vollständigen Durchlauf dazwischen.
+
+    Die beiden Fehler traten nicht *in Folge* auf: dazwischen kam der Body
+    vollständig an, nur der Verbindungsabbau scheiterte. Der Lauf darf
+    deshalb nicht mit ``RangeNotHonoredError`` abbrechen.
+    """
+    api, sleep, reporter = FakeApi(), FakeSleep(), FakeReporter()
+    item = make_item(tmp_path, md5=BODY_MD5)
+    item.part_path.parent.mkdir(parents=True)
+    item.part_path.write_bytes(JUNK)
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # Vollständiger Body, danach bricht die Verbindung ab.
+            return httpx.Response(200, stream=FlakyStream(BODY))
+        return httpx.Response(200, content=BODY)  # Range wird ignoriert
+
+    # Chunkgröße teilt die Länge glatt, damit wirklich alle Bytes ankommen.
+    downloader = make_downloader(handler, api, sleep, chunk_size=50)
+    result = await downloader.fetch(item, reporter)
+
+    assert result.ok and result.verified
+    assert result.restarted is True
+    assert calls["n"] == 4  # 200, vollständig+Abbruch, 200, sauberer Neustart
+    assert item.target.read_bytes() == BODY
+    assert not item.part_path.exists()
 
 
 async def test_limit_rate_throttles(tmp_path):

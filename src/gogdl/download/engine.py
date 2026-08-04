@@ -14,6 +14,17 @@ verhindern das und bestimmen deshalb den gesamten Aufbau:
 
 Geschrieben wird ausschließlich nach ``item.part_path``; die Umbenennung
 nach ``item.target`` erfolgt atomar und erst nach bestandener Verifikation.
+
+Dazu kommen zwei Regeln, die den Bestand auf der Platte schützen:
+
+3. Verifiziert wird die fertige ``.part`` auf der Platte, nicht der
+   nebenbei mitgerechnete Digest des Streams. Nur so beantwortet die
+   Prüfung die Frage „was liegt da" statt „was kam an".
+4. Eine bereits vorhandene Zieldatei wird niemals überschrieben. GOG
+   liefert neue Fassungen regelmäßig unter identischem Dateinamen
+   (KONZEPT.md §4.1); der Altbestand wandert deshalb vor der Umbenennung
+   nach ``<name>.old`` (:data:`OLD_SUFFIX`). Löschen darf ihn nur
+   ``prune/``, das die Slot-Regel und ``--keep-versions`` kennt.
 """
 
 from __future__ import annotations
@@ -45,6 +56,15 @@ BACKOFF_CAP = 60.0
 
 RETRY_AFTER_CAP = 300.0
 """Obergrenze für ein von GOG genanntes ``Retry-After`` — schützt vor Hängern."""
+
+OLD_SUFFIX = ".old"
+"""Endung, unter der eine vorhandene Zieldatei beiseitegelegt wird.
+
+Bei Namenskollision wird durchnummeriert: ``<name>.old``, ``<name>.old.1``,
+``<name>.old.2`` ... Der ursprüngliche Dateiname bleibt dabei Präfix, damit
+die Namensheuristik von ``sync/`` und ``prune/`` die Datei weiterhin ihrem
+Slot zuordnen kann.
+"""
 
 
 def _parse_content_range_start(value: str | None) -> int | None:
@@ -182,7 +202,6 @@ class HttpDownloader:
         attempts = 0  # verbrauchte Netz-Wiederholungen
         range_failures = 0  # ignorierte Ranges *in Folge*
         written = 0
-        digest: str | None = None
         # Harte Schleifengrenze: Neustarts dürfen das Retry-Budget nicht
         # aufbrauchen, deshalb ein zweiter, unabhängiger Zähler.
         rounds = 0
@@ -268,11 +287,9 @@ class HttpDownloader:
                             item, written, restarted, f"Unerwarteter HTTP-Status {status}"
                         )
 
-                    hasher = self._make_hasher(entry.md5, part, resume_from)
                     written += await self._stream_to_part(
-                        response, part, resume_from, hasher, reporter, progress_handle
+                        response, part, resume_from, reporter, progress_handle
                     )
-                    digest = hasher.hexdigest() if hasher is not None else None
             except httpx.HTTPError as exc:
                 attempts += 1
                 if attempts > self._max_retries:
@@ -280,12 +297,20 @@ class HttpDownloader:
                 await self._nap(self._backoff(attempts))
                 # Die tatsächlich geschriebenen Bytes sind der neue Startpunkt.
                 resume_from = self._part_size(part)
-                digest = None
+                expected = item.expected_size
+                if expected is not None and resume_from >= expected:
+                    # Der Body kam vollständig an, erst danach brach die
+                    # Verbindung ab. Damit ist der laufende Versuch - auch ein
+                    # Neustart von vorn - erfolgreich abgeschlossen; ein später
+                    # erneut ignorierter Range ist dann kein Fehler *in Folge*.
+                    # Ohne diese Rücksetzung reißt ein einzelner Netzabbruch
+                    # den ganzen Lauf mit ``RangeNotHonoredError`` ab.
+                    range_failures = 0
                 continue
 
             break
 
-        return self._finish(item, written, restarted, digest)
+        return self._finish(item, written, restarted)
 
     # -------------------------------------------------------------- Details
 
@@ -294,7 +319,6 @@ class HttpDownloader:
         response: httpx.Response,
         part: Path,
         resume_from: int,
-        hasher: Any,
         reporter: ProgressReporter,
         progress_handle: object = None,
     ) -> int:
@@ -302,6 +326,12 @@ class HttpDownloader:
 
         ``progress_handle`` stammt aus ``start_file`` und ordnet die Bytes
         der richtigen Datei zu; ``handle`` ist hier die offene ``.part``.
+
+        Hier wird bewusst *nicht* mitgehasht: verifiziert wird später die
+        Datei auf der Platte. Ein Digest aus dem Stream beschreibt nur, was
+        durch den Puffer lief - schreiben zwei Läufe dieselbe ``.part``,
+        bestünden beide ihre Prüfung, obwohl nur ein Inhalt auf der Platte
+        liegt.
         """
         written = 0
         started = time.monotonic()
@@ -316,8 +346,6 @@ class HttpDownloader:
                 if not chunk:
                     continue
                 handle.write(chunk)
-                if hasher is not None:
-                    hasher.update(chunk)
                 written += len(chunk)
                 reporter.advance(len(chunk), progress_handle)
                 await self._throttle(written, started)
@@ -334,30 +362,14 @@ class HttpDownloader:
         if due > elapsed:
             await self._nap(due - elapsed)
 
-    def _make_hasher(self, expected_md5: str | None, part: Path, resume_from: int) -> Any:
-        """MD5-Kontext, beim Resume mit dem Altbestand vorbefüllt.
+    def _finish(self, item: DownloadItem, written: int, restarted: bool) -> DownloadResult:
+        """Verifiziert die ``.part`` und benennt sie erst danach atomar um.
 
-        Ohne diese Vorbefüllung hasht ein fortgesetzter Download nur den
-        neuen Teil und die Prüfung schlägt grundlos fehl.
+        Geprüft wird immer die Datei auf der Platte (:meth:`_digest_file`),
+        nie ein während des Streams mitgerechneter Digest - ein fortgesetzter
+        Download schließt den Altbestand der ``.part`` damit selbstverständlich
+        ein, und ein von fremder Hand veränderter Rest fällt auf.
         """
-        if not expected_md5:
-            return None
-        hasher = hashlib.md5()
-        if resume_from > 0 and part.exists():
-            with open(part, "rb") as handle:
-                remaining = resume_from
-                while remaining > 0:
-                    block = handle.read(min(self._chunk_size, remaining))
-                    if not block:
-                        break
-                    hasher.update(block)
-                    remaining -= len(block)
-        return hasher
-
-    def _finish(
-        self, item: DownloadItem, written: int, restarted: bool, digest: str | None
-    ) -> DownloadResult:
-        """Verifiziert die ``.part`` und benennt sie erst danach atomar um."""
         entry = item.entry
         part = item.part_path
         if not part.exists():
@@ -381,8 +393,7 @@ class HttpDownloader:
 
         if entry.md5:
             checked = True
-            if digest is None:
-                digest = self._digest_file(part)
+            digest = self._digest_file(part)
             if digest.lower() != entry.md5.lower():
                 self._discard(part)
                 return DownloadResult(
@@ -395,6 +406,27 @@ class HttpDownloader:
                 )
 
         item.target.parent.mkdir(parents=True, exist_ok=True)
+        if os.path.lexists(item.target):
+            # Am Zielpfad liegt bereits etwas. Es kann nicht das Ergebnis
+            # dieses Downloads sein - geschrieben wurde ausschließlich nach
+            # ``.part``. Also ist es Altbestand (§4.1: neue Fassung unter
+            # identischem Namen).
+            if not checked:
+                # Ein ungeprüftes Ergebnis darf eine bekannte gute Datei
+                # nicht ersetzen. Die ``.part`` bleibt liegen, damit der
+                # nächste Lauf mit Prüfsumme darüber entscheiden kann.
+                return self._failure(
+                    item,
+                    written,
+                    restarted,
+                    "Vorhandene Zieldatei nicht ersetzt: weder Größe noch MD5 prüfbar",
+                )
+            try:
+                self._preserve_existing(item.target)
+            except OSError as exc:
+                return self._failure(
+                    item, written, restarted, f"Altbestand nicht beiseitezulegen: {exc}"
+                )
         os.replace(part, item.target)
         return DownloadResult(
             item=item,
@@ -404,6 +436,33 @@ class HttpDownloader:
             error=None,
             restarted=restarted,
         )
+
+    @staticmethod
+    def _preserve_existing(target: Path) -> Path:
+        """Vorhandene Zieldatei beiseitelegen und den frei gewordenen Pfad melden.
+
+        GOG stellt neue Fassungen regelmäßig unter identischem Dateinamen ein
+        (KONZEPT.md §4.1) - der Zielpfad des neuen Downloads ist dann exakt
+        der Pfad der alten Datei. Ein ``os.replace`` darüber vernichtet sie an
+        Ort und Stelle. Bei einem zweiteiligen Installer genügt dann ein
+        Abbruch zwischen Teil 1 und Teil 2, und es existiert überhaupt keine
+        vollständige Fassung mehr: Teil 1 ist neu, Teil 2 alt. Weder die
+        Slot-Regel noch ``--keep-versions 2`` greifen da noch, denn zerstört
+        wird, bevor irgendein Aufräumschritt erreicht ist.
+
+        Die Altdatei wandert deshalb nach ``<name>.old`` im selben
+        Verzeichnis; ist der Name belegt, wird durchnummeriert, damit auch
+        das zweite Update in Folge nichts überschreibt. Gelöscht wird hier
+        nichts - das ist Sache von ``prune/``, das als einziges weiß, wann
+        eine Altfassung entbehrlich ist.
+        """
+        candidate = target.with_name(target.name + OLD_SUFFIX)
+        counter = 1
+        while os.path.lexists(candidate):
+            candidate = target.with_name(f"{target.name}{OLD_SUFFIX}.{counter}")
+            counter += 1
+        os.replace(target, candidate)
+        return candidate
 
     def _digest_file(self, path: Path) -> str:
         hasher = hashlib.md5()

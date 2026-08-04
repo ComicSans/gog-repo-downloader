@@ -48,12 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument("--jobs", type=int, default=4, help="Parallele Metadaten-Abrufe")
 
     status = sub.add_parser("status", help="Zeigen, was zu tun wäre - ohne etwas zu tun")
+    _add_selection(status)
     _add_filters(status)
     # Ohne diese Schalter kann status den Aufraeumteil von download nicht
     # vorhersagen, obwohl genau das sein Zweck ist.
     _add_prune_flags(status)
 
     download = sub.add_parser("download", help="Fehlende und veraltete Dateien laden")
+    _add_selection(download)
     _add_filters(download)
     _add_prune_flags(download)
     download.add_argument("--jobs", type=int, default=2, help="Parallele Downloads")
@@ -222,9 +224,11 @@ def main(argv: list[str] | None = None) -> int:
             case "update":
                 return asyncio.run(commands.cmd_update(ctx, only=args.only, skip=args.skip))
             case "status":
-                return commands.cmd_status(ctx)
+                return commands.cmd_status(ctx, only=args.only, skip=args.skip)
             case "download":
-                return asyncio.run(commands.cmd_download(ctx))
+                return asyncio.run(
+                    commands.cmd_download(ctx, only=args.only, skip=args.skip)
+                )
             case "verify":
                 return commands.cmd_verify(ctx, deep=args.deep)
             case "import":

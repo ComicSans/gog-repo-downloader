@@ -1,7 +1,13 @@
 """Tests für gogdl.api gegen ``httpx.MockTransport``.
 
-Die Fixtures bilden die GOG-Payloads als JSON-Strings ab; jeder Test
-beschreibt genau ein Verhalten aus KONZEPT.md §3/§4.
+Die Fixtures bilden die echten GOG-Payloads als JSON-Strings ab; jeder
+Test beschreibt genau ein Verhalten aus KONZEPT.md §3/§4.
+
+Gearbeitet wird auf dem Offline-Weg von ``embed.gog.com``:
+``account/gameDetails/{id}.json`` plus ein 302 auf jede ``manualUrl``.
+Der alte Weg über ``api.gog.com/products/{id}?expand=downloads`` ist
+gegen ein echtes Konto als kaputt nachgewiesen (die dort genannten
+``downlink``-URLs antworten mit HTTP 404 und einer HTML-Fehlerseite).
 """
 
 from __future__ import annotations
@@ -12,7 +18,8 @@ import httpx
 import pytest
 
 from gogdl.api import GogApiClient
-from gogdl.constants import API_BASE
+from gogdl.api.client import language_code, language_fallback
+from gogdl.constants import EMBED_BASE
 from gogdl.errors import ApiError, AuthError, RateLimitError
 from gogdl.model.protocols import GogApi
 from gogdl.model.types import FileKind, OsName, SlotKey
@@ -21,7 +28,7 @@ from gogdl.model.types import FileKind, OsName, SlotKey
 
 
 class FakeAuth:
-    """Minimaler AuthProvider — liefert immer dasselbe Token."""
+    """Minimaler AuthProvider - liefert immer dasselbe Token."""
 
     def __init__(self, token: str = "token-123") -> None:
         self.token = token
@@ -52,28 +59,34 @@ def json_response(payload, status: int = 200) -> httpx.Response:
     return httpx.Response(status, text=text, headers={"Content-Type": "application/json"})
 
 
-PRODUCT_BASE = json.loads(
+GAME_DETAILS_BASE = json.loads(
     """
 {
-  "id": 1207658930,
-  "title": "Beispielspiel",
-  "downloads": {
-    "installers": [],
-    "patches": [],
-    "bonus_content": []
-  },
-  "expanded_dlcs": []
+  "title": "15 Days",
+  "backgroundImage": "//images.gog.com/x_bg.jpg",
+  "cdKey": "",
+  "textInformation": "",
+  "downloads": [],
+  "galaxyDownloads": [],
+  "extras": [],
+  "dlcs": [],
+  "tags": [],
+  "isPreOrder": false,
+  "releaseTimestamp": 1234567890,
+  "messages": [],
+  "changelog": "",
+  "forumLink": "https://www.gog.com/forum/15_days",
+  "isBaseProductMissing": false,
+  "missingBaseProduct": null,
+  "simpleGalaxyInstallers": []
 }
 """
 )
 
 
-def product_payload(**overrides):
-    """Produkt-Payload aus der Basis plus gezielten Ergänzungen."""
-    payload = json.loads(json.dumps(PRODUCT_BASE))
-    downloads = overrides.pop("downloads", None)
-    if downloads is not None:
-        payload["downloads"].update(downloads)
+def details_payload(**overrides):
+    """gameDetails-Payload aus der Basis plus gezielten Ergänzungen."""
+    payload = json.loads(json.dumps(GAME_DETAILS_BASE))
     payload.update(overrides)
     return payload
 
@@ -155,216 +168,286 @@ async def test_library_einzelseite_ohne_total_pages():
     assert [p.product_id for p in await client.library()] == [7]
 
 
+# -- Sprachabbildung --------------------------------------------------
+
+
+def test_sprachcode_erkennt_englische_und_muttersprachliche_namen():
+    assert language_code("English") == "en"
+    assert language_code("Deutsch") == "de"
+    assert language_code("German") == "de"
+    assert language_code("français") == "fr"
+    assert language_code("Polish") == "pl"
+    assert language_code("русский") == "ru"
+    assert language_code("日本語") == "ja"
+    assert language_code("Türkçe") == "tr"
+
+
+def test_sprachcode_ignoriert_gross_klein_und_randleerraum():
+    assert language_code("  ENGLISH ") == "en"
+    assert language_code("deutsch") == "de"
+
+
+def test_sprachcode_ist_bei_unbekanntem_none():
+    assert language_code("Klingon") is None
+    assert language_code(None) is None
+    assert language_code(17) is None
+
+
+def test_alle_sprachcodes_sind_kleingeschrieben():
+    """``Preference.select`` schreibt klein - ein Code mit Großbuchstaben
+    fiele beim Filtern lautlos durch."""
+    from gogdl.api.client import LANGUAGE_CODES
+
+    assert all(code == code.lower() for code in LANGUAGE_CODES.values())
+
+
+def test_sprach_fallback_ist_klartext_ohne_leerraum():
+    assert language_fallback("Klingon") == "klingon"
+    assert language_fallback("Old English") == "oldenglish"
+    assert language_fallback("") == ""
+
+
 # -- product_files ----------------------------------------------------
 
-MULTIPART_INSTALLER = """
-[{"id": "en1installer0", "os": "windows", "language": "en", "version": "2.1.0.9",
-  "total_size": 3000,
-  "files": [
-    {"id": "en1installer0", "size": 2000,
-     "downlink": "https://api.gog.com/products/1207658930/downlink/installer/en1installer0"},
-    {"id": "en1installer1", "size": 1000,
-     "downlink": "https://api.gog.com/products/1207658930/downlink/installer/en1installer1"}
+
+async def test_game_details_endpunkt_wird_angefragt():
+    gesehen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.append(str(request.url))
+        assert request.headers["Authorization"] == "Bearer token-123"
+        return json_response(details_payload())
+
+    client, _ = make_client(handler)
+    await client.product_files(42)
+
+    assert gesehen == [f"{EMBED_BASE}/account/gameDetails/42.json"]
+
+
+ZWEI_SPRACHEN_ZWEI_PLATTFORMEN = """
+[
+  ["English", {
+    "windows": [{"manualUrl": "/downloads/15_days/en1installer0",
+                 "name": "15 Days", "version": "1.0", "date": "", "size": "1 MB"}],
+    "mac": [{"manualUrl": "/downloads/15_days/en2installer0",
+             "name": "15 Days", "version": "1.0", "date": "", "size": "1 MB"}]
+  }],
+  ["Deutsch", {
+    "windows": [{"manualUrl": "/downloads/15_days/de1installer0",
+                 "name": "15 Days", "version": "1.0", "date": "", "size": "1 MB"}],
+    "mac": [{"manualUrl": "/downloads/15_days/de2installer0",
+             "name": "15 Days", "version": "1.0", "date": "", "size": "1 MB"}]
+  }]
+]
+"""
+
+
+async def test_zwei_sprachen_und_zwei_plattformen_ergeben_vier_slots():
+    payload = details_payload(downloads=json.loads(ZWEI_SPRACHEN_ZWEI_PLATTFORMEN))
+    client, _ = make_client(lambda request: json_response(payload))
+
+    files = await client.product_files(1207658930)
+
+    assert len(files) == 4
+    assert {f.slot for f in files} == {
+        SlotKey(1207658930, FileKind.INSTALLER, OsName.WINDOWS, "en"),
+        SlotKey(1207658930, FileKind.INSTALLER, OsName.MAC, "en"),
+        SlotKey(1207658930, FileKind.INSTALLER, OsName.WINDOWS, "de"),
+        SlotKey(1207658930, FileKind.INSTALLER, OsName.MAC, "de"),
+    }
+    assert all(f.slot.variant is None for f in files)
+    assert all(f.part_index == 1 and f.total_parts == 1 for f in files)
+    assert [f.file_id for f in files] == [
+        "en1installer0",
+        "en2installer0",
+        "de1installer0",
+        "de2installer0",
+    ]
+
+
+DREITEILIGER_INSTALLER = """
+[
+  ["English", {"windows": [
+    {"manualUrl": "/downloads/15_days/en1installer0",
+     "name": "15 Days (Part 1 of 3)", "version": "1.0", "date": "", "size": "1 MB"},
+    {"manualUrl": "/downloads/15_days/en1installer1",
+     "name": "15 Days (Part 2 of 3)", "version": "1.0", "date": "", "size": "4 GB"},
+    {"manualUrl": "/downloads/15_days/en1installer2",
+     "name": "15 Days (Part 3 of 3)", "version": "1.0", "date": "", "size": "2 GB"}
   ]}]
+]
 """
 
 
 async def test_mehrteiliger_installer_teilt_einen_slot():
-    payload = product_payload(downloads={"installers": json.loads(MULTIPART_INSTALLER)})
+    """Alle Einträge einer (Sprache, Plattform) sind eine Auslieferung - §5.5."""
+    payload = details_payload(downloads=json.loads(DREITEILIGER_INSTALLER))
     client, _ = make_client(lambda request: json_response(payload))
 
     files = await client.product_files(1207658930)
 
-    assert len(files) == 2
-    erwartet = SlotKey(1207658930, FileKind.INSTALLER, OsName.WINDOWS, "en")
-    assert {f.slot for f in files} == {erwartet}
-    assert [f.part_index for f in files] == [1, 2]
-    assert [f.total_parts for f in files] == [2, 2]
-    assert [f.file_id for f in files] == ["en1installer0", "en1installer1"]
-    assert [f.size for f in files] == [2000, 1000]
-    assert all(f.version == "2.1.0.9" for f in files)
-
-
-async def test_expand_parameter_wird_gesetzt():
-    gesehen: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        gesehen.append(request.url.params["expand"])
-        assert str(request.url).startswith(f"{API_BASE}/products/42")
-        return json_response(product_payload())
-
-    client, _ = make_client(handler)
-    await client.product_files(42)
-    assert gesehen == ["downloads,expanded_dlcs"]
-
-
-TWO_LANGUAGES = """
-[{"id": "en1installer0", "os": "windows", "language": "en", "version": "2.1",
-  "files": [{"id": "en1installer0", "size": 10, "downlink": "/dl/en"}]},
- {"id": "de1installer0", "os": "windows", "language": "de", "version": "2.1",
-  "files": [{"id": "de1installer0", "size": 11, "downlink": "/dl/de"}]}]
-"""
-
-
-async def test_zwei_sprachen_ergeben_zwei_slots():
-    payload = product_payload(downloads={"installers": json.loads(TWO_LANGUAGES)})
-    client, _ = make_client(lambda request: json_response(payload))
-
-    files = await client.product_files(1207658930)
-
-    assert len(files) == 2
+    assert len(files) == 3
     assert {f.slot for f in files} == {
-        SlotKey(1207658930, FileKind.INSTALLER, OsName.WINDOWS, "en"),
-        SlotKey(1207658930, FileKind.INSTALLER, OsName.WINDOWS, "de"),
+        SlotKey(1207658930, FileKind.INSTALLER, OsName.WINDOWS, "en")
     }
-    assert all(f.total_parts == 1 and f.part_index == 1 for f in files)
+    assert [f.part_index for f in files] == [1, 2, 3]
+    assert [f.total_parts for f in files] == [3, 3, 3]
+    assert [f.file_id for f in files] == ["en1installer0", "en1installer1", "en1installer2"]
+    assert [f.downlink for f in files] == [
+        "/downloads/15_days/en1installer0",
+        "/downloads/15_days/en1installer1",
+        "/downloads/15_days/en1installer2",
+    ]
+    assert all(f.version == "1.0" for f in files)
 
 
-PATCHES = """
-[{"id": "en1patch0", "os": "linux", "language": "en", "version": "2.0_to_2.1",
-  "files": [{"id": "en1patch0", "size": 500, "downlink": "/dl/patch"}]}]
+async def test_groesse_aus_game_details_wird_nicht_uebernommen():
+    """"1 MB" ist gerundeter Text und als Aktualitätssignal unbrauchbar -
+    die echte Größe liefert erst ``content_length`` (§4.2)."""
+    payload = details_payload(downloads=json.loads(DREITEILIGER_INSTALLER))
+    client, _ = make_client(lambda request: json_response(payload))
+
+    files = await client.product_files(1207658930)
+    assert all(f.size is None for f in files)
+
+
+LEERE_VERSION = """
+[["English", {"windows": [
+  {"manualUrl": "/downloads/x/en1installer0", "name": "X", "version": "", "size": "1 MB"}
+]}]]
 """
 
 
-async def test_patches_werden_als_patch_kind_erfasst():
-    payload = product_payload(downloads={"patches": json.loads(PATCHES)})
+async def test_leere_version_wird_zu_none():
+    payload = details_payload(downloads=json.loads(LEERE_VERSION))
     client, _ = make_client(lambda request: json_response(payload))
 
     (file,) = await client.product_files(1207658930)
-    assert file.slot == SlotKey(1207658930, FileKind.PATCH, OsName.LINUX, "en", "2.0_to_2.1")
-    assert file.version == "2.0_to_2.1"
-
-
-TWO_PATCHES = """
-[{"id": "en1patch0", "os": "windows", "language": "en", "version": "2.0 to 2.1",
-  "files": [{"id": "en1patch0", "size": 500, "downlink": "/dl/patch0"}]},
- {"id": "en1patch1", "os": "windows", "language": "en", "version": "2.1 to 2.2",
-  "files": [{"id": "en1patch1", "size": 600, "downlink": "/dl/patch1"}]}]
-"""
-
-
-async def test_zwei_patches_gleicher_plattform_ergeben_zwei_slots():
-    """GOG bietet mehrere Versionsspannen pro (os, language) an - §5.5."""
-    payload = product_payload(downloads={"patches": json.loads(TWO_PATCHES)})
-    client, _ = make_client(lambda request: json_response(payload))
-
-    files = await client.product_files(1207658930)
-
-    assert len(files) == 2
-    assert {f.slot for f in files} == {
-        SlotKey(1207658930, FileKind.PATCH, OsName.WINDOWS, "en", "2.0-to-2.1"),
-        SlotKey(1207658930, FileKind.PATCH, OsName.WINDOWS, "en", "2.1-to-2.2"),
-    }
-    assert [f.version for f in files] == ["2.0 to 2.1", "2.1 to 2.2"]
-
-
-PATCH_OHNE_VERSION = """
-[{"id": "en1patch0", "os": "windows", "language": "en",
-  "files": [{"id": "a", "size": 1, "downlink": "/dl/a"}]},
- {"id": "en1patch1", "os": "windows", "language": "en",
-  "files": [{"id": "b", "size": 2, "downlink": "/dl/b"}]}]
-"""
-
-
-async def test_patch_ohne_version_faellt_auf_die_eintrags_id_zurueck():
-    payload = product_payload(downloads={"patches": json.loads(PATCH_OHNE_VERSION)})
-    client, _ = make_client(lambda request: json_response(payload))
-
-    files = await client.product_files(1207658930)
-
-    assert [f.slot.variant for f in files] == ["en1patch0", "en1patch1"]
-    assert len({f.slot for f in files}) == 2
-    assert all(f.version is None for f in files)
-
-
-BONUS_CONTENT = """
-[{"id": 12345, "name": "manual", "type": "manuals", "count": 1, "total_size": 700,
-  "files": [{"id": 12345, "size": 700, "downlink": "/dl/manual"}]}]
-"""
-
-
-async def test_extra_ohne_version():
-    payload = product_payload(downloads={"bonus_content": json.loads(BONUS_CONTENT)})
-    client, _ = make_client(lambda request: json_response(payload))
-
-    (file,) = await client.product_files(1207658930)
-    assert file.slot == SlotKey(1207658930, FileKind.EXTRA, None, None, "manuals")
-    assert file.slot.os is None and file.slot.language is None
     assert file.version is None
-    assert file.file_id == "12345"
-    assert file.size == 700
 
 
-TWO_EXTRAS = """
-[{"id": 12345, "name": "Handbuch (PDF)", "type": "manuals", "count": 1,
-  "files": [{"id": 12345, "size": 700, "downlink": "/dl/manual"}]},
- {"id": 12346, "name": "Soundtrack", "type": "Game Soundtrack", "count": 1,
-  "files": [{"id": 12346, "size": 900, "downlink": "/dl/ost"}]}]
+UNBEKANNTE_SPRACHE = """
+[
+  ["English", {"windows": [{"manualUrl": "/downloads/x/en1installer0", "version": "1.0"}]}],
+  ["Klingon", {"windows": [{"manualUrl": "/downloads/x/kl1installer0", "version": "1.0"}]}]
+]
 """
 
 
-async def test_zwei_extras_ergeben_zwei_slots():
+async def test_unbekannte_sprache_faellt_auf_den_klartext_zurueck(caplog):
+    payload = details_payload(downloads=json.loads(UNBEKANNTE_SPRACHE))
+    client, _ = make_client(lambda request: json_response(payload))
+
+    with caplog.at_level("WARNING"):
+        files = await client.product_files(1207658930)
+
+    assert [f.slot.language for f in files] == ["en", "klingon"]
+    assert any("Klingon" in record.getMessage() for record in caplog.records)
+
+
+async def test_unbekannte_sprache_warnt_nur_einmal(caplog):
+    payload = details_payload(downloads=json.loads(UNBEKANNTE_SPRACHE))
+    client, _ = make_client(lambda request: json_response(payload))
+
+    with caplog.at_level("WARNING"):
+        await client.product_files(1207658930)
+        await client.product_files(1207658930)
+
+    treffer = [r for r in caplog.records if "Unbekannte Sprache" in r.getMessage()]
+    assert len(treffer) == 1
+
+
+UNBEKANNTE_PLATTFORM = """
+[["English", {
+  "amiga": [{"manualUrl": "/downloads/x/am1installer0", "version": "1.0"}],
+  "windows": [{"manualUrl": "/downloads/x/en1installer0", "version": "1.0"}]
+}]]
+"""
+
+
+async def test_unbekannte_plattform_wird_uebersprungen(caplog):
+    payload = details_payload(downloads=json.loads(UNBEKANNTE_PLATTFORM))
+    client, _ = make_client(lambda request: json_response(payload))
+
+    with caplog.at_level("WARNING"):
+        files = await client.product_files(1207658930)
+
+    assert [f.file_id for f in files] == ["en1installer0"]
+    assert any("amiga" in record.getMessage() for record in caplog.records)
+
+
+async def test_unbekannte_plattform_warnt_nur_einmal(caplog):
+    payload = details_payload(downloads=json.loads(UNBEKANNTE_PLATTFORM))
+    client, _ = make_client(lambda request: json_response(payload))
+
+    with caplog.at_level("WARNING"):
+        await client.product_files(1207658930)
+        await client.product_files(1207658930)
+
+    treffer = [r for r in caplog.records if "Betriebssystem" in r.getMessage()]
+    assert len(treffer) == 1
+
+
+EXTRAS = """
+[
+  {"manualUrl": "/downloads/15_days/extra0", "name": "Handbuch (PDF)",
+   "type": "manuals", "info": 1, "size": "12 MB"},
+  {"manualUrl": "/downloads/15_days/extra1", "name": "Game Soundtrack",
+   "type": "audio", "info": 1, "size": "300 MB"}
+]
+"""
+
+
+async def test_extras_ergeben_je_variant_einen_slot():
     """Ohne Diskriminator wären Handbuch und Soundtrack fürs Aufräumen eine
     einzige Auslieferung - genau das verbietet §5.5."""
-    payload = product_payload(downloads={"bonus_content": json.loads(TWO_EXTRAS)})
+    payload = details_payload(extras=json.loads(EXTRAS))
     client, _ = make_client(lambda request: json_response(payload))
 
     files = await client.product_files(1207658930)
 
     assert len(files) == 2
     assert {f.slot for f in files} == {
-        SlotKey(1207658930, FileKind.EXTRA, None, None, "manuals"),
+        SlotKey(1207658930, FileKind.EXTRA, None, None, "handbuch-pdf"),
         SlotKey(1207658930, FileKind.EXTRA, None, None, "game-soundtrack"),
     }
     assert all(f.slot.os is None and f.slot.language is None for f in files)
+    assert all(f.version is None and f.size is None for f in files)
+    assert [f.file_id for f in files] == ["extra0", "extra1"]
+    assert [f.downlink for f in files] == [
+        "/downloads/15_days/extra0",
+        "/downloads/15_days/extra1",
+    ]
 
 
-EXTRA_OHNE_TYPE = """
-[{"id": 777, "name": "Avatare & Wallpaper",
-  "files": [{"id": 777, "size": 10, "downlink": "/dl/av"}]},
- {"id": 778, "files": [{"id": 778, "size": 11, "downlink": "/dl/x"}]},
- {"id": 779, "name": "!!!", "files": [{"id": 779, "size": 12, "downlink": "/dl/y"}]}]
+EXTRAS_OHNE_NAME = """
+[
+  {"manualUrl": "/downloads/15_days/extra0", "size": "1 MB"},
+  {"manualUrl": "/downloads/15_days/extra1", "name": "!!!", "size": "1 MB"},
+  {"name": "ohne manualUrl", "size": "1 MB"}
+]
 """
 
 
-async def test_extra_diskriminator_faellt_von_type_auf_name_auf_id_zurueck():
-    payload = product_payload(downloads={"bonus_content": json.loads(EXTRA_OHNE_TYPE)})
+async def test_extra_diskriminator_faellt_auf_die_id_der_manual_url_zurueck():
+    payload = details_payload(extras=json.loads(EXTRAS_OHNE_NAME))
     client, _ = make_client(lambda request: json_response(payload))
 
     files = await client.product_files(1207658930)
 
-    # "&" fällt weg, Leerraum wird zu "-"; leeres Ergebnis nutzt die id.
-    assert [f.slot.variant for f in files] == ["avatare--wallpaper", "778", "779"]
-    assert len({f.slot for f in files}) == 3
-
-
-async def test_mehrteiliger_extra_bleibt_ein_slot():
-    """Die Trennung nach variant darf die Bündelung der Teile nicht brechen."""
-    entry = json.loads(TWO_EXTRAS)[0]
-    entry["count"] = 2
-    entry["files"] = [
-        {"id": "manual_a", "size": 700, "downlink": "/dl/manual_a"},
-        {"id": "manual_b", "size": 300, "downlink": "/dl/manual_b"},
-    ]
-    payload = product_payload(downloads={"bonus_content": [entry]})
-    client, _ = make_client(lambda request: json_response(payload))
-
-    files = await client.product_files(1207658930)
-
-    assert len(files) == 2
-    assert {f.slot for f in files} == {SlotKey(1207658930, FileKind.EXTRA, None, None, "manuals")}
-    assert [f.part_index for f in files] == [1, 2]
-    assert [f.total_parts for f in files] == [2, 2]
-    assert [f.file_id for f in files] == ["manual_a", "manual_b"]
+    # Ohne brauchbaren Namen greift die id aus der manualUrl; der Eintrag
+    # ohne manualUrl ist nicht ladbar und fällt weg.
+    assert [f.slot.variant for f in files] == ["extra0", "extra1"]
+    assert len({f.slot for f in files}) == 2
 
 
 async def test_variant_ist_ueber_laeufe_stabil():
     """Der Diskriminator kommt aus der Payload, nicht aus der Reihenfolge -
     sonst gälte beim nächsten Lauf jeder Slot als neu."""
-    eintraege = json.loads(TWO_EXTRAS)
+    eintraege = json.loads(EXTRAS)
     payloads = [
-        product_payload(downloads={"bonus_content": eintraege}),
-        product_payload(downloads={"bonus_content": list(reversed(eintraege))}),
+        details_payload(extras=eintraege),
+        details_payload(extras=list(reversed(eintraege))),
     ]
     client, _ = make_client(lambda request: json_response(payloads.pop(0)))
 
@@ -377,27 +460,19 @@ async def test_variant_ist_ueber_laeufe_stabil():
     }
 
 
-async def test_installer_slot_bleibt_ohne_variant():
-    payload = product_payload(downloads={"installers": json.loads(TWO_LANGUAGES)})
-    client, _ = make_client(lambda request: json_response(payload))
-
-    files = await client.product_files(1207658930)
-    assert all(f.slot.variant is None for f in files)
-
-
-DLC_PAYLOAD = """
-[{"id": 555, "title": "Beispielspiel DLC",
-  "downloads": {"installers": [
-    {"id": "en1installer0", "os": "mac", "language": "en", "version": "1.0",
-     "files": [{"id": "dlc_file", "size": 99, "downlink": "/dl/dlc"}]}]},
-  "expanded_dlcs": []}]
+DLC = """
+[{"id": 555, "title": "15 Days DLC",
+  "downloads": [["English", {"mac": [
+    {"manualUrl": "/downloads/15_days_dlc/en2installer0",
+     "name": "DLC", "version": "1.0", "size": "5 MB"}]}]],
+  "extras": [],
+  "dlcs": []}]
 """
 
 
 async def test_dlc_wird_rekursiv_mit_eigener_produkt_id_erfasst():
-    payload = product_payload(
-        downloads={"installers": json.loads(TWO_LANGUAGES)},
-        expanded_dlcs=json.loads(DLC_PAYLOAD),
+    payload = details_payload(
+        downloads=json.loads(ZWEI_SPRACHEN_ZWEI_PLATTFORMEN), dlcs=json.loads(DLC)
     )
     client, _ = make_client(lambda request: json_response(payload))
 
@@ -406,14 +481,13 @@ async def test_dlc_wird_rekursiv_mit_eigener_produkt_id_erfasst():
     dlc_files = [f for f in files if f.product_id == 555]
     assert len(dlc_files) == 1
     assert dlc_files[0].slot == SlotKey(555, FileKind.INSTALLER, OsName.MAC, "en")
-    assert dlc_files[0].file_id == "dlc_file"
-    assert len(files) == 3
+    assert dlc_files[0].file_id == "en2installer0"
+    assert len(files) == 5
 
 
 async def test_dlc_datei_kennt_das_hauptspiel():
-    payload = product_payload(
-        downloads={"installers": json.loads(TWO_LANGUAGES)},
-        expanded_dlcs=json.loads(DLC_PAYLOAD),
+    payload = details_payload(
+        downloads=json.loads(ZWEI_SPRACHEN_ZWEI_PLATTFORMEN), dlcs=json.loads(DLC)
     )
     client, _ = make_client(lambda request: json_response(payload))
 
@@ -427,129 +501,186 @@ async def test_dlc_datei_kennt_das_hauptspiel():
 
 
 async def test_dlc_wird_bei_include_dlc_false_ausgelassen():
-    payload = product_payload(
-        downloads={"installers": json.loads(TWO_LANGUAGES)},
-        expanded_dlcs=json.loads(DLC_PAYLOAD),
+    payload = details_payload(
+        downloads=json.loads(ZWEI_SPRACHEN_ZWEI_PLATTFORMEN), dlcs=json.loads(DLC)
     )
     client, _ = make_client(lambda request: json_response(payload))
 
     files = await client.product_files(1207658930, include_dlc=False)
 
     assert all(f.product_id == 1207658930 for f in files)
-    assert len(files) == 2
+    assert len(files) == 4
 
 
-NESTED_DLC = """
-[{"id": 555, "title": "DLC", "downloads": {"installers": []},
-  "expanded_dlcs": [
-    {"id": 556, "title": "DLC im DLC",
-     "downloads": {"installers": [
-       {"id": "x", "os": "windows", "language": "en", "version": "1.0",
-        "files": [{"id": "nested", "size": 5, "downlink": "/dl/nested"}]}]},
-     "expanded_dlcs": []}]}]
+VERSCHACHTELTES_DLC = """
+[{"id": 555, "title": "DLC", "downloads": [], "extras": [],
+  "dlcs": [{"id": 556, "title": "DLC im DLC",
+    "downloads": [["English", {"windows": [
+      {"manualUrl": "/downloads/nested/en1installer0", "version": "1.0"}]}]],
+    "extras": [], "dlcs": []}]}]
 """
 
 
 async def test_dlc_rekursion_geht_in_die_tiefe():
-    payload = product_payload(expanded_dlcs=json.loads(NESTED_DLC))
+    payload = details_payload(dlcs=json.loads(VERSCHACHTELTES_DLC))
     client, _ = make_client(lambda request: json_response(payload))
 
     (file,) = await client.product_files(1207658930)
     assert file.product_id == 556
-    assert file.file_id == "nested"
+    assert file.file_id == "en1installer0"
     # dlc_of zeigt auf das angefragte Hauptprodukt, nicht auf das Eltern-DLC 555.
     assert file.dlc_of == 1207658930
 
 
-UNKNOWN_OS = """
-[{"id": "amiga0", "os": "amiga", "language": "en", "version": "1.0",
-  "files": [{"id": "amiga_file", "size": 1, "downlink": "/dl/amiga"}]},
- {"id": "en1installer0", "os": "windows", "language": "en", "version": "1.0",
-  "files": [{"id": "win_file", "size": 2, "downlink": "/dl/win"}]}]
+DLC_OHNE_ID = """
+[{"title": "DLC ohne id", "extras": [
+   {"manualUrl": "/downloads/15_days_dlc/extra0", "name": "DLC-Handbuch"}],
+  "downloads": [], "dlcs": []}]
 """
 
 
-async def test_unbekanntes_os_wird_uebersprungen(caplog):
-    payload = product_payload(downloads={"installers": json.loads(UNKNOWN_OS)})
+async def test_dlc_ohne_id_laeuft_unter_der_produkt_id_des_hauptspiels(caplog):
+    payload = details_payload(dlcs=json.loads(DLC_OHNE_ID))
     client, _ = make_client(lambda request: json_response(payload))
 
     with caplog.at_level("WARNING"):
-        files = await client.product_files(1207658930)
+        (file,) = await client.product_files(1207658930)
 
-    assert [f.file_id for f in files] == ["win_file"]
-    assert any("amiga" in record.getMessage() for record in caplog.records)
-
-
-async def test_unbekanntes_os_warnt_nur_einmal(caplog):
-    payload = product_payload(downloads={"installers": json.loads(UNKNOWN_OS)})
-    client, _ = make_client(lambda request: json_response(payload))
-
-    with caplog.at_level("WARNING"):
-        await client.product_files(1207658930)
-        await client.product_files(1207658930)
-
-    treffer = [r for r in caplog.records if "Betriebssystem" in r.getMessage()]
-    assert len(treffer) == 1
+    assert file.product_id == 1207658930
+    # Die Zugehörigkeit bleibt trotzdem erkennbar.
+    assert file.dlc_of == 1207658930
+    assert file.is_dlc is True
+    assert any("ohne eigene id" in record.getMessage() for record in caplog.records)
 
 
 async def test_produkt_ohne_downloads_liefert_leere_liste():
-    client, _ = make_client(lambda request: json_response('{"id": 1, "title": "leer"}'))
+    client, _ = make_client(lambda request: json_response('{"title": "leer"}'))
     assert await client.product_files(1) == []
 
 
 # -- resolve_downlink -------------------------------------------------
 
+SIGNIERT = (
+    "https://gog-cdn-fastly.gog.com/token=nva0000/secure/offline/1104118179/"
+    "setup_15_days_1.0_%2819285%29.exe"
+)
 
-async def test_resolve_downlink_extrahiert_dateinamen():
-    signed = (
-        "https://gog-cdn-lumen.secure2.footprint.net/token/x/setup_the_witcher_2.1.0.9.exe"
-        "?token=abc&expires=1700000000"
-    )
+
+async def test_resolve_downlink_liest_die_signierte_url_aus_dem_location_header():
+    aufrufe: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == f"{API_BASE}/products/1/downlink/installer/en1installer0"
-        return json_response(
-            {"downlink": signed, "checksum": "https://cdn.gog.com/x/setup.exe.xml"}
-        )
+        aufrufe.append(request)
+        return httpx.Response(302, headers={"Location": SIGNIERT})
 
     client, _ = make_client(handler)
-    link = await client.resolve_downlink("/products/1/downlink/installer/en1installer0")
+    link = await client.resolve_downlink("/downloads/15_days/en1installer0")
 
-    assert link.url == signed
-    assert link.filename == "setup_the_witcher_2.1.0.9.exe"
-    assert link.checksum_url == "https://cdn.gog.com/x/setup.exe.xml"
-
-
-async def test_resolve_downlink_dekodiert_dateinamen():
-    signed = "https://cdn.gog.com/token/setup%20spiel%20%282%29.bin?token=a%2Fb&x=1"
-    client, _ = make_client(lambda request: json_response({"downlink": signed, "checksum": ""}))
-
-    link = await client.resolve_downlink("https://api.gog.com/products/1/downlink/x")
-
-    assert link.filename == "setup spiel (2).bin"
+    # Genau ein Request: der Redirect darf nicht verfolgt werden, sonst
+    # lädt schon das Auflösen die ganze Datei.
+    assert len(aufrufe) == 1
+    assert str(aufrufe[0].url) == f"{EMBED_BASE}/downloads/15_days/en1installer0"
+    assert aufrufe[0].headers["Authorization"] == "Bearer token-123"
+    assert link.url == SIGNIERT
+    assert link.filename == "setup_15_days_1.0_(19285).exe"
+    # Solange kein funktionierender XML-Pfad bekannt ist, wird keiner geraten.
     assert link.checksum_url is None
 
 
 async def test_resolve_downlink_akzeptiert_absoluten_link():
-    absolut = "https://api.gog.com/products/1/downlink/installer/en1installer0"
+    absolut = f"{EMBED_BASE}/downloads/15_days/en1installer0"
     gesehen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         gesehen.append(str(request.url))
-        return json_response({"downlink": "https://cdn.gog.com/a/b/file.bin"})
+        return httpx.Response(302, headers={"Location": SIGNIERT})
 
     client, _ = make_client(handler)
     link = await client.resolve_downlink(absolut)
 
     assert gesehen == [absolut]
-    assert link.filename == "file.bin"
+    assert link.url == SIGNIERT
+
+
+async def test_resolve_downlink_macht_relative_location_absolut():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": "/secure/offline/setup.exe"})
+
+    client, _ = make_client(handler)
+    link = await client.resolve_downlink("/downloads/x/en1installer0")
+
+    assert link.url == f"{EMBED_BASE}/secure/offline/setup.exe"
+    assert link.filename == "setup.exe"
+
+
+async def test_resolve_downlink_akzeptiert_200_statt_302():
+    """Antwortet GOG direkt mit der Datei, ist die angefragte URL bereits
+    die signierte - das ist kein Fehler."""
+    signiert = "https://gog-cdn-fastly.gog.com/token=x/secure/setup_spiel%20%282%29.bin"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"MZ", headers={"Content-Length": "2"})
+
+    client, _ = make_client(handler)
+    link = await client.resolve_downlink(signiert)
+
+    assert link.url == signiert
+    assert link.filename == "setup_spiel (2).bin"
     assert link.checksum_url is None
 
 
-async def test_resolve_downlink_ohne_downlink_ist_api_error():
-    client, _ = make_client(lambda request: json_response({"checksum": "x"}))
+async def test_resolve_downlink_ohne_location_ist_api_error():
+    client, _ = make_client(lambda request: httpx.Response(302))
     with pytest.raises(ApiError):
-        await client.resolve_downlink("/products/1/downlink/x")
+        await client.resolve_downlink("/downloads/x/en1installer0")
+
+
+# -- content_length ---------------------------------------------------
+
+
+async def test_content_length_liest_den_header():
+    gesehen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        gesehen.append(request.method)
+        return httpx.Response(200, headers={"Content-Length": "821824", "Accept-Ranges": "bytes"})
+
+    client, _ = make_client(handler)
+    assert await client.content_length(SIGNIERT) == 821824
+    assert gesehen == ["HEAD"]
+
+
+async def test_content_length_ohne_header_ist_none():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Accept-Ranges": "bytes"})
+
+    client, _ = make_client(handler)
+    assert await client.content_length(SIGNIERT) is None
+
+
+async def test_content_length_bei_404_ist_none():
+    client, _ = make_client(lambda request: httpx.Response(404, text=""))
+    assert await client.content_length(SIGNIERT) is None
+
+
+async def test_content_length_ohne_url_ist_none():
+    client, _ = make_client(lambda request: pytest.fail("es darf kein Request erfolgen"))
+    assert await client.content_length("") is None
+
+
+async def test_content_length_reicht_429_durch():
+    client, _ = make_client(
+        lambda request: httpx.Response(429, headers={"Retry-After": "5"}, text=""),
+        max_retries=0,
+    )
+    with pytest.raises(RateLimitError):
+        await client.content_length(SIGNIERT)
+
+
+async def test_content_length_reicht_401_durch():
+    client, _ = make_client(lambda request: httpx.Response(401, text=""))
+    with pytest.raises(AuthError):
+        await client.content_length(SIGNIERT)
 
 
 # -- checksum ---------------------------------------------------------
@@ -600,7 +731,7 @@ async def test_checksum_ohne_url_ist_none():
 
 
 async def test_checksum_reicht_429_durch():
-    """RateLimitError ist ein ApiError — darf trotzdem nicht verschluckt werden."""
+    """RateLimitError ist ein ApiError - darf trotzdem nicht verschluckt werden."""
     client, _ = make_client(
         lambda request: httpx.Response(429, headers={"Retry-After": "5"}, text=""),
         max_retries=0,
@@ -630,7 +761,7 @@ async def test_404_wird_zu_api_error_mit_status_und_url():
     with pytest.raises(ApiError) as excinfo:
         await client.product_files(999)
     assert "404" in str(excinfo.value)
-    assert "products/999" in str(excinfo.value)
+    assert "gameDetails/999.json" in str(excinfo.value)
 
 
 async def test_429_wird_zu_rate_limit_error_mit_retry_after():
