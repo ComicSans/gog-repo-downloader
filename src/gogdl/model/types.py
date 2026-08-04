@@ -7,6 +7,7 @@ Fachmodul verändert. Es hat bewusst keine Abhängigkeiten außer der Stdlib.
 from __future__ import annotations
 
 import platform
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -284,7 +285,7 @@ class Preference:
         """Eine einzelne Ebene aus gleichrangigen Werten."""
         return Preference((frozenset(v.lower() for v in values),))
 
-    def select(self, available: "Iterable[str]") -> frozenset[str]:
+    def select(self, available: Iterable[str]) -> frozenset[str]:
         """Aus dem tatsächlich Vorhandenen auswählen.
 
         Leere Präferenz heißt "keine Einschränkung": dann kommt alles durch.

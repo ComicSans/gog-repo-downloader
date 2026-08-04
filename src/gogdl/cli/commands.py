@@ -207,6 +207,7 @@ def _build_download_plan(store: SqliteStore, ctx: AppContext) -> SyncPlan:
             version=e.version,
             part_index=e.part_index,
             total_parts=e.total_parts,
+            dlc_of=e.dlc_of,
         )
         for e in entries
         if e.state is not LocalState.ORPHANED

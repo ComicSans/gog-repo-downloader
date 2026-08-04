@@ -42,8 +42,10 @@ gogdl --dest ~/GOG download       # download, resume, verify, clean up
 By default this fetches installers for **your current platform** in **English**, including DLC. Everything else is opt-in:
 
 ```bash
-gogdl --dest ~/GOG download --os windows,linux --lang de,en --extras
+gogdl --dest ~/GOG download --os windows+linux --lang de,en --extras
 ```
+
+That reads as: Windows *and* Linux builds, German *or else* English, bonus content included. See below for the full notation.
 
 ## Commands
 
@@ -57,11 +59,26 @@ gogdl --dest ~/GOG download --os windows,linux --lang de,en --extras
 | `clean` | Run the cleanup separately (`--apply` to actually delete) |
 | `sync` | `update` + `download` in one call, for cron |
 
+## Choosing platforms and languages
+
+`--os` and `--lang` share one notation. **A comma means "otherwise", a plus means "and".**
+
+```bash
+--lang de,en          German, and only if there is no German build, English
+--lang de+en          both German and English
+--lang de+en,fr       German and English; French only if neither exists
+--os linux+mac        Linux and macOS, never Windows
+--os mac,windows      macOS, falling back to Windows for games without a Mac build
+```
+
+The language choice is made **per platform**, not once for the whole game. A title that ships German on Windows but only English on macOS gives you `windows/de` and `mac/en` under `--os windows+mac --lang de,en` - a single global choice would silently drop the Mac build.
+
+A platform level that offers nothing in an acceptable language counts as a miss, so the next fallback level applies: `--os mac,windows --lang de` on a game with an English-only Mac build gives you the German Windows build rather than nothing.
+
 ## Options
 
 ```
---os windows,linux,mac | all   default: the platform you are running on
---lang de,en                   default: en
+--os / --lang                  see above; defaults: current platform, en
 --dlc / --no-dlc               default: on
 --extras / --no-extras         default: off
 --patches / --no-patches       default: off
