@@ -316,14 +316,41 @@ def _slugs(store: SqliteStore) -> dict[int, str]:
     return {p.product_id: p.slug for p in store.products()}
 
 
-def _scan(ctx: AppContext) -> dict[Path, int]:
+_DISK_CACHE: dict[tuple[Path, bool], dict[Path, int]] = {}
+
+
+def _scan(ctx: AppContext, *, fresh: bool = False) -> dict[Path, int]:
     """Plattenzustand so, wie der Nutzer ihn bestellt hat.
 
     Nur an einer Stelle, damit alle Kommandos dieselbe Sicht haben: sähe
     das Aufräumen mehr als die Planung, würde eine Datei geplant und
     gleich wieder gelöscht.
+
+    **Und nur einmal pro Lauf.** Auf einer externen Platte mit 3,5 TB
+    dauert ein vollständiger Durchlauf über 80 Sekunden. Ihn nach jeder
+    fertigen Datei zu wiederholen, wie es das Aufräumen je Auslieferung
+    zunächst tat, kostet bei tausend Dateien mehr Zeit als die Downloads
+    selbst. Der Zustand wird deshalb einmal erhoben und danach von
+    :func:`_note_written` und :func:`_note_removed` fortgeschrieben.
     """
-    return scan_disk(ctx.dest, include_saves=ctx.config.include_saves)
+    key = (ctx.dest, ctx.config.include_saves)
+    if fresh or key not in _DISK_CACHE:
+        _DISK_CACHE[key] = scan_disk(ctx.dest, include_saves=ctx.config.include_saves)
+    return _DISK_CACHE[key]
+
+
+def _note_written(ctx: AppContext, path: Path, size: int) -> None:
+    """Eine gerade geschriebene Datei in den bekannten Zustand aufnehmen."""
+    cached = _DISK_CACHE.get((ctx.dest, ctx.config.include_saves))
+    if cached is not None:
+        cached[path] = size
+
+
+def _note_removed(ctx: AppContext, path: Path) -> None:
+    """Eine gerade entfernte Datei aus dem bekannten Zustand nehmen."""
+    cached = _DISK_CACHE.get((ctx.dest, ctx.config.include_saves))
+    if cached is not None:
+        cached.pop(path, None)
 
 
 def _plan_prune(
@@ -590,6 +617,10 @@ async def cmd_download(
     failed = 0
     zugang_verloren = False
     try:
+        if not ctx.quiet:
+            # Der erste Scan dauert auf einer grossen, externen Sammlung
+            # ueber eine Minute. Ohne Ansage sieht das aus wie ein Haenger.
+            print(f"Reading {ctx.dest} ...", flush=True)
         plan = _build_download_plan(store, ctx, only=only, skip=skip)
 
         if ctx.dry_run:
@@ -645,6 +676,10 @@ async def cmd_download(
                             zugang_verloren = True
                     store.update_entry(entry)
                     if result.ok:
+                        # Der bekannte Plattenzustand wird fortgeschrieben,
+                        # nicht neu erhoben: ein Vollscan kostet auf einer
+                        # externen Platte über 80 Sekunden.
+                        _note_written(ctx, item.target, result.bytes_written)
                         _prune_slot_if_complete(store, ctx, entry.slot, reporter)
 
                 await asyncio.gather(*(one(item) for item in plan.downloads))
@@ -732,6 +767,7 @@ def _prune_slot_if_complete(
     executor = PruneExecutor(ctx.dest, store, mode=ctx.config.prune_mode)
     for result in executor.execute(fuer_slot, dry_run=ctx.dry_run):
         if result.removed:
+            _note_removed(ctx, result.item.path)
             reporter.message(
                 f"removed: {result.item.path.name} ({human_bytes(result.item.size)})"
             )
