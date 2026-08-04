@@ -1,3 +1,6 @@
+# Werkzeuge: generierter Index, gehoert nicht ins Repository
+.tokensave/
+
 # Python
 .venv/
 __pycache__/
