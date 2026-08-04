@@ -37,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     login = sub.add_parser("login", help="Bei GOG anmelden (einmalig)")
+    _add_dest(login)
     login.add_argument(
         "--no-browser", action="store_true", help="Browser nicht automatisch öffnen"
     )
@@ -64,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
         "import",
         help="Vorhandenen Bestand dem Manifest zuordnen (für gewachsene Sammlungen)",
     )
+    _add_dest(imp)
     imp.add_argument("--apply", action="store_true", help="Zuordnung tatsächlich übernehmen")
     imp.add_argument(
         "--trust",
@@ -98,7 +100,21 @@ def _add_selection(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--skip", action="append", default=[], help="Diese Spiele auslassen")
 
 
+def _add_dest(parser: argparse.ArgumentParser) -> None:
+    """``--dest`` auch nach dem Unterkommando erlauben.
+
+    ``gogdl status --dest ~/GOG`` ist die naheliegende Schreibweise; ein
+    globales Argument allein würde sie mit einer Fehlermeldung abweisen.
+    Eigener Zielname, damit der Wert den globalen nur überschreibt, wenn er
+    wirklich angegeben wurde.
+    """
+    parser.add_argument(
+        "--dest", dest="dest_local", default=None, help="Zielverzeichnis der Sammlung"
+    )
+
+
 def _add_filters(parser: argparse.ArgumentParser) -> None:
+    _add_dest(parser)
     parser.add_argument(
         "--os",
         help=(
@@ -171,6 +187,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        # Der Wert nach dem Unterkommando schlaegt den davor.
+        if getattr(args, "dest_local", None):
+            args.dest = args.dest_local
         config = build_sync_config(args)
         warning = check_dest(config.dest)
         if warning and args.command != "login":

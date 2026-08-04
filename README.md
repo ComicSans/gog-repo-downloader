@@ -123,7 +123,9 @@ Flat per game, matching GOG's own filenames - so an existing `gogrepo` collectio
 
 ## Status
 
-Phase 1. The API layer is written against GOG's documented endpoints and covered by mocked tests; the live login and CDN behaviour need a real account to exercise. See [KONZEPT.md](KONZEPT.md) for the full design (in German), including the failure modes this tool is built to avoid.
+Phase 1. The API layer is written against GOG's documented endpoints and covered by mocked tests; the live login and CDN behaviour need a real account to exercise.
+
+Two failure modes shaped most of the design and are worth knowing about if you read the code: a CDN that answers a range request with `200` instead of `206` will silently corrupt a resumed file if you append to it, and pruning per file rather than per release can leave a multi-part installer with neither version complete. Both are covered by tests.
 
 ## Credits
 

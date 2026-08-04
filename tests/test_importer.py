@@ -377,19 +377,21 @@ def test_import_ohne_pruefung_autorisiert_keine_loeschung(tmp_path: Path) -> Non
     assert [item.path for item in prune_mit.prunes] == [alt]
 
 
-def test_trust_size_macht_namensaehnliche_nachbarn_in_extras_loeschbar(
+def test_trust_size_greift_nicht_in_unterverzeichnisse(
     tmp_path: Path,
 ) -> None:
-    """Dokumentiert eine Folge von ``Trust.SIZE``, die leicht übersehen wird.
+    """Auch ``Trust.SIZE`` greift nie in ein Unterverzeichnis.
 
-    ``plan_prune`` leitet das Kandidatenverzeichnis eines Slots aus
-    ``relative_path`` ab. Wird ein Eintrag in ``extras/`` importiert, wird
-    ``<slug>/extras/`` damit zum Prune-Verzeichnis - und eine namensähnliche
-    Nachbardatei dort (``handbuch_alt.pdf``) gilt als Altversion. Genau dort
-    liegt bei einem gewachsenen Bestand aber oft handverlesenes Material.
+    Ursprünglich leitete ``plan_prune`` das Kandidatenverzeichnis eines
+    Slots aus ``relative_path`` ab. Ein in ``extras/`` importierter Eintrag
+    machte damit ``<slug>/extras/`` zum Prune-Verzeichnis, und eine
+    namensähnliche Nachbardatei dort (``handbuch_alt.pdf``) galt als
+    Altversion. Bei einem gewachsenen Bestand liegt dort aber oft
+    handverlesenes Material, das GOG teilweise nicht mehr anbietet.
 
-    Mit ``Trust.NONE`` passiert nichts davon. Wer ``Trust.SIZE`` wählt,
-    kauft sich diese Reichweite mit ein.
+    Seitdem sind Kandidaten ausschließlich Dateien direkt im
+    Spielverzeichnis. Ein Slot, der woanders liegt, räumt gar nichts auf -
+    lieber bleibt ein Extra liegen, als dass einmal das Falsche verschwindet.
     """
     dest = tmp_path / "gog"
     write(dest / SLUG / "extras" / "handbuch.pdf", b"P" * 500)
@@ -414,11 +416,10 @@ def test_trust_size_macht_namensaehnliche_nachbarn_in_extras_loeschbar(
     mit.close()
     prune = plan_prune(mit_eintraege, prune_config(dest), on_disk, slugs=SLUGS)
 
-    # Festgehalten, nicht gutgeheißen: unter Trust.SIZE steht der Nachbar
-    # zur Löschung an. Ändert sich das in sync/, muss diese Erwartung
-    # bewusst nachgezogen werden.
-    assert [item.path for item in prune.prunes] == [nachbar]
-    assert nachbar.exists()  # Geplant ist nicht gelöscht - der Import löscht nie.
+    # Auch mit dem stärkeren Vertrauensgrad bleibt der Nachbar unberührt:
+    # Prune-Kandidaten sind nur Dateien direkt im Spielverzeichnis.
+    assert [item.path for item in prune.prunes] == []
+    assert nachbar.exists()
 
 
 def test_trust_size_setzt_zeitstempel_ohne_die_platte_zu_lesen(tmp_path: Path) -> None:

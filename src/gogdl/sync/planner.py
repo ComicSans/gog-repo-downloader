@@ -223,8 +223,134 @@ def _parse_version(name: str) -> tuple[str, tuple[int, ...]] | None:
 # ---------------------------------------------------------------------------
 
 
+_OsKey = tuple[int, FileKind]
+"""Schlüssel der Plattformwahl: Produkt + Dateiart."""
+
+_LangKey = tuple[int, FileKind, str | None]
+"""Schlüssel der Sprachwahl: Produkt + Dateiart + Plattform."""
+
+
+def _select_axes(
+    remote: Sequence[RemoteFile], config: SyncConfig
+) -> tuple[dict[_OsKey, frozenset[str]], dict[_LangKey, frozenset[str]]]:
+    """Plattform- und Sprachwahl pro Produkt treffen (§6).
+
+    Beide Achsen werden aus dem **tatsächlich angebotenen** Bestand
+    entschieden, denn nur so greifen die Rückfallebenen von
+    :class:`~gogdl.model.types.Preference`: „deutsch, sonst englisch" kann
+    man erst beantworten, wenn man weiß, was es gibt.
+
+    Drei Feinheiten, an denen die Auswahl sonst falsch wird:
+
+    * Die Wahl fällt **pro FileKind getrennt**. Patches folgen derselben
+      Logik wie Installer, aber ein Spiel kann Installer für drei
+      Plattformen und Patches nur für eine anbieten - eine gemeinsame
+      Entscheidung würde die Patches der übrigen Plattformen mitnehmen
+      oder verwerfen.
+    * Die Sprache wird **je gewählter Plattform getrennt** entschieden.
+      Ein Spiel kann auf Windows deutsch anbieten und auf Mac nur
+      englisch; eine global über alle Plattformen getroffene Sprachwahl
+      würde bei ``--lang de,en`` die Mac-Fassung stumm verschlucken.
+    * Beide Achsen kaskadieren **gemeinsam**: Eine Plattform-Ebene gilt
+      nur als getroffen, wenn mindestens eine ihrer Plattformen auch eine
+      akzeptable Sprache anbietet. „Mac, sonst Windows" plus „deutsch"
+      heißt nicht „Mac um jeden Preis" - eine Mac-Fassung, die es nur auf
+      Chinesisch gibt, erfüllt den Wunsch nicht und darf die Rückfallebene
+      auf Windows nicht blockieren. Ohne diese Kopplung käme in dem Fall
+      gar nichts, obwohl der Nutzer das Spiel auf Deutsch besitzt.
+
+    Innerhalb der getroffenen Ebene gibt es **keinen** weiteren Rückfall:
+    Plattformen ohne akzeptable Sprache fallen einfach heraus. Bei
+    ``--os linux+mac --lang de,en`` mit Linux auf Deutsch und Mac nur auf
+    Englisch bleiben beide, jede in ihrer Sprache.
+
+    Die Reihenfolge der beiden Rückfälle ist damit festgelegt: erst
+    erschöpft die Sprache ihre Ebenen **innerhalb** einer Plattform, dann
+    erst rückt die Plattform-Ebene weiter. ``--os mac,windows --lang
+    de,en`` mit Mac auf Englisch und Windows auf Deutsch liefert deshalb
+    Mac/en - nicht Windows/de.
+
+    ``variant`` geht bewusst in keinen Schlüssel ein: die verschiedenen
+    Versionsspannen eines Patches sind dieselbe Auslieferung in
+    Plattform/Sprache und teilen sich deshalb die Auswahl.
+
+    Rückwärtskompatibilität: Ist die jeweilige ``Preference`` leer, gilt
+    weiterhin die flache Menge (``os_filter``/``languages``). Ist auch die
+    leer, gibt es auf dieser Achse keine Einschränkung. Eine gesetzte
+    ``Preference`` **ersetzt** die Menge, sie schneidet sich nicht mit ihr
+    - sonst könnte eine Rückfallebene nie greifen, die außerhalb der Menge
+    liegt. Ohne Sprach-Preference gibt es auch keine Kopplung: dann gilt
+    jede Plattform-Ebene als getroffen, sobald sie überhaupt angeboten
+    wird.
+    """
+    angeboten_os: dict[_OsKey, set[str]] = {}
+    angeboten_lang: dict[_LangKey, set[str]] = {}
+    for file in remote:
+        slot = file.slot
+        os_value = slot.os.value if slot.os is not None else None
+        if os_value is not None:
+            angeboten_os.setdefault((slot.product_id, slot.kind), set()).add(os_value)
+        if slot.language is not None:
+            key = (slot.product_id, slot.kind, os_value)
+            angeboten_lang.setdefault(key, set()).add(slot.language.lower())
+
+    gewaehlt_lang: dict[_LangKey, frozenset[str]] = {
+        lang_key: _sprachwahl(values, config) for lang_key, values in angeboten_lang.items()
+    }
+
+    def traegt(os_key: _OsKey, os_value: str) -> bool:
+        """Bietet diese Plattform eine Sprache an, die der Wunsch akzeptiert?
+
+        Ohne Sprach-Preference wird nicht gekoppelt (siehe Docstring).
+        Trägt die Plattform gar keine Sprachdimension, gibt es nichts zu
+        erfüllen und sie zählt als tragfähig.
+        """
+        if not config.language_preference:
+            return True
+        key = (os_key[0], os_key[1], os_value)
+        if not angeboten_lang.get(key):
+            return True
+        return bool(gewaehlt_lang.get(key))
+
+    gewaehlt_os: dict[_OsKey, frozenset[str]] = {}
+    for os_key, values in angeboten_os.items():
+        if config.os_preference:
+            treffer: frozenset[str] = frozenset()
+            for level in config.os_preference.levels:
+                kandidaten = {v for v in values if v in level}
+                treffer = frozenset(v for v in kandidaten if traegt(os_key, v))
+                if treffer:
+                    break
+            gewaehlt_os[os_key] = treffer
+        elif config.os_filter:
+            erlaubt = {member.value for member in config.os_filter}
+            gewaehlt_os[os_key] = frozenset(v for v in values if v in erlaubt)
+        else:
+            gewaehlt_os[os_key] = frozenset(values)
+
+    return gewaehlt_os, gewaehlt_lang
+
+
+def _sprachwahl(angeboten: set[str], config: SyncConfig) -> frozenset[str]:
+    """Sprachauswahl für **eine** Plattform eines Produkts.
+
+    Die Preference schlägt die flache Menge; ohne beides gibt es keine
+    Einschränkung.
+    """
+    if config.language_preference:
+        return config.language_preference.select(angeboten)
+    if config.languages:
+        erlaubt = {lang.lower() for lang in config.languages}
+        return frozenset(v for v in angeboten if v in erlaubt)
+    return frozenset(angeboten)
+
+
 def _passes_filters(
-    remote: RemoteFile, config: SyncConfig, dlc_of: Mapping[int, int] | None
+    remote: RemoteFile,
+    config: SyncConfig,
+    dlc_of: Mapping[int, int] | None,
+    gewaehlt_os: Mapping[_OsKey, frozenset[str]],
+    gewaehlt_lang: Mapping[_LangKey, frozenset[str]],
 ) -> bool:
     """Greifen die konfigurierten Filter für diese Datei?
 
@@ -232,26 +358,32 @@ def _passes_filters(
     überhaupt trägt. **Extras haben ``os``/``language`` gleich ``None``
     und dürfen davon nicht herausgefiltert werden** — sie werden allein
     über ``include_extras`` gesteuert.
+
+    Die Auswahl selbst ist in :func:`_select_axes` gefallen; hier wird nur
+    noch nachgeschlagen.
     """
-    kind = remote.slot.kind
+    slot = remote.slot
+    kind = slot.kind
 
     if kind is FileKind.EXTRA and not config.include_extras:
         return False
     if kind is FileKind.PATCH and not config.include_patches:
         return False
 
-    if not config.include_dlc and dlc_of:
-        parent = dlc_of.get(remote.product_id)
+    if not config.include_dlc:
+        parent = dlc_of.get(remote.product_id) if dlc_of else remote.dlc_of
         if parent is not None and parent != remote.product_id:
             return False
 
-    if remote.slot.os is not None and config.os_filter:
-        if remote.slot.os not in config.os_filter:
+    os_value = slot.os.value if slot.os is not None else None
+    if os_value is not None:
+        erlaubte_os = gewaehlt_os.get((slot.product_id, kind))
+        if erlaubte_os is None or os_value not in erlaubte_os:
             return False
 
-    if remote.slot.language is not None and config.languages:
-        wanted = {lang.lower() for lang in config.languages}
-        if remote.slot.language.lower() not in wanted:
+    if slot.language is not None:
+        erlaubte_lang = gewaehlt_lang.get((slot.product_id, kind, os_value))
+        if erlaubte_lang is None or slot.language.lower() not in erlaubte_lang:
             return False
 
     return True
@@ -298,6 +430,9 @@ def _download_entry(
         bytes_done=resume_from,
         last_seen_utc=existing.last_seen_utc if existing is not None else None,
         last_verified_utc=None,
+        dlc_of=remote.dlc_of if remote.dlc_of is not None else (
+            existing.dlc_of if existing is not None else None
+        ),
     )
 
 
@@ -321,9 +456,18 @@ def plan_downloads(
     ``str(product_id)`` als Verzeichnis.
 
     ``dlc_of`` (Produkt-ID → Produkt-ID des Hauptspiels, §4.3) steuert
-    ``include_dlc``. Fehlt die Abbildung, wird **nicht** nach DLC
-    gefiltert: die Zugehörigkeit steht nicht in ``RemoteFile``, und
-    geraten wird hier nichts.
+    ``include_dlc`` und **übersteuert** die Angabe an der Datei: ist die
+    Abbildung gesetzt, gilt allein sie. Fehlt sie, kommt die Zugehörigkeit
+    aus ``RemoteFile.dlc_of`` (die api-Schicht füllt das Feld). Trägt auch
+    die Datei nichts, wird nicht nach DLC gefiltert - geraten wird hier
+    nichts.
+
+    Plattform- und Sprachwahl fallen pro Produkt in :func:`_select_axes`,
+    inklusive der Rückfallebenen aus ``os_preference``/
+    ``language_preference``. Dateien, deren Manifest-Eintrag ``ORPHANED``
+    ist, gehen dort nicht in den Bestand ein: sie werden ohnehin nicht
+    geladen und dürfen deshalb keine Plattform „belegen", für die es dann
+    nichts zu tun gibt.
 
     Der lokale Zustand wird ausschließlich aus ``on_disk`` abgeleitet,
     nie aus dem Manifest — die Datei ist die Wahrheit, die DB nur der
@@ -380,11 +524,17 @@ def plan_downloads(
                 )
             )
 
-    for remote_file in remote:
+    planbar = [
+        remote_file
+        for remote_file in remote
+        if (entry := by_key.get((remote_file.slot, remote_file.file_id))) is None
+        or entry.state is not LocalState.ORPHANED
+    ]
+    gewaehlt_os, gewaehlt_lang = _select_axes(planbar, config)
+
+    for remote_file in planbar:
         entry = by_key.get((remote_file.slot, remote_file.file_id))
-        if entry is not None and entry.state is LocalState.ORPHANED:
-            continue
-        if not _passes_filters(remote_file, config, dlc_of):
+        if not _passes_filters(remote_file, config, dlc_of, gewaehlt_os, gewaehlt_lang):
             continue
 
         target = _remote_target(remote_file, entry, dest, slugs)
@@ -536,10 +686,13 @@ def plan_prune(
     *aktuellen* Remote-Stand; die Vorgängerversion steht in keiner
     Datenstruktur mehr. Sie wird deshalb aus ``on_disk`` erschlossen:
 
-    1. Kandidat ist eine Datei direkt im Produktverzeichnis eines
+    1. Kandidat ist eine Datei **direkt** in ``<dest>/<slug>/`` eines
        Produkts, das Manifest-Einträge hat, und deren Pfad zu keinem
        aktuellen Eintrag (und zu keiner ``.part``-Datei eines aktuellen
-       Eintrags) gehört.
+       Eintrags) gehört. Das Verzeichnis wird aus ``dest`` und dem Slug
+       gebildet, nicht aus ``relative_path``; Unterverzeichnisse wie
+       ``<slug>/extras/`` bleiben vollständig außen vor - auch für Slots,
+       die selbst dort liegen.
     2. Der Kandidat wird über die Länge des gemeinsamen Namenspräfixes
        genau einem Slot zugeordnet (:func:`_attribute_slot`). Ohne klaren
        Sieger bleibt er liegen.
@@ -571,19 +724,36 @@ def plan_prune(
     by_slot: dict[SlotKey, list[ManifestEntry]] = {}
     known: set[Path] = set()
     slot_dirs: dict[SlotKey, Path] = {}
+    verschachtelt: set[SlotKey] = set()
     for entry in local:
         target = _entry_target(entry, dest, slugs)
         if not _is_inside(target, dest):
             # Hartes Sicherheitsnetz: nichts außerhalb von dest.
             continue
         by_slot.setdefault(entry.slot, []).append(entry)
-        slot_dirs.setdefault(entry.slot, target.parent)
         known.add(target)
         known.add(_part_of(target))
+        # Das Kandidatenverzeichnis kommt aus dest und dem Slug, **nicht**
+        # aus relative_path: sonst macht ein Eintrag in <slug>/extras/
+        # diesen Unterordner zum Suchbereich.
+        if target.parent == dest / _slug_dir(entry.product_id, slugs):
+            slot_dirs.setdefault(entry.slot, target.parent)
+        else:
+            verschachtelt.add(entry.slot)
 
-    # Produktverzeichnis → Slots, die dort liegen.
+    # Produktverzeichnis → Slots, die **direkt** dort liegen.
     dirs: dict[Path, dict[SlotKey, tuple[str, ...]]] = {}
     for slot, entries in by_slot.items():
+        # Liegt auch nur eine Datei des Slots in einem Unterverzeichnis,
+        # räumt dieser Slot gar nichts auf. Gewollt: in <slug>/extras/ liegt
+        # bei einem gewachsenen Bestand handverlesenes Material, das GOG
+        # teils nicht mehr anbietet, und die Namensheuristik kann es nicht
+        # von einer Altversion unterscheiden (handbuch_alt.pdf neben
+        # handbuch.pdf). Extras sind klein, das Platzproblem sind die
+        # Installer - lieber räumen wir dort nichts auf, als einmal das
+        # Falsche zu löschen. Keine vergessene Ecke, sondern die Abwägung.
+        if slot in verschachtelt or slot not in slot_dirs:
+            continue
         names = tuple(entry.filename for entry in entries if entry.filename)
         if not names:
             continue

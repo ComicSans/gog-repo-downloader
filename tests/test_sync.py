@@ -16,6 +16,7 @@ from gogdl.model.types import (
     LocalState,
     ManifestEntry,
     OsName,
+    Preference,
     RemoteFile,
     SlotKey,
     SyncConfig,
@@ -89,6 +90,7 @@ def remote(
     md5: str | None = None,
     total_parts: int = 1,
     part_index: int = 1,
+    dlc_of: int | None = None,
 ) -> RemoteFile:
     return RemoteFile(
         slot=slot,
@@ -100,6 +102,7 @@ def remote(
         version=version,
         part_index=part_index,
         total_parts=total_parts,
+        dlc_of=dlc_of,
     )
 
 
@@ -347,6 +350,317 @@ def test_filter_erzeugen_keine_fremdmeldung():
 
 
 # ---------------------------------------------------------------------------
+# §6 - Auswahl mit Rückfallebenen (--os / --lang)
+# ---------------------------------------------------------------------------
+
+PRODUCT_ID = 1207658924
+
+
+def islot(os: OsName, lang: str, kind: FileKind = FileKind.INSTALLER) -> SlotKey:
+    return SlotKey(product_id=PRODUCT_ID, kind=kind, os=os, language=lang)
+
+
+def datei(os: OsName, lang: str, *, kind: FileKind = FileKind.INSTALLER) -> RemoteFile:
+    """Eine Auslieferung, deren file_id sie sofort lesbar macht."""
+    name = f"{os.value}_{lang}"
+    return remote(
+        slot=islot(os, lang, kind), file_id=name, filename=f"setup_game_{name}_2.0.exe"
+    )
+
+
+def geplant(files, cfg) -> list[str]:
+    plan = plan_downloads(files, [], cfg, {}, slugs=SLUGS)
+    return sorted(item.entry.file_id for item in plan.downloads)
+
+
+def lang_config(text: str, **overrides) -> SyncConfig:
+    return config(language_preference=Preference.parse(text), **overrides)
+
+
+def test_lang_rueckfallebene_nimmt_die_erste_ebene_die_traegt():
+    """``de,en``: deutsch, und nur wenn es das nicht gibt, englisch."""
+    cfg = lang_config("de,en")
+    beides = [datei(OsName.WINDOWS, "de"), datei(OsName.WINDOWS, "en")]
+    assert geplant(beides, cfg) == ["windows_de"]
+
+    assert geplant([datei(OsName.WINDOWS, "en")], cfg) == ["windows_en"]
+
+    # Keine Ebene trägt: dann wird nichts geplant, nicht ersatzweise alles.
+    assert geplant([datei(OsName.WINDOWS, "fr")], cfg) == []
+
+
+def test_lang_plus_nimmt_beide_sprachen():
+    """``de+en``: gleichrangig, also beide."""
+    cfg = lang_config("de+en")
+    files = [datei(OsName.WINDOWS, "de"), datei(OsName.WINDOWS, "en")]
+    assert geplant(files, cfg) == ["windows_de", "windows_en"]
+
+
+def test_lang_gemischte_notation():
+    """``de+en,fr``: deutsch und englisch, ersatzweise französisch."""
+    cfg = lang_config("de+en,fr")
+    assert geplant([datei(OsName.WINDOWS, "de"), datei(OsName.WINDOWS, "fr")], cfg) == [
+        "windows_de"
+    ]
+    assert geplant([datei(OsName.WINDOWS, "fr")], cfg) == ["windows_fr"]
+
+
+def test_sprachwahl_faellt_je_plattform_getrennt():
+    """Der Kernfall: Windows hat de und en, Mac nur en.
+
+    Eine global über alle Plattformen getroffene Sprachwahl käme auf
+    ``{de}`` und würde die Mac-Fassung stumm verschlucken. Erwartet sind
+    deshalb **beide** Auslieferungen: Windows auf Deutsch, Mac auf
+    Englisch.
+    """
+    cfg = config(
+        os_preference=Preference.parse("windows+mac"),
+        language_preference=Preference.parse("de,en"),
+    )
+    files = [
+        datei(OsName.WINDOWS, "de"),
+        datei(OsName.WINDOWS, "en"),
+        datei(OsName.MAC, "en"),
+    ]
+    assert geplant(files, cfg) == ["mac_en", "windows_de"]
+
+
+def test_sprachwahl_je_plattform_auch_bei_patches():
+    """Patches folgen derselben Logik - und getrennt von den Installern."""
+    cfg = config(
+        os_preference=Preference.parse("windows+mac"),
+        language_preference=Preference.parse("de,en"),
+        include_patches=True,
+    )
+    files = [
+        datei(OsName.WINDOWS, "de", kind=FileKind.PATCH),
+        datei(OsName.WINDOWS, "en", kind=FileKind.PATCH),
+        datei(OsName.MAC, "en", kind=FileKind.PATCH),
+        # Installer gibt es nur auf Englisch: das darf die Patch-Wahl nicht
+        # verschieben und umgekehrt.
+        datei(OsName.WINDOWS, "en"),
+    ]
+    assert geplant(files, cfg) == ["mac_en", "windows_de", "windows_en"]
+
+
+def test_os_plus_schliesst_windows_aus():
+    """``linux+mac``: Windows kommt nie, auch wenn es sonst nichts gibt."""
+    cfg = config(os_preference=Preference.parse("linux+mac"))
+    assert geplant([datei(OsName.WINDOWS, "en")], cfg) == []
+
+    files = [datei(OsName.WINDOWS, "en"), datei(OsName.LINUX, "en"), datei(OsName.MAC, "en")]
+    assert geplant(files, cfg) == ["linux_en", "mac_en"]
+
+
+def test_os_rueckfallebene():
+    """``mac,windows``: Mac, und nur ohne Mac-Fassung Windows."""
+    cfg = config(os_preference=Preference.parse("mac,windows"))
+    assert geplant([datei(OsName.WINDOWS, "en")], cfg) == ["windows_en"]
+    assert geplant([datei(OsName.WINDOWS, "en"), datei(OsName.MAC, "en")], cfg) == ["mac_en"]
+
+
+def test_rueckfallebenen_gelten_pro_produkt():
+    """Die Wahl fällt pro Produkt, nicht einmal für die ganze Bibliothek."""
+    zweites = SlotKey(product_id=999111, kind=FileKind.INSTALLER, os=OsName.MAC, language="en")
+    cfg = config(
+        os_preference=Preference.parse("mac,windows"),
+        language_preference=Preference.parse("de,en"),
+    )
+    files = [
+        datei(OsName.WINDOWS, "de"),  # Produkt 1: kein Mac -> Windows/de
+        remote(slot=zweites, file_id="zweites", filename="setup_dlc_mac_2.0.pkg"),
+    ]
+    assert geplant(files, cfg) == ["windows_de", "zweites"]
+
+
+def test_plattform_ohne_akzeptable_sprache_gilt_als_nicht_getroffen():
+    """Mac nur auf Englisch, gewünscht ist Deutsch -> Windows/de rückt nach.
+
+    Eine Mac-Fassung, die es nur auf Chinesisch (hier: Englisch) gibt,
+    erfüllt den Wunsch „auf Deutsch" nicht und darf die Rückfallebene auf
+    Windows nicht blockieren. Ohne die gemeinsame Kaskade wäre das
+    Ergebnis leer, obwohl der Nutzer das Spiel auf Deutsch besitzt.
+    """
+    cfg = config(
+        os_preference=Preference.parse("mac,windows"),
+        language_preference=Preference.parse("de"),
+    )
+    files = [datei(OsName.MAC, "en"), datei(OsName.WINDOWS, "de")]
+    assert geplant(files, cfg) == ["windows_de"]
+
+
+def test_sprache_erschoepft_ihre_ebenen_vor_der_plattform():
+    """Die Reihenfolge der beiden Rückfälle - der eigentliche Kern.
+
+    ``--os mac,windows --lang de,en`` mit Mac auf Englisch und Windows auf
+    Deutsch: Die Sprach-Rückfallebene greift **innerhalb** von Mac, bevor
+    die Plattform-Ebene weiterrückt. Also Mac/en, nicht Windows/de.
+    """
+    cfg = config(
+        os_preference=Preference.parse("mac,windows"),
+        language_preference=Preference.parse("de,en"),
+    )
+    files = [datei(OsName.MAC, "en"), datei(OsName.WINDOWS, "de")]
+    assert geplant(files, cfg) == ["mac_en"]
+
+
+def test_innerhalb_der_ebene_gibt_es_keinen_weiteren_rueckfall():
+    """``linux+mac``: Linux auf Deutsch, Mac auf Englisch - beide bleiben."""
+    cfg = config(
+        os_preference=Preference.parse("linux+mac"),
+        language_preference=Preference.parse("de,en"),
+    )
+    files = [datei(OsName.LINUX, "de"), datei(OsName.MAC, "en")]
+    assert geplant(files, cfg) == ["linux_de", "mac_en"]
+
+    # Und eine Plattform ohne akzeptable Sprache fällt still heraus, statt
+    # die ganze Ebene zu kippen.
+    gemischt = [datei(OsName.LINUX, "de"), datei(OsName.MAC, "ja")]
+    assert geplant(gemischt, cfg) == ["linux_de"]
+
+
+def test_keine_plattform_ebene_traegt_liefert_leeres_ergebnis():
+    """Kein Treffer ist kein Fehler: leerer Plan, keine Exception."""
+    cfg = config(
+        os_preference=Preference.parse("mac,windows"),
+        language_preference=Preference.parse("de"),
+    )
+    files = [datei(OsName.MAC, "en"), datei(OsName.WINDOWS, "fr")]
+    assert geplant(files, cfg) == []
+
+
+def test_ohne_sprach_preference_traegt_jede_angebotene_ebene():
+    """Ohne ``--lang`` gibt es keine Kopplung: Mac gewinnt, so oder so.
+
+    Die flache Menge ``languages`` filtert danach wie bisher - auch wenn
+    dabei nichts übrig bleibt. Das ist der alte Vertrag und bleibt so.
+    """
+    cfg = config(os_preference=Preference.parse("mac,windows"))
+    files = [datei(OsName.MAC, "en"), datei(OsName.WINDOWS, "en")]
+    assert geplant(files, cfg) == ["mac_en"]
+
+    nur_mac_de = [datei(OsName.MAC, "de"), datei(OsName.WINDOWS, "en")]
+    assert geplant(nur_mac_de, cfg) == []
+    assert geplant(nur_mac_de, config(
+        os_preference=Preference.parse("mac,windows"),
+        languages=frozenset({"de", "en"}),
+    )) == ["mac_de"]
+
+
+def test_plattform_ohne_sprachdimension_traegt_immer():
+    """Eine Auslieferung ohne Sprachsignal kann keinen Sprachwunsch verfehlen."""
+    ohne_sprache = SlotKey(
+        product_id=PRODUCT_ID, kind=FileKind.INSTALLER, os=OsName.MAC, language=None
+    )
+    cfg = config(
+        os_preference=Preference.parse("mac,windows"),
+        language_preference=Preference.parse("de"),
+    )
+    files = [
+        remote(slot=ohne_sprache, file_id="mac_neutral", filename="game_2.0.pkg"),
+        datei(OsName.WINDOWS, "de"),
+    ]
+    assert geplant(files, cfg) == ["mac_neutral"]
+
+
+def test_extras_ueberstehen_jede_plattform_und_sprachwahl():
+    """os=None und language=None: von beiden Achsen unberührt."""
+    cfg = config(
+        os_preference=Preference.parse("linux"),
+        language_preference=Preference.parse("ja"),
+        include_extras=True,
+    )
+    files = [
+        datei(OsName.WINDOWS, "en"),
+        remote(slot=EXTRA_SLOT, file_id="x", filename="handbuch.pdf", version=None),
+    ]
+    assert geplant(files, cfg) == ["x"]
+
+
+def test_leere_preference_faellt_auf_die_flachen_mengen_zurueck():
+    """Ohne Preference gelten os_filter/languages wie bisher."""
+    files = [
+        datei(OsName.WINDOWS, "en"),
+        datei(OsName.WINDOWS, "de"),
+        datei(OsName.MAC, "en"),
+    ]
+    assert geplant(files, config()) == ["windows_en"]
+    assert geplant(files, config(languages=frozenset({"de", "en"}))) == [
+        "windows_de",
+        "windows_en",
+    ]
+    assert geplant(files, config(os_filter=frozenset({OsName.WINDOWS, OsName.MAC}))) == [
+        "mac_en",
+        "windows_en",
+    ]
+
+
+def test_gesetzte_preference_ersetzt_die_flache_menge():
+    """Preference und Menge schneiden sich nicht - sonst trüge keine Ebene.
+
+    ``os_filter``/``languages`` stehen hier bewusst auf dem alten Default
+    (Windows/en), und trotzdem muss die Mac-Fassung auf Deutsch kommen.
+    """
+    cfg = config(
+        os_filter=frozenset({OsName.WINDOWS}),
+        languages=frozenset({"en"}),
+        os_preference=Preference.parse("mac"),
+        language_preference=Preference.parse("de"),
+    )
+    files = [datei(OsName.WINDOWS, "en"), datei(OsName.MAC, "de")]
+    assert geplant(files, cfg) == ["mac_de"]
+
+
+def test_orphaned_belegt_keine_plattform():
+    """Eine nicht mehr ladbare Mac-Fassung darf die Rückfallebene nicht blockieren."""
+    mac = datei(OsName.MAC, "en")
+    tot = entry(
+        slot=mac.slot, file_id=mac.file_id, filename=mac.filename, state=LocalState.ORPHANED
+    )
+    cfg = config(os_preference=Preference.parse("mac,windows"))
+    plan = plan_downloads([mac, datei(OsName.WINDOWS, "en")], [tot], cfg, {}, slugs=SLUGS)
+    assert sorted(i.entry.file_id for i in plan.downloads) == ["windows_en"]
+
+
+def test_no_dlc_filtert_ueber_remote_file_dlc_of():
+    """``--no-dlc`` ohne Mapping: die Zuordnung steht in der Datei selbst."""
+    files = [
+        remote(slot=WIN_SLOT, file_id="w"),
+        remote(slot=DLC_SLOT, file_id="d", filename="setup_dlc_1.0.exe", dlc_of=1207658924),
+    ]
+    assert geplant(files, config()) == ["d", "w"]
+    assert geplant(files, config(include_dlc=False)) == ["w"]
+
+    # Der Zeiger auf sich selbst ist kein DLC.
+    eigen = [remote(slot=WIN_SLOT, file_id="w", dlc_of=1207658924)]
+    assert geplant(eigen, config(include_dlc=False)) == ["w"]
+
+
+def test_dlc_mapping_uebersteuert_die_angabe_an_der_datei():
+    """Ist das Mapping gesetzt, gilt allein es."""
+    files = [
+        remote(slot=WIN_SLOT, file_id="w"),
+        remote(slot=DLC_SLOT, file_id="d", filename="setup_dlc_1.0.exe", dlc_of=1207658924),
+    ]
+    plan = plan_downloads(
+        files, [], config(include_dlc=False), {}, slugs=SLUGS, dlc_of={1207658924: 999111}
+    )
+    assert sorted(i.entry.file_id for i in plan.downloads) == ["d"]
+
+
+def test_download_eintrag_traegt_dlc_of_weiter():
+    """Sonst stirbt die Zuordnung beim ersten Roundtrip durch den Store."""
+    plan = plan_downloads(
+        [remote(slot=DLC_SLOT, file_id="d", filename="setup_dlc_1.0.exe", dlc_of=1207658924)],
+        [],
+        config(),
+        {},
+        slugs=SLUGS,
+    )
+    assert plan.downloads[0].entry.dlc_of == 1207658924
+
+
+# ---------------------------------------------------------------------------
 # §5.5 — plan_prune
 # ---------------------------------------------------------------------------
 
@@ -531,6 +845,54 @@ def test_sprachslots_werden_getrennt_zugeordnet():
     assert len(plan.prunes) == 1
     assert plan.prunes[0].slot == de_slot
     assert plan.prunes[0].replaced_by == ("de2",)
+
+
+def test_prune_greift_nie_in_ein_unterverzeichnis():
+    """Ein Slot in ``<slug>/extras/`` erzeugt gar keine Prune-Einträge.
+
+    ``handbuch_alt.pdf`` teilt mit ``handbuch.pdf`` weit mehr als die
+    geforderten vier Zeichen Präfix - über die Namensheuristik geriete es
+    in den Löschplan. In den ``extras/``-Unterordnern eines gewachsenen
+    Bestands liegt aber handverlesenes Material, das GOG teils gar nicht
+    mehr anbietet. Kandidat ist deshalb nur, was **direkt** im
+    Spielverzeichnis liegt.
+    """
+    on_disk = {
+        GAME_DIR / "extras" / "handbuch.pdf": 500,
+        GAME_DIR / "extras" / "handbuch_alt.pdf": 400,
+    }
+    local = [
+        entry(
+            slot=EXTRA_SLOT,
+            file_id="x1",
+            filename="handbuch.pdf",
+            version=None,
+            size=500,
+            relative_path="the_game/extras/handbuch.pdf",
+        )
+    ]
+    assert plan_prune(local, config(), on_disk, slugs=SLUGS).prunes == []
+
+
+def test_altdatei_im_unterordner_bleibt_liegen():
+    """Auch wenn der Slot selbst direkt im Spielverzeichnis liegt."""
+    on_disk = {
+        GAME_DIR / "setup_game_2.0.exe": 1000,
+        GAME_DIR / "unterordner" / "setup_game_1.0.exe": 900,
+    }
+    plan = plan_prune([entry()], config(), on_disk, slugs=SLUGS)
+    assert plan.prunes == []
+
+
+def test_prune_im_spielverzeichnis_bleibt_erhalten():
+    """Gegenprobe: der normale Fall darf durch die Einschränkung nicht sterben."""
+    on_disk = {
+        GAME_DIR / "setup_game_2.0.exe": 1000,
+        GAME_DIR / "setup_game_1.0.exe": 900,
+        GAME_DIR / "extras" / "handbuch_alt.pdf": 400,
+    }
+    plan = plan_prune([entry()], config(), on_disk, slugs=SLUGS)
+    assert [i.path for i in plan.prunes] == [GAME_DIR / "setup_game_1.0.exe"]
 
 
 def test_part_rest_einer_alten_version_darf_weg():

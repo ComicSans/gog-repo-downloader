@@ -1,6 +1,10 @@
 # Werkzeuge: generierter Index, gehoert nicht ins Repository
 .tokensave/
 
+# Arbeitsunterlagen, bleiben lokal
+CLAUDE.md
+KONZEPT.md
+
 # Python
 .venv/
 __pycache__/
