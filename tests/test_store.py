@@ -7,6 +7,8 @@ Dateien, die GOG entfernt hat, dürfen nicht still verschwinden.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import pytest
 
 from gogdl.errors import StoreError
@@ -20,7 +22,7 @@ from gogdl.model.types import (
     RemoteFile,
     SlotKey,
 )
-from gogdl.store import SqliteStore
+from gogdl.store import SCHEMA_VERSION, SqliteStore
 
 PRODUCT_ID = 4242
 SEEN_1 = "2026-08-01T10:00:00Z"
@@ -32,7 +34,7 @@ EXTRA_SLOT = SlotKey(PRODUCT_ID, FileKind.EXTRA)
 
 
 @pytest.fixture
-def store() -> SqliteStore:
+def store() -> Iterator[SqliteStore]:
     s = SqliteStore(":memory:")
     yield s
     s.close()
@@ -314,6 +316,37 @@ def test_datei_db_ueberlebt_schliessen_und_oeffnen(tmp_path) -> None:
         assert restored.is_verified_complete
     finally:
         reopened.close()
+
+
+def test_leerer_remote_stand_orphaned_alles(store: SqliteStore) -> None:
+    """Der Grenzfall: GOG liefert nichts mehr — nichts darf verschwinden."""
+    store.replace_remote(PRODUCT_ID, [remote(), remote(file_id="f2")], SEEN_1)
+
+    store.replace_remote(PRODUCT_ID, [], SEEN_2)
+
+    entries = store.entries(PRODUCT_ID)
+    assert {e.file_id for e in entries} == {"f1", "f2"}
+    assert all(e.state is LocalState.ORPHANED for e in entries)
+    assert all(e.last_seen_utc == SEEN_1 for e in entries)
+
+
+def test_pragmas_und_schemaversion(tmp_path) -> None:
+    """WAL, foreign_keys und user_version sind Vorgaben aus §4.4."""
+    store = SqliteStore(tmp_path / "manifest.sqlite3")
+    try:
+        conn = store._conn
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    finally:
+        store.close()
+
+    # Erneutes Öffnen migriert nicht noch einmal und lässt die Version stehen.
+    again = SqliteStore(tmp_path / "manifest.sqlite3")
+    try:
+        assert again._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    finally:
+        again.close()
 
 
 def test_zugriff_nach_close_meldet_storeerror(tmp_path) -> None:

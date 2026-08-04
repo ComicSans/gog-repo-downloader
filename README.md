@@ -1,6 +1,6 @@
 # gogdl
 
-Keep a local, offline copy of **your own GOG.com library** — always up to date, resumable, and without the disk slowly filling up with obsolete installers.
+Keep a local, offline copy of **your own GOG.com library** - always up to date, resumable, and without the disk slowly filling up with obsolete installers.
 
 GOG games are DRM-free, which makes archiving them straightforward. They are not copyright-free: `gogdl` only ever downloads games the signed-in account actually owns, which is why authentication is mandatory and there is no anonymous mode.
 
@@ -10,9 +10,9 @@ GOG games are DRM-free, which makes archiving them straightforward. They are not
 
 `gogrepo` and friends solved this years ago, and mostly still work. `gogdl` differs in three places that matter in daily use:
 
-**Updates are detected by content, not by filename.** GOG bumps installer filenames *and* silently re-uploads under the same name. Comparing filenames looks correct and quietly misses the second case. `gogdl` compares `version`, then `size`, then the MD5 from GOG's checksum sidecar — any mismatch means stale.
+**Updates are detected by content, not by filename.** GOG bumps installer filenames *and* silently re-uploads under the same name. Comparing filenames looks correct and quietly misses the second case. `gogdl` compares `version`, then `size`, then the MD5 from GOG's checksum sidecar - any mismatch means stale.
 
-**Old versions are cleaned up automatically.** On by default, because otherwise every update cycle costs a full installer generation. The deletion only happens after the replacement is completely downloaded *and* verified, and it operates on whole releases — never on individual files, so a multi-part installer can never lose part 1 while part 2 of the new version is still downloading.
+**Old versions are cleaned up automatically.** On by default, because otherwise every update cycle costs a full installer generation. The deletion only happens after the replacement is completely downloaded *and* verified, and it operates on whole releases - never on individual files, so a multi-part installer can never lose part 1 while part 2 of the new version is still downloading.
 
 **Login uses the real browser.** No username/password automation to be broken by reCAPTCHA. You sign in at GOG the normal way, paste back the code once, and `gogdl` refreshes its token silently from then on.
 
@@ -31,7 +31,7 @@ Requires Python 3.12+. `pip install -e .` works just as well.
 ## Quickstart
 
 ```bash
-gogdl login                       # once — opens your browser, paste the code back
+gogdl login                       # once - opens your browser, paste the code back
 gogdl --dest ~/GOG update         # fetch library metadata
 gogdl --dest ~/GOG status         # what would happen, without doing it
 gogdl --dest ~/GOG download       # download, resume, verify, clean up
@@ -49,7 +49,7 @@ gogdl --dest ~/GOG download --os windows,linux --lang de,en --extras
 |---|---|
 | `login` | Authenticate once; stores only a refresh token |
 | `update` | Fetch library and file metadata into the local manifest |
-| `status` | Show what is missing, outdated, and cleanable — changes nothing |
+| `status` | Show what is missing, outdated, and cleanable - changes nothing |
 | `download` | Download missing and outdated files, then clean up old versions |
 | `verify` | Check local files against the manifest (`--deep` for MD5) |
 | `clean` | Run the cleanup separately (`--apply` to actually delete) |
@@ -73,7 +73,7 @@ gogdl --dest ~/GOG download --os windows,linux --lang de,en --extras
 ### Cleanup options
 
 ```
---prune                  default — remove old versions once replaced and verified
+--prune                  default - remove old versions once replaced and verified
 --no-prune               keep every version
 --keep-versions N        default 1 (current only); 2 keeps one generation as a fallback
 --prune-mode trash       move to <dest>/.trash/<date>/ instead of deleting
@@ -100,7 +100,7 @@ Exit codes: `0` nothing to do · `10` something was downloaded or removed · any
   .trash/                      # only with --prune-mode trash
 ```
 
-Flat per game, matching GOG's own filenames — so an existing `gogrepo` collection can be adopted as-is.
+Flat per game, matching GOG's own filenames - so an existing `gogrepo` collection can be adopted as-is.
 
 ## Status
 

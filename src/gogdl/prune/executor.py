@@ -62,6 +62,7 @@ class PruneExecutor:
         today: Callable[[], date] = date.today,
     ) -> None:
         self._dest = Path(dest).resolve()
+        self._dest_given = Path(dest).absolute()
         self._store = store
         self._mode = mode or PruneMode.DELETE
         self._today = today
@@ -127,6 +128,15 @@ class PruneExecutor:
 
         candidate = raw if raw.is_absolute() else self._dest / raw
         candidate = Path(os.path.normpath(candidate))
+
+        # ``dest`` kann selbst über einen Symlink benannt worden sein
+        # (``--dest /tmp/gog`` bei ``/tmp -> /private/tmp``). Plan-Pfade
+        # tragen dann die ungelöste Schreibweise: auf die aufgelöste
+        # Wurzel umbasieren, statt alles fälschlich abzulehnen.
+        if not candidate.is_relative_to(self._dest) and candidate.is_relative_to(
+            self._dest_given
+        ):
+            candidate = self._dest / candidate.relative_to(self._dest_given)
 
         if candidate == self._dest or not candidate.is_relative_to(self._dest):
             return None, f"Pfad liegt außerhalb von {self._dest}"

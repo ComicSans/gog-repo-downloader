@@ -1,4 +1,4 @@
-# GOG Repo Downloader — Konzept & Architektur
+# GOG Repo Downloader - Konzept & Architektur
 
 Stand: 2026-08-04 · Status: Entwurf zur Abstimmung
 
@@ -8,7 +8,7 @@ Stand: 2026-08-04 · Status: Entwurf zur Abstimmung
 
 GOG-Spiele sind **DRM-frei**, nicht copyright-frei. Das Tool lädt ausschließlich die
 **eigene, gekaufte Bibliothek** des angemeldeten Kontos herunter. Daraus folgt direkt eine
-Architekturentscheidung: **Es gibt keinen anonymen Modus und keinen Katalog-Scrape** —
+Architekturentscheidung: **Es gibt keinen anonymen Modus und keinen Katalog-Scrape** -
 Authentifizierung ist Pflichtvoraussetzung für jede Operation außer `--help`.
 
 ---
@@ -24,12 +24,12 @@ Ein CLI-Tool mit vier Verben:
 | `download` | Fehlende/veraltete Dateien laden, resume-fähig, mit Live-Fortschritt |
 | `verify` | Lokalen Bestand gegen Manifest prüfen (Größe, MD5, ZIP-Integrität) |
 
-Ergänzend: `status` (was ist veraltet, ohne zu laden — Dry-Run) und `clean`
+Ergänzend: `status` (was ist veraltet, ohne zu laden - Dry-Run) und `clean`
 (verwaiste Altversionen nach Update entfernen, standardmäßig nur anzeigen).
 
 ---
 
-## 2. Authentifizierung — die kritische Designentscheidung
+## 2. Authentifizierung - die kritische Designentscheidung
 
 ### 2.1 Warum kein Username/Passwort-Login
 
@@ -48,7 +48,7 @@ nicht nach.
      &response_type=code
      &layout=client2
 
-2. Nutzer meldet sich normal an (inkl. 2FA-Mailcode, reCAPTCHA — im Browser unproblematisch).
+2. Nutzer meldet sich normal an (inkl. 2FA-Mailcode, reCAPTCHA - im Browser unproblematisch).
 
 3. Redirect landet auf .../on_login_success?code=<CODE>.
    Nutzer kopiert die URL bzw. den Code und fügt ihn im Terminal ein.
@@ -62,7 +62,7 @@ nicht nach.
    Access-Token wird bei Ablauf still über grant_type=refresh_token erneuert.
 ```
 
-`client_id`/`client_secret` sind die öffentlich dokumentierten Galaxy-Client-Credentials —
+`client_id`/`client_secret` sind die öffentlich dokumentierten Galaxy-Client-Credentials -
 dieselben, die auch `lgogdownloader` verwendet.
 
 **Cookie-Jar wird nicht benötigt.** `lgogdownloader` kommt für Bibliothek und Downloads mit
@@ -79,7 +79,7 @@ dieselben, die auch `lgogdownloader` verwendet.
 
 Statt Copy-Paste kann das Tool einen lokalen Einmal-Listener auf `127.0.0.1:<port>` starten
 und den Code automatisch abgreifen. **Einschränkung:** Die `redirect_uri` muss zu einer bei GOG
-registrierten passen — `localhost` ist es nicht. Realistisch bleibt daher Copy-Paste als
+registrierten passen - `localhost` ist es nicht. Realistisch bleibt daher Copy-Paste als
 Primärweg; der Listener funktioniert nur mit Browser-Extension oder Clipboard-Watcher und wird
 deshalb **nicht** für Phase 1 eingeplant.
 
@@ -87,7 +87,7 @@ deshalb **nicht** für Phase 1 eingeplant.
 
 ## 3. Datenquellen (API-Landkarte)
 
-### Pfad A — Offline-Installer (Phase 1, entspricht gogrepo)
+### Pfad A - Offline-Installer (Phase 1, entspricht gogrepo)
 
 | Endpunkt | Liefert |
 |----------|---------|
@@ -99,10 +99,10 @@ deshalb **nicht** für Phase 1 eingeplant.
 
 Die `expand=downloads`-Payload liefert pro Installer:
 `os`, `language`, `version`, `total_size` und je Datei `id`, `size`, `downlink`.
-DLCs erscheinen als eigene Produkte unter `expanded_dlcs` mit identischer Struktur —
+DLCs erscheinen als eigene Produkte unter `expanded_dlcs` mit identischer Struktur -
 werden also **rekursiv** mit derselben Logik behandelt, nicht als Sonderfall.
 
-### Pfad B — Galaxy Content-System (bewusst zurückgestellt)
+### Pfad B - Galaxy Content-System (bewusst zurückgestellt)
 
 `content-system.gog.com/products/{id}/secure_link` + `cdn.gog.com/content-system/v2/meta/…`
 liefert chunk-basierte Manifeste mit `md5_compressed`/`md5_uncompressed` pro Chunk. Das ist der
@@ -110,12 +110,12 @@ Weg des Galaxy-Clients und ermöglicht **echte Delta-Updates** (nur geänderte C
 
 Bewertung: deutlich höherer Aufwand (Chunk-Reassembly, Depot-Auflösung, V1/V2-Unterscheidung),
 und das Ergebnis ist ein *entpacktes Spielverzeichnis*, kein Installer-Archiv. Für das gestellte
-Ziel — Offline-Archiv der Installer — ist Pfad A richtig. Pfad B bleibt als Phase-3-Option
+Ziel - Offline-Archiv der Installer - ist Pfad A richtig. Pfad B bleibt als Phase-3-Option
 architektonisch offen (siehe §9).
 
 ---
 
-## 4. Aktualitätsprüfung — der Kern des Tools
+## 4. Aktualitätsprüfung - der Kern des Tools
 
 ### 4.1 Warum Dateinamen nicht ausreichen
 
@@ -136,7 +136,7 @@ Dateiname ist deshalb **kein** Aktualitätssignal, sondern nur ein Ablage-Detail
 
 **Regel: Abweichung in irgendeinem Signal ⇒ Datei gilt als veraltet.**
 Fehlt `version` (kommt bei Extras/Bonus vor), rückt `size` auf Rang 1 und `md5` wird zum
-Tiebreaker — bei Extras ist md5 daher standardmäßig aktiv, bei Installern nur bei `verify`
+Tiebreaker - bei Extras ist md5 daher standardmäßig aktiv, bei Installern nur bei `verify`
 oder `--strict`.
 
 ### 4.3 Manifest-Eintrag
@@ -148,7 +148,7 @@ oder `--strict`.
   bytes_done, last_seen_utc, last_verified_utc }
 ```
 
-`last_seen_utc` erlaubt das Erkennen von Dateien, die GOG **entfernt** hat — die bleiben lokal
+`last_seen_utc` erlaubt das Erkennen von Dateien, die GOG **entfernt** hat - die bleiben lokal
 erhalten, werden aber als `orphaned` markiert statt still zu verschwinden.
 
 ### 4.4 Ablage: SQLite statt einer großen Datei
@@ -162,7 +162,7 @@ weiterhin JSON ausgeben.
 
 ## 5. Download-Engine
 
-### 5.1 Signierte URLs laufen ab — Resume darf sie nicht wiederverwenden
+### 5.1 Signierte URLs laufen ab - Resume darf sie nicht wiederverwenden
 
 Der `downlink`-Aufruf liefert eine **zeitlich signierte** CDN-URL. Wird sie im Manifest
 persistiert und Stunden später zum Fortsetzen benutzt, antwortet der CDN mit 403.
@@ -183,7 +183,7 @@ die Implementierung.
 ### 5.2 Schreibstrategie
 
 - Download nach `<ziel>.part`, Umbenennung erst nach erfolgreicher Größen-/MD5-Prüfung.
-- `bytes_done` wird aus der tatsächlichen `.part`-Dateigröße abgeleitet, nicht aus der DB —
+- `bytes_done` wird aus der tatsächlichen `.part`-Dateigröße abgeleitet, nicht aus der DB -
   die Datei ist die Wahrheit, die DB nur der Cache.
 - Neue Version derselben Datei → Ablage in `<spiel>/` neben der alten; die Altversion wird
   nach erfolgreicher Verifikation der neuen **automatisch entfernt** (§5.5).
@@ -191,7 +191,7 @@ die Implementierung.
 ### 5.3 Parallelität
 
 Standard: **2 gleichzeitige Dateien**, konfigurierbar via `--jobs`. Kein Multi-Connection-
-Splitting einer einzelnen Datei — das reizt Rate-Limits, bringt bei GOGs CDN wenig und
+Splitting einer einzelnen Datei - das reizt Rate-Limits, bringt bei GOGs CDN wenig und
 verkompliziert Resume erheblich. Bei HTTP 429 exponentielles Backoff mit Respektierung von
 `Retry-After`.
 
@@ -200,7 +200,7 @@ verkompliziert Resume erheblich. Bei HTTP 429 exponentielles Backoff mit Respekt
 Zwei Ebenen gleichzeitig:
 ```
 Gesamt   [████████░░░░░░░░]  12/47 Dateien · 8.2/31.5 GB · ETA 42m
-Aktuell  Baldur's Gate 3 — setup_bg3_de_4.1.2_(1).bin
+Aktuell  Baldur's Gate 3 - setup_bg3_de_4.1.2_(1).bin
          [██████████████░░]  3.1/4.0 GB · 11.4 MB/s · ETA 1m20s
 ```
 - TTY: Live-Refresh, gedrosselt auf ~4 Hz.
@@ -214,7 +214,7 @@ läuft deshalb standardmäßig als Teil von `download`/`sync`, nicht als separat
 Weil Löschen irreversibel ist, hängt alles an der Reihenfolge und an der Frage, was überhaupt
 als „alte Version" gilt.
 
-#### Ablauf — strikt in dieser Reihenfolge
+#### Ablauf - strikt in dieser Reihenfolge
 
 ```
 prune(product, slot):
@@ -225,11 +225,11 @@ prune(product, slot):
 
 Schritt 1 ist der Punkt, an dem eine naive Implementierung Daten verliert: Große Installer sind
 **mehrteilig** (`…_(1).bin`, `…_(2).bin`). Wird nach jeder fertigen Einzeldatei aufgeräumt,
-verschwindet Teil 1 der alten Version, während Teil 2 der neuen noch fehlt — der Lauf bricht ab
+verschwindet Teil 1 der alten Version, während Teil 2 der neuen noch fehlt - der Lauf bricht ab
 und man hat *keine* vollständige Version mehr. Deshalb ist die Prune-Einheit der **Slot**
 (product_id + kind + os + language), nicht die Einzeldatei.
 
-#### Was gelöscht werden darf — und was nie
+#### Was gelöscht werden darf - und was nie
 
 | Kategorie | Verhalten |
 |-----------|-----------|
@@ -240,7 +240,7 @@ und man hat *keine* vollständige Version mehr. Deshalb ist die Prune-Einheit de
 
 Regel dahinter: Gelöscht wird ausschließlich, was das Tool selbst angelegt hat und wofür
 nachweislich ein aktuellerer Ersatz vollständig auf der Platte liegt. Alles andere ist
-Fremdbestand — dafür gibt es Meldungen, keine Löschung. Zusätzlich als hartes Sicherheitsnetz:
+Fremdbestand - dafür gibt es Meldungen, keine Löschung. Zusätzlich als hartes Sicherheitsnetz:
 kein Pfad außerhalb von `<dest>/<slug>/`, keine Symlink-Verfolgung, absoluter Pfadvergleich
 gegen `dest` vor jedem `unlink`.
 
@@ -252,19 +252,19 @@ gegen `dest` vor jedem `unlink`.
 --keep-versions N  Default 1 = nur die aktuelle. N=2 hält eine Generation als Rückfallebene.
 --prune-mode delete|trash    Default: delete.
                    trash = Verschieben nach <dest>/.trash/<datum>/, manuell zu leeren.
-                   Löst das Platzproblem nur mit anschließendem Aufräumen — bewusst nicht Default.
+                   Löst das Platzproblem nur mit anschließendem Aufräumen - bewusst nicht Default.
 --dry-run          Zeigt Downloads *und* geplante Löschungen mit Freigabe-Volumen, ohne beides.
 ```
 
 Der erste Lauf nach einem Update meldet die Löschungen explizit im Protokoll
-(`entfernt: setup_x_2.1.0.exe (4.2 GB) — ersetzt durch 2.1.1`), damit im Cron-Log
+(`entfernt: setup_x_2.1.0.exe (4.2 GB) - ersetzt durch 2.1.1`), damit im Cron-Log
 nachvollziehbar bleibt, wohin der Platz gegangen ist. `gogdl clean` bleibt zusätzlich als
-manuelles Verb erhalten — für den Fall, dass mit `--no-prune` gearbeitet wurde oder ein
+manuelles Verb erhalten - für den Fall, dass mit `--no-prune` gearbeitet wurde oder ein
 früherer Lauf abgebrochen ist.
 
 #### Wechselwirkung mit `verify`
 
-Nach `--prune` existiert die alte Version nicht mehr — ein später fehlschlagender
+Nach `--prune` existiert die alte Version nicht mehr - ein später fehlschlagender
 `verify --deep` auf der neuen Datei hat dann keine lokale Rückfallebene und erzwingt einen
 Neu-Download. Wer das nicht will, nimmt `--keep-versions 2`. Bei `--prune-mode trash` liegt
 die Vorgängerversion noch im Papierkorbordner und `verify` weist im Fehlerfall darauf hin.
@@ -316,9 +316,9 @@ cli/         Argument-Parsing, Kommandos, Exit-Codes
 
 `sync/` ist bewusst **frei von I/O**: Eingabe sind zwei Listen (Remote-Metadaten,
 lokaler Zustand), Ausgabe sind eine Download-Arbeitsliste und ein Prune-Plan. Dadurch sind
-die beiden riskantesten Entscheidungen — „ist das veraltet?" und „darf das gelöscht werden?" —
+die beiden riskantesten Entscheidungen - „ist das veraltet?" und „darf das gelöscht werden?" -
 ohne Netzwerk und ohne GOG-Konto testbar. `prune/` führt nur aus, was `sync/` beschlossen hat,
-und lehnt jeden Plan-Eintrag ab, dessen Ersatz nicht als verifiziert markiert ist — die
+und lehnt jeden Plan-Eintrag ab, dessen Ersatz nicht als verifiziert markiert ist - die
 Sicherheitsprüfung findet also zweimal statt, in Planung und Ausführung.
 
 ---
@@ -340,14 +340,14 @@ Sicherheitsprüfung findet also zweimal statt, in Planung und Ausführung.
 
 ## 9. Phasen
 
-**Phase 1 (Kern)** — `login`, `update`, `status`, `download` mit Resume, Fortschritt,
+**Phase 1 (Kern)** - `login`, `update`, `status`, `download` mit Resume, Fortschritt,
 Filter für OS/Sprache/DLC/Extras, SQLite-Manifest **und automatischem Prune (§5.5)**.
 Prune ist Teil des Kerns, nicht des Komforts: ohne ihn ist das Tool nach wenigen
 Update-Zyklen unbenutzbar. Die Größen-/MD5-Verifikation der Ersatzdatei ist damit
-ebenfalls Phase 1 — sie ist die Vorbedingung jeder Löschung.
-**Phase 2** — `verify --deep` (ZIP-Test), `clean` als manuelles Verb, `--prune-mode trash`,
+ebenfalls Phase 1 - sie ist die Vorbedingung jeder Löschung.
+**Phase 2** - `verify --deep` (ZIP-Test), `clean` als manuelles Verb, `--prune-mode trash`,
 Konfigurationsdatei, Keychain, `sync` + Exit-Codes für Cron, `--json`.
-**Phase 3 (optional)** — Galaxy-Content-System (Pfad B) für echte Delta-Updates. Die
+**Phase 3 (optional)** - Galaxy-Content-System (Pfad B) für echte Delta-Updates. Die
 `api/`-Schicht wird in Phase 1 bereits so geschnitten, dass ein zweiter Download-Backend
 danebentreten kann, ohne `sync/` anzufassen.
 
@@ -357,9 +357,9 @@ danebentreten kann, ohne `sync/` anzufassen.
 
 1. **Implementierungssprache: Python 3** (`httpx` + `rich`, Begründung siehe Vergleich unten).
 2. **Default für `--os`: nur die laufende Plattform.** Auf dem Mac also `mac`. Andere
-   Plattformen nur bei expliziter Angabe — verhindert unbeabsichtigte 3-fache Downloadmenge.
+   Plattformen nur bei expliziter Angabe - verhindert unbeabsichtigte 3-fache Downloadmenge.
    `--os all` als Kurzform für den Vollarchiv-Fall.
-3. **Verzeichnislayout: flach je Spiel** — `<dest>/<slug>/<datei>`. OS und Sprache stecken
+3. **Verzeichnislayout: flach je Spiel** - `<dest>/<slug>/<datei>`. OS und Sprache stecken
    bereits im GOG-Dateinamen; ein bestehender gogrepo-Bestand bleibt dadurch importierbar.
    Für die Ablage von Altversionen gilt: die neue Datei kommt daneben, die alte wird erst
    nach erfolgreicher Verifikation durch `clean` zur Löschung vorgeschlagen (§5.2).
@@ -367,13 +367,13 @@ danebentreten kann, ohne `sync/` anzufassen.
 ### Sprachvergleich (Entscheidungsgrundlage)
 
 Entscheidend ist eine einzige Frage: **Braucht der Login eine eingebettete Browser-Engine?**
-Antwort: nein (§2.2) — `lgogdownloader` löst das in reinem C++. Damit ist die Sprachwahl frei
+Antwort: nein (§2.2) - `lgogdownloader` löst das in reinem C++. Damit ist die Sprachwahl frei
 und reduziert sich auf zwei sinnvolle Kandidaten:
 
 | | Python 3 | Go |
 |---|---|---|
 | Parität zum Vorbild | hoch (gogrepoc ist Python) | keine |
-| Fortschritts-UI | `rich` — nahezu geschenkt | manuell, aber überschaubar |
+| Fortschritts-UI | `rich` - nahezu geschenkt | manuell, aber überschaubar |
 | HTTP/Resume | `httpx` | stdlib reicht |
 | Auslieferung | braucht Runtime + venv | **eine statische Binary** |
 | Cron-Tauglichkeit | gut | sehr gut (keine Umgebungsabhängigkeit) |

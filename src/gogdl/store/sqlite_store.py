@@ -287,9 +287,9 @@ class SqliteStore:
         except sqlite3.Error as exc:
             raise StoreError(f"Commit fehlgeschlagen: {exc}") from exc
 
-    def _query(self, sql: str, params: Sequence[object] | dict[str, object] = ()) -> list[
-        sqlite3.Row
-    ]:
+    def _query(
+        self, sql: str, params: Sequence[object] | dict[str, object] = ()
+    ) -> list[sqlite3.Row]:
         self._check_open()
         try:
             return list(self._conn.execute(sql, params))
