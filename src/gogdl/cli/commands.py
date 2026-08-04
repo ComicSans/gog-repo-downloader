@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 
 from gogdl.api.client import GogApiClient
-from gogdl.auth.flow import FileCredentialStore, GogAuth, extract_code, open_login_page
+from gogdl.auth.flow import FileCredentialStore, GogAuth, extract_code, start_login
 from gogdl.constants import DEFAULT_TIMEOUT, USER_AGENT
 from gogdl.download.engine import HttpDownloader
 from gogdl.errors import AuthError, GogdlError
@@ -48,7 +48,7 @@ def _auth() -> GogAuth:
 
 
 async def cmd_login(ctx: AppContext, *, no_browser: bool = False) -> int:
-    url = open_login_page(open_browser=not no_browser)
+    url = start_login(open_browser=not no_browser)
     print("Melde dich in deinem Browser bei GOG an:")
     print(f"\n  {url}\n")
     print(
@@ -167,11 +167,25 @@ def _filter_products(
 # --------------------------------------------------------------------------- status
 
 
+def _slugs(store: SqliteStore) -> dict[int, str]:
+    """Produkt-ID -> Verzeichnisname. Bestimmt das flache Ablagelayout."""
+    return {p.product_id: p.slug for p in store.products()}
+
+
+def _plan_prune(store: SqliteStore, ctx: AppContext) -> SyncPlan:
+    return plan_prune(
+        store.entries(),
+        ctx.config,
+        on_disk=scan_disk(ctx.dest),
+        slugs=_slugs(store),
+    )
+
+
 def cmd_status(ctx: AppContext) -> int:
     store = SqliteStore(db_path(ctx.dest))
     try:
         plan = _build_download_plan(store, ctx)
-        prune_plan = plan_prune(store.entries(), ctx.config, on_disk=scan_disk(ctx.dest))
+        prune_plan = _plan_prune(store, ctx)
     finally:
         store.close()
 
@@ -181,7 +195,7 @@ def cmd_status(ctx: AppContext) -> int:
 
 def _build_download_plan(store: SqliteStore, ctx: AppContext) -> SyncPlan:
     entries = store.entries()
-    slugs = {p.product_id: p.slug for p in store.products()}
+    slugs = _slugs(store)
     remote = [
         RemoteFile(
             slot=e.slot,
@@ -241,7 +255,7 @@ async def cmd_download(ctx: AppContext) -> int:
         plan = _build_download_plan(store, ctx)
 
         if ctx.dry_run:
-            prune_plan = plan_prune(store.entries(), ctx.config, on_disk=scan_disk(ctx.dest))
+            prune_plan = _plan_prune(store, ctx)
             _print_plan(plan, prune_plan, ctx)
             return EXIT_WORK_DONE if (plan.downloads or prune_plan.prunes) else EXIT_NOTHING_TO_DO
 
@@ -293,7 +307,7 @@ async def cmd_download(ctx: AppContext) -> int:
 def _run_prune(store: SqliteStore, ctx: AppContext, reporter) -> int:
     if not ctx.config.prune:
         return 0
-    prune_plan = plan_prune(store.entries(), ctx.config, on_disk=scan_disk(ctx.dest))
+    prune_plan = _plan_prune(store, ctx)
     if not prune_plan.prunes:
         return 0
     executor = PruneExecutor(ctx.dest, store, mode=ctx.config.prune_mode)

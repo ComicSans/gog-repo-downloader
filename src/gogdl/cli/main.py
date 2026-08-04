@@ -10,7 +10,7 @@ from gogdl import __version__
 from gogdl.errors import GogdlError
 
 from . import commands
-from .context import AppContext, build_sync_config
+from .context import AppContext, build_sync_config, check_dest
 
 _FILTER_HELP = "Kommagetrennt, z. B. --lang de,en"
 
@@ -24,8 +24,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--version", action="version", version=f"gogdl {__version__}")
+    # Bewusst nicht "." als Default: das Tool legt hier eine Datenbank an,
+    # lädt Gigabytes hinein und löscht darin alte Versionen. Ein versehentlicher
+    # Aufruf im falschen Verzeichnis - etwa im Quellbaum - soll nichts anrichten.
     parser.add_argument(
-        "--dest", default=".", help="Zielverzeichnis der Sammlung (Default: aktuelles)"
+        "--dest", default="~/GOG", help="Zielverzeichnis der Sammlung (Default: ~/GOG)"
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="Mehr Details")
     parser.add_argument("-q", "--quiet", action="store_true", help="Nur Fehler ausgeben")
@@ -43,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_filters(update)
     update.add_argument("--jobs", type=int, default=4, help="Parallele Metadaten-Abrufe")
 
-    status = sub.add_parser("status", help="Zeigen, was zu tun wäre — ohne etwas zu tun")
+    status = sub.add_parser("status", help="Zeigen, was zu tun wäre - ohne etwas zu tun")
     _add_filters(status)
 
     download = sub.add_parser("download", help="Fehlende und veraltete Dateien laden")
@@ -139,9 +142,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        config = build_sync_config(args)
+        warning = check_dest(config.dest)
+        if warning and args.command != "login":
+            print(f"Warnung: {warning}", file=sys.stderr)
+
         ctx = AppContext(
-            dest=build_sync_config(args).dest,
-            config=build_sync_config(args),
+            dest=config.dest,
+            config=config,
             jobs=getattr(args, "jobs", 2),
             dry_run=getattr(args, "dry_run", False),
             quiet=args.quiet,

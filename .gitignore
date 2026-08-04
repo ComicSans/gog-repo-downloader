@@ -1,3 +1,4 @@
+# Python
 .venv/
 __pycache__/
 *.py[cod]
@@ -6,3 +7,18 @@ __pycache__/
 dist/
 build/
 .DS_Store
+
+# Laufzeitdaten von gogdl - niemals ins Repository.
+# Entstehen, sobald das Tool mit --dest auf dieses Verzeichnis läuft.
+.gogdl/
+.trash/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.part
+auth.json
+
+# Heruntergeladene Spiele, falls jemand --dest hierher zeigt
+setup_*
+gog_*
+*.bin

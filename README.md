@@ -37,6 +37,8 @@ gogdl --dest ~/GOG status         # what would happen, without doing it
 gogdl --dest ~/GOG download       # download, resume, verify, clean up
 ```
 
+`--dest` defaults to `~/GOG` and never to the current directory: the tool writes a database there, downloads gigabytes into it, and deletes superseded files inside it. Pointing it at a git working tree prints a warning.
+
 By default this fetches installers for **your current platform** in **English**, including DLC. Everything else is opt-in:
 
 ```bash

@@ -60,6 +60,22 @@ class AppContext:
     limit_rate: int | None = None
 
 
+def check_dest(dest: Path) -> str | None:
+    """Warnt, wenn das Zielverzeichnis offensichtlich das falsche ist.
+
+    Das Tool legt im Ziel eine Datenbank an und löscht dort alte Versionen.
+    Ein Git-Arbeitsverzeichnis ist dafür fast nie gemeint - meist ist der
+    Quellbaum erwischt worden, weil ``--dest`` fehlte.
+    """
+    if (dest / ".git").exists():
+        return (
+            f"{dest} ist ein Git-Arbeitsverzeichnis. Manifest, Papierkorb und "
+            "heruntergeladene Spiele landen dann im Repository. Gemeint war "
+            "vermutlich ein eigenes Zielverzeichnis, z. B. --dest ~/GOG"
+        )
+    return None
+
+
 def build_sync_config(args) -> SyncConfig:
     """Übersetzt die geparsten Argumente in eine ``SyncConfig``."""
     dest = Path(args.dest).expanduser().resolve()
