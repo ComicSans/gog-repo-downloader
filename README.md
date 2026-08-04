@@ -111,9 +111,12 @@ Filters, available on `update`, `status`, `download`, `verify`, `clean`, and `sy
                                (goodies are included by default)
 --include-patches              also fetch individual patch files (default: off,
                                the full installer of the current version is preferred)
---include-saves                read save game directories when scanning (default: off)
+--include-saves                read save game directories such as SaveFiles/ when
+                               scanning the destination (default: off; also on `import`)
 --strict                       compare MD5 for installers too, not only for goodies
 ```
+
+`--extras` and `--no-extras` still work as undocumented aliases so existing cron lines keep running; `--no-extras` is the same as `--skip-goodies`. Note that `--include-patches` also pulls in language packs, since GOG groups both as patches. Per-language installers are selected through `--lang` anyway, which makes the packs largely redundant.
 
 Game selection, available on `update` and `sync` (they decide what enters the manifest):
 
