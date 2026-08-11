@@ -29,6 +29,14 @@
       "env": {
         "MSC_PROJECTS_ROOT": "/Users/tobias/GitHub:/Users/tobias/website"
       }
+    },
+    "swift-contracts": {
+      "type": "stdio",
+      "command": "/Users/tobias/GitHub/swift-contracts/.build/release/swift-contracts-mcp",
+      "args": [],
+      "env": {
+        "SWIFT_CONTRACTS_HOME": "/Users/tobias/GitHub/swift-contracts"
+      }
     }
   }
 }
